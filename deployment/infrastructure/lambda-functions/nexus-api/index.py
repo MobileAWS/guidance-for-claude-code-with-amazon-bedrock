@@ -953,6 +953,9 @@ def handle_user_detail(event):
     """GET /api/users/{id} - user detail with usage history."""
     path = event.get("requestContext", {}).get("http", {}).get("path", "")
     user_email = path.split("/api/users/", 1)[-1]
+    # URL decode the email (handles + and other special chars)
+    import urllib.parse
+    user_email = urllib.parse.unquote(user_email)
 
     # Get quota metrics
     result = quota_table.query(
@@ -972,16 +975,47 @@ def handle_user_detail(event):
     policy = policy_result.get("Items", [{}])[0] if policy_result.get("Items") else {}
 
     monthly_limit = int(policy.get("monthly_limit", 225_000_000))
-    monthly_used = int(current.get("monthly_tokens", 0))
+
+    # Get actual tokens from UserQuotaMetrics
+    now = datetime.now(timezone.utc)
+    current_month = now.strftime("%Y-%m")
+    prev_month = (now - timedelta(days=30)).strftime("%Y-%m")
+    monthly_used = 0
+    try:
+        quota_metrics = boto3.resource("dynamodb").Table("UserQuotaMetrics")
+        for mp in set([current_month, prev_month]):
+            item = quota_metrics.get_item(Key={"pk": f"USER#{user_email}", "sk": f"MONTH#{mp}"}).get("Item", {})
+            if item:
+                monthly_used += int(float(item.get("input_tokens", 0))) + int(float(item.get("output_tokens", 0)))
+    except Exception:
+        pass
+
+    # Get daily token history from CloudWatch (30 days)
+    daily_history = []
+    try:
+        cw = boto3.client("cloudwatch")
+        result = cw.get_metric_statistics(
+            Namespace="ClaudeCode", MetricName="claude_code.token.usage",
+            Dimensions=[{"Name": "user.email", "Value": user_email}, {"Name": "OTelLib", "Value": "com.anthropic.claude_code"}],
+            StartTime=now - timedelta(days=30), EndTime=now, Period=86400, Statistics=["Sum"],
+        )
+        for p in sorted(result.get("Datapoints", []), key=lambda x: x["Timestamp"]):
+            daily_history.append({
+                "date": p["Timestamp"].strftime("%Y-%m-%d"),
+                "tokens": int(p["Sum"]),
+            })
+    except Exception:
+        pass
 
     return response(200, {
         "email": user_email,
         "monthlyTokens": monthly_used,
         "monthlyLimit": monthly_limit,
-        "dailyTokens": int(current.get("daily_tokens", 0)),
+        "dailyTokens": int(float(current.get("daily_tokens", 0))),
         "lastActive": current.get("timestamp", ""),
         "blocked": bool(current.get("blocked")),
         "status": "blocked" if current.get("blocked") else "active",
+        "dailyHistory": daily_history,
     })
 
 
@@ -1011,10 +1045,15 @@ def handle_create_user(event):
     cognito = boto3.client("cognito-idp")
     pool_id = os.environ.get("COGNITO_USER_POOL_ID", "")
 
+    # Generate a temporary password
+    import secrets, string
+    temp_password = ''.join(secrets.choice(string.ascii_letters + string.digits + "!@#$%") for _ in range(12))
+
     try:
         cognito.admin_create_user(
             UserPoolId=pool_id,
             Username=email,
+            TemporaryPassword=temp_password,
             UserAttributes=[
                 {"Name": "email", "Value": email},
                 {"Name": "email_verified", "Value": "true"},
@@ -1046,7 +1085,7 @@ def handle_create_user(event):
                 pass
 
         log_audit(get_caller_email(event), "create_user", email, f"role={role}, org={org_id}")
-        return response(201, {"email": email, "role": role, "status": "invited"})
+        return response(201, {"email": email, "role": role, "status": "invited", "tempPassword": temp_password})
     except Exception as e:
         err = str(e)
         if "UsernameExistsException" in err:

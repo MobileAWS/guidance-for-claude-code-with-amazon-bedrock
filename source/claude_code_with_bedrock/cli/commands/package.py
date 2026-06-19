@@ -77,6 +77,7 @@ def _ensure_cross_arch_venv(arch: str, universal2_python: Path, runtime_packages
             return venv_dir
         # Wrong arch — rebuild
         import shutil
+
         console.print(f"[yellow]Rebuilding {arch} build venv (wrong architecture detected)[/yellow]")
         shutil.rmtree(venv_dir, ignore_errors=True)
 
@@ -85,7 +86,8 @@ def _ensure_cross_arch_venv(arch: str, universal2_python: Path, runtime_packages
 
     create = subprocess.run(  # nosec B603 B607
         ["/usr/bin/arch", f"-{arch}", str(universal2_python), "-m", "venv", str(venv_dir)],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     if create.returncode != 0:
         raise RuntimeError(f"Failed to create {arch} build venv: {create.stderr}")
@@ -93,7 +95,8 @@ def _ensure_cross_arch_venv(arch: str, universal2_python: Path, runtime_packages
     pip = venv_dir / "bin" / "pip"
     install = subprocess.run(  # nosec B603 B607
         ["/usr/bin/arch", f"-{arch}", str(pip), "install", "--quiet", _PYINSTALLER_PIN, *runtime_packages],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     if install.returncode != 0:
         raise RuntimeError(f"Failed to install deps into {arch} build venv: {install.stderr or install.stdout}")
@@ -163,8 +166,16 @@ class PackageCommand(Command):
         option("build-local", description="Build binaries locally instead of downloading pre-built", flag=True),
         option("no-cache", description="Force re-download of pre-built binaries", flag=True),
         option("build-verbose", description="Enable verbose logging for build processes", flag=True),
-        option("regenerate-installers", description="Regenerate installer scripts using existing binaries from latest dist", flag=True),
-        option("go", description="Build binaries using Go cross-compilation (native binaries, no AV false positives)", flag=True),
+        option(
+            "regenerate-installers",
+            description="Regenerate installer scripts using existing binaries from latest dist",
+            flag=True,
+        ),
+        option(
+            "go",
+            description="Build binaries using Go cross-compilation (native binaries, no AV false positives)",
+            flag=True,
+        ),
     ]
 
     def handle(self) -> int:
@@ -254,8 +265,7 @@ class PackageCommand(Command):
                 cost_center = questionary.text("Cost center:", default="default").ask()
                 organization = questionary.text("Organization:", default="default").ask()
                 otel_resource_attributes = (
-                    f"department={department},team.id={team_id},"
-                    f"cost_center={cost_center},organization={organization}"
+                    f"department={department},team.id={team_id},cost_center={cost_center},organization={organization}"
                 )
 
         # Validate platform
@@ -483,7 +493,9 @@ class PackageCommand(Command):
                     else:
                         built_executables.append((platform_name, executable_path))
                 except Exception as e:
-                    console.print(f"[yellow]Warning: Could not build credential process for {platform_name}: {e}[/yellow]")
+                    console.print(
+                        f"[yellow]Warning: Could not build credential process for {platform_name}: {e}[/yellow]"
+                    )
 
                 # Build OTEL helper if monitoring is enabled
                 if profile.monitoring_enabled:
@@ -498,7 +510,9 @@ class PackageCommand(Command):
                             if otel_helper_path is not None:
                                 built_otel_helpers.append((platform_name, otel_helper_path))
                         except Exception as e:
-                            console.print(f"[yellow]Warning: Could not build OTEL helper for {platform_name}: {e}[/yellow]")
+                            console.print(
+                                f"[yellow]Warning: Could not build OTEL helper for {platform_name}: {e}[/yellow]"
+                            )
 
         # Check if Windows is building asynchronously via CodeBuild (no local binary yet).
         # Only treat a missing Windows binary as "deferred to CodeBuild" when CodeBuild is
@@ -704,8 +718,7 @@ class PackageCommand(Command):
             self.line(f"  <info>{result.stdout.strip()}</info>")
         except (FileNotFoundError, subprocess.CalledProcessError):
             raise RuntimeError(
-                "Go is not installed or not in PATH. Install from https://go.dev/dl/ "
-                "or run: brew install go"
+                "Go is not installed or not in PATH. Install from https://go.dev/dl/ or run: brew install go"
             )
 
         platform_map = {
@@ -748,10 +761,13 @@ class PackageCommand(Command):
                 # cmd/*/ are auto-linked by the Go compiler to help further.
                 ldflags = "" if plat == "windows" else "-s -w"
                 cmd = [
-                    "go", "build",
+                    "go",
+                    "build",
                     "-trimpath",
-                    "-ldflags", ldflags,
-                    "-o", str(output_path),
+                    "-ldflags",
+                    ldflags,
+                    "-o",
+                    str(output_path),
                     f"./cmd/{binary}/",
                 ]
                 result = subprocess.run(cmd, cwd=str(go_src), env=env, capture_output=True, text=True)
@@ -1044,9 +1060,12 @@ class PackageCommand(Command):
             work_root = Path.home() / ".ccwb" / "build-work"
             work_root.mkdir(parents=True, exist_ok=True)
             cmd = [
-                "/usr/bin/arch", f"-{arch}",
+                "/usr/bin/arch",
+                f"-{arch}",
                 str(venv_dir / "bin" / "pyinstaller"),
-                "--onefile", "--clean", "--noconfirm",
+                "--onefile",
+                "--clean",
+                "--noconfirm",
                 f"--name={binary_name}",
                 f"--distpath={str(output_dir)}",
                 f"--workpath={str(work_root / arch)}",
@@ -1062,8 +1081,12 @@ class PackageCommand(Command):
         else:
             # Native build: use Poetry environment directly
             cmd = [
-                "poetry", "run", "pyinstaller",
-                "--onefile", "--clean", "--noconfirm",
+                "poetry",
+                "run",
+                "pyinstaller",
+                "--onefile",
+                "--clean",
+                "--noconfirm",
                 f"--target-arch={arch}",
                 f"--name={binary_name}",
                 f"--distpath={str(output_dir)}",
@@ -1094,7 +1117,9 @@ class PackageCommand(Command):
             # Code-sign the binary (Developer ID if available, ad-hoc otherwise)
             sign_id = None
             try:
-                id_check = subprocess.run(["security", "find-identity", "-v", "-p", "codesigning"], capture_output=True, text=True)
+                id_check = subprocess.run(
+                    ["security", "find-identity", "-v", "-p", "codesigning"], capture_output=True, text=True
+                )
                 for line in id_check.stdout.splitlines():
                     if "Developer ID Application" in line:
                         sign_id = line.split('"')[1]
@@ -1699,7 +1724,8 @@ RUN pyinstaller \
         console.print("\n[dim]View logs in AWS Console:[/dim]")
         # Properly encode the build ID (contains colon) and include region
         from urllib.parse import quote
-        encoded_build_id = quote(build_id, safe='')
+
+        encoded_build_id = quote(build_id, safe="")
         aws_region = profile_obj.aws_region if profile_obj else "us-east-1"
         console.print(
             f"  [dim]https://{aws_region}.console.aws.amazon.com/codesuite/codebuild/projects/{project_name}/build/{encoded_build_id}[/dim]"
@@ -1825,15 +1851,20 @@ RUN pyinstaller \
             # Cross-arch build: need a per-arch venv seeded from a universal2 Python
             universal2_python = _find_universal2_python()
             if universal2_python is None:
-                console.print(f"[yellow]Warning: Skipping {binary_name} — cross-arch build requires universal2 Python (not found)[/yellow]")
+                console.print(
+                    f"[yellow]Warning: Skipping {binary_name} — cross-arch build requires universal2 Python (not found)[/yellow]"
+                )
                 return output_dir / binary_name
             venv_dir = _ensure_cross_arch_venv(arch, universal2_python, _OTEL_HELPER_RUNTIME_DEPS, console)
             work_root = Path.home() / ".ccwb" / "build-work"
             work_root.mkdir(parents=True, exist_ok=True)
             cmd = [
-                "/usr/bin/arch", f"-{arch}",
+                "/usr/bin/arch",
+                f"-{arch}",
                 str(venv_dir / "bin" / "pyinstaller"),
-                "--onefile", "--clean", "--noconfirm",
+                "--onefile",
+                "--clean",
+                "--noconfirm",
                 f"--name={binary_name}",
                 f"--distpath={str(output_dir)}",
                 f"--workpath={str(work_root / arch)}",
@@ -1843,8 +1874,12 @@ RUN pyinstaller \
             ]
         else:
             cmd = [
-                "poetry", "run", "pyinstaller",
-                "--onefile", "--clean", "--noconfirm",
+                "poetry",
+                "run",
+                "pyinstaller",
+                "--onefile",
+                "--clean",
+                "--noconfirm",
                 f"--name={binary_name}",
                 f"--distpath={str(output_dir)}",
                 "--workpath=/tmp/pyinstaller",
@@ -1871,7 +1906,9 @@ RUN pyinstaller \
             # Code-sign (Developer ID if available, ad-hoc otherwise)
             sign_id = None
             try:
-                id_check = subprocess.run(["security", "find-identity", "-v", "-p", "codesigning"], capture_output=True, text=True)
+                id_check = subprocess.run(
+                    ["security", "find-identity", "-v", "-p", "codesigning"], capture_output=True, text=True
+                )
                 for line in id_check.stdout.splitlines():
                     if "Developer ID Application" in line:
                         sign_id = line.split('"')[1]
@@ -2102,17 +2139,14 @@ RUN pyinstaller \
 
         otel_resource_attributes = None
         if profile.monitoring_enabled:
-            customize_otel = questionary.confirm(
-                "Customize telemetry resource attributes?", default=False
-            ).ask()
+            customize_otel = questionary.confirm("Customize telemetry resource attributes?", default=False).ask()
             if customize_otel:
                 department = questionary.text("Department:", default="engineering").ask()
                 team_id = questionary.text("Team ID:", default="default").ask()
                 cost_center = questionary.text("Cost center:", default="default").ask()
                 organization = questionary.text("Organization:", default="default").ask()
                 otel_resource_attributes = (
-                    f"department={department},team.id={team_id},"
-                    f"cost_center={cost_center},organization={organization}"
+                    f"department={department},team.id={team_id},cost_center={cost_center},organization={organization}"
                 )
 
         # Regenerate config.json
@@ -2132,7 +2166,7 @@ RUN pyinstaller \
         self._create_claude_settings(output_dir, profile, include_coauthored_by, profile_name, otel_resource_attributes)
 
         # Summary
-        console.print(f"\n[green]✓ Installers regenerated successfully![/green]")
+        console.print("\n[green]✓ Installers regenerated successfully![/green]")
         console.print(f"\nOutput directory: [cyan]{output_dir}[/cyan]")
         console.print("\nRegenerated files:")
         console.print("  • config.json")
@@ -2144,7 +2178,9 @@ RUN pyinstaller \
         if (output_dir / "claude-settings" / "settings.json").exists():
             console.print("  • claude-settings/settings.json")
         console.print(f"\nBinaries copied from: [dim]{source_dir}[/dim]")
-        console.print("\n[bold]Next: Run '[cyan]poetry run ccwb distribute --per-os[/cyan]' to create distribution packages.[/bold]")
+        console.print(
+            "\n[bold]Next: Run '[cyan]poetry run ccwb distribute --per-os[/cyan]' to create distribution packages.[/bold]"
+        )
         return 0
 
     def _create_config(
@@ -2219,9 +2255,7 @@ RUN pyinstaller \
                     "\n[yellow]Warning: certificate paths in config.json are absolute and will not "
                     "resolve on machines where the files are stored elsewhere.[/yellow]"
                 )
-                console.print(
-                    "[yellow]Instruct end users to set the following environment variables:[/yellow]"
-                )
+                console.print("[yellow]Instruct end users to set the following environment variables:[/yellow]")
                 console.print("[dim]  AZURE_CLIENT_CERTIFICATE_PATH=<path/to/cert.pem>[/dim]")
                 console.print("[dim]  AZURE_CLIENT_CERTIFICATE_KEY_PATH=<path/to/key.pem>[/dim]\n")
 
@@ -2279,7 +2313,11 @@ RUN pyinstaller \
             # Check for exact domain match or subdomain match
             # Using endswith with leading dot prevents bypass attacks
             okta_domains = (".okta.com", ".oktapreview.com", ".okta-emea.com")
-            if hostname_lower.endswith(okta_domains) or hostname_lower in ("okta.com", "oktapreview.com", "okta-emea.com"):
+            if hostname_lower.endswith(okta_domains) or hostname_lower in (
+                "okta.com",
+                "oktapreview.com",
+                "okta-emea.com",
+            ):
                 return "okta"
             elif hostname_lower.endswith(".auth0.com") or hostname_lower == "auth0.com":
                 return "auth0"
@@ -2896,17 +2934,17 @@ REM Configure AWS profiles
 echo.
 echo Configuring AWS profiles...
 
-REM Configure AWS profiles by writing %USERPROFILE%\.aws\config directly (no AWS CLI dependency)
+REM Configure AWS profiles by writing %USERPROFILE%\\.aws\\config directly (no AWS CLI dependency)
 if not exist "%USERPROFILE%\\.aws" mkdir "%USERPROFILE%\\.aws"
 
-REM Purge any stale stanza from %USERPROFILE%\.aws\credentials. The credential
-REM chain resolves that file before credential_process in %USERPROFILE%\.aws\config,
+REM Purge any stale stanza from %USERPROFILE%\\.aws\\credentials. The credential
+REM chain resolves that file before credential_process in %USERPROFILE%\\.aws\\config,
 REM so a leftover [profile-name] block (e.g. EXPIRED placeholder written by an
 REM older ccwb auth logout) would shadow credential_process and break Cowork
 REM Desktop with a 403 InvalidClientTokenId.
-powershell -NoProfile -Command "$ErrorActionPreference = 'Stop'; $awsCreds = Join-Path $env:USERPROFILE '.aws\credentials'; if (Test-Path $awsCreds) {{ $cfg = Get-Content config.json | ConvertFrom-Json; $existing = Get-Content $awsCreds -Raw; foreach ($p in $cfg.PSObject.Properties.Name) {{ $pattern = '(?ms)^\[' + [regex]::Escape($p) + '\].*?(?=^\[|\Z)'; $existing = [regex]::Replace($existing, $pattern, '') }}; Set-Content -Path $awsCreds -Value $existing.TrimStart() -NoNewline -Encoding ASCII }}"
+powershell -NoProfile -Command "$ErrorActionPreference = 'Stop'; $awsCreds = Join-Path $env:USERPROFILE '.aws\\credentials'; if (Test-Path $awsCreds) {{ $cfg = Get-Content config.json | ConvertFrom-Json; $existing = Get-Content $awsCreds -Raw; foreach ($p in $cfg.PSObject.Properties.Name) {{ $pattern = '(?ms)^\\[' + [regex]::Escape($p) + '\\].*?(?=^\\[|\\Z)'; $existing = [regex]::Replace($existing, $pattern, '') }}; Set-Content -Path $awsCreds -Value $existing.TrimStart() -NoNewline -Encoding ASCII }}"
 
-powershell -NoProfile -Command "$ErrorActionPreference = 'Stop'; $nl = [char]13 + [char]10; $cfg = Get-Content config.json | ConvertFrom-Json; $awsConfig = Join-Path $env:USERPROFILE '.aws\config'; $credProcess = Join-Path $env:USERPROFILE 'claude-code-with-bedrock\credential-process.exe'; $existing = if (Test-Path $awsConfig) {{ Get-Content $awsConfig -Raw }} else {{ '' }}; foreach ($p in $cfg.PSObject.Properties.Name) {{ $region = $cfg.$p.aws_region; if (-not $region) {{ $region = '{profile.aws_region}' }}; $pattern = '(?ms)^\[profile ' + [regex]::Escape($p) + '\].*?(?=^\[|\Z)'; $existing = [regex]::Replace($existing, $pattern, ''); $stanza = '[profile ' + $p + ']' + $nl + 'credential_process = ' + $credProcess + ' --profile ' + $p + $nl + 'region = ' + $region + $nl; $existing = $existing.TrimEnd() + $nl + $nl + $stanza; Write-Host ('  OK Configured AWS profile ' + $p) }}; Set-Content -Path $awsConfig -Value $existing.TrimStart() -NoNewline -Encoding ASCII"
+powershell -NoProfile -Command "$ErrorActionPreference = 'Stop'; $nl = [char]13 + [char]10; $cfg = Get-Content config.json | ConvertFrom-Json; $awsConfig = Join-Path $env:USERPROFILE '.aws\\config'; $credProcess = Join-Path $env:USERPROFILE 'claude-code-with-bedrock\\credential-process.exe'; $existing = if (Test-Path $awsConfig) {{ Get-Content $awsConfig -Raw }} else {{ '' }}; foreach ($p in $cfg.PSObject.Properties.Name) {{ $region = $cfg.$p.aws_region; if (-not $region) {{ $region = '{profile.aws_region}' }}; $pattern = '(?ms)^\\[profile ' + [regex]::Escape($p) + '\\].*?(?=^\\[|\\Z)'; $existing = [regex]::Replace($existing, $pattern, ''); $stanza = '[profile ' + $p + ']' + $nl + 'credential_process = ' + $credProcess + ' --profile ' + $p + $nl + 'region = ' + $region + $nl; $existing = $existing.TrimEnd() + $nl + $nl + $stanza; Write-Host ('  OK Configured AWS profile ' + $p) }}; Set-Content -Path $awsConfig -Value $existing.TrimStart() -NoNewline -Encoding ASCII"
 if %errorlevel% neq 0 (
     echo ERROR: Failed to configure AWS profiles
     pause
@@ -3130,7 +3168,7 @@ Available metrics include:
 """
             readme_content += analytics_section
 
-        readme_content += "\n" ""
+        readme_content += "\n"
 
         with open(output_dir / "README.md", "w", encoding="utf-8") as f:
             f.write(readme_content)
@@ -3234,14 +3272,16 @@ Available metrics include:
             if profile.monitoring_enabled:
                 # Default to the local sidecar collector for reliable token counting
                 otel_endpoint = "http://localhost:4318"
-                settings["env"].update({
-                    "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
-                    "OTEL_METRICS_EXPORTER": "otlp",
-                    "OTEL_LOGS_EXPORTER": "otlp",
-                    "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
-                    "OTEL_EXPORTER_OTLP_ENDPOINT": otel_endpoint,
-                    "OTEL_RESOURCE_ATTRIBUTES": "department=engineering,team.id=default,cost_center=default,organization=default",
-                })
+                settings["env"].update(
+                    {
+                        "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+                        "OTEL_METRICS_EXPORTER": "otlp",
+                        "OTEL_LOGS_EXPORTER": "otlp",
+                        "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+                        "OTEL_EXPORTER_OTLP_ENDPOINT": otel_endpoint,
+                        "OTEL_RESOURCE_ATTRIBUTES": "department=engineering,team.id=default,cost_center=default,organization=default",
+                    }
+                )
                 settings["otelHeadersHelper"] = "__OTEL_HELPER_PATH__"
 
                 # Try to get a custom endpoint from the monitoring stack (overrides the sidecar default)
@@ -3310,7 +3350,6 @@ Available metrics include:
 
         except Exception as e:
             console.print(f"[yellow]Warning: Could not create Claude Code settings: {e}[/yellow]")
-
 
     def _generate_cowork_3p_mdm_config(
         self,

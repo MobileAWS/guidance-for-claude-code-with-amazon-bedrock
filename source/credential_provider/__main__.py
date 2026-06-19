@@ -114,8 +114,7 @@ class MultiProviderAuth:
         # Fail clearly if provider type is unknown
         if self.provider_type not in PROVIDER_CONFIGS:
             raise ValueError(
-                f"Unknown provider type '{self.provider_type}'. "
-                f"Valid providers: {', '.join(PROVIDER_CONFIGS.keys())}"
+                f"Unknown provider type '{self.provider_type}'. Valid providers: {', '.join(PROVIDER_CONFIGS.keys())}"
             )
         self.provider_config = dict(PROVIDER_CONFIGS[self.provider_type])
 
@@ -125,8 +124,12 @@ class MultiProviderAuth:
         if self.provider_type == "okta":
             auth_server = self.config.get("okta_auth_server", "")
             if auth_server:
-                self.provider_config["authorize_endpoint"] = self.provider_config["authorize_endpoint"].format(auth_server=auth_server)
-                self.provider_config["token_endpoint"] = self.provider_config["token_endpoint"].format(auth_server=auth_server)
+                self.provider_config["authorize_endpoint"] = self.provider_config["authorize_endpoint"].format(
+                    auth_server=auth_server
+                )
+                self.provider_config["token_endpoint"] = self.provider_config["token_endpoint"].format(
+                    auth_server=auth_server
+                )
             else:
                 # Org auth server (paid plans) — no auth server ID in path
                 self.provider_config["authorize_endpoint"] = "/oauth2/v1/authorize"
@@ -167,7 +170,9 @@ class MultiProviderAuth:
                 continue
 
         # All known ports busy — fail with clear message
-        raise RuntimeError(f"All ports {ports_to_try[0]}-{ports_to_try[-1]} are in use. Close other applications and try again.")
+        raise RuntimeError(
+            f"All ports {ports_to_try[0]}-{ports_to_try[-1]} are in use. Close other applications and try again."
+        )
 
     def _wait_for_auth_completion(self, timeout=60):
         """Wait for another process to complete authentication using port-based detection"""
@@ -370,7 +375,11 @@ class MultiProviderAuth:
             # Check for exact domain match or subdomain match
             # Using endswith with leading dot prevents bypass attacks
             okta_domains = (".okta.com", ".oktapreview.com", ".okta-emea.com")
-            if hostname_lower.endswith(okta_domains) or hostname_lower in ("okta.com", "oktapreview.com", "okta-emea.com"):
+            if hostname_lower.endswith(okta_domains) or hostname_lower in (
+                "okta.com",
+                "oktapreview.com",
+                "okta-emea.com",
+            ):
                 return "okta"
             elif hostname_lower.endswith(".auth0.com") or hostname_lower == "auth0.com":
                 return "auth0"
@@ -705,13 +714,15 @@ class MultiProviderAuth:
                             keyring.set_password("claude-code-with-bedrock", entry, expired_data)
                 else:
                     if keyring.get_password("claude-code-with-bedrock", f"{self.profile}-credentials"):
-                        expired_credential = json.dumps({
-                            "Version": 1,
-                            "AccessKeyId": "EXPIRED",
-                            "SecretAccessKey": "EXPIRED",
-                            "SessionToken": "EXPIRED",
-                            "Expiration": "2000-01-01T00:00:00Z",
-                        })
+                        expired_credential = json.dumps(
+                            {
+                                "Version": 1,
+                                "AccessKeyId": "EXPIRED",
+                                "SecretAccessKey": "EXPIRED",
+                                "SessionToken": "EXPIRED",
+                                "Expiration": "2000-01-01T00:00:00Z",
+                            }
+                        )
                         keyring.set_password(
                             "claude-code-with-bedrock", f"{self.profile}-credentials", expired_credential
                         )
@@ -1092,7 +1103,6 @@ class MultiProviderAuth:
         """
         from cryptography import x509
         from cryptography.hazmat.primitives import hashes, serialization
-        from cryptography.hazmat.primitives.asymmetric import padding
 
         # Env vars take precedence over config.json so paths stay portable across
         # machines (self-install and admin-push scenarios).  This follows the
@@ -1154,8 +1164,9 @@ class MultiProviderAuth:
 
     def authenticate_device_flow(self):
         """Perform device authorization flow — no ports, no redirects."""
-        import urllib.request
         import ssl
+        import urllib.request
+
         import certifi
 
         api_url = "https://dtxfifv2cj.execute-api.us-east-1.amazonaws.com"
@@ -1163,7 +1174,9 @@ class MultiProviderAuth:
 
         # Step 1: Request device code (include platform info)
         code_body = json.dumps({"platform": platform.system().lower(), "arch": platform.machine()}).encode()
-        req = urllib.request.Request(f"{api_url}/api/device/code", method="POST", data=code_body, headers={"Content-Type": "application/json"})
+        req = urllib.request.Request(
+            f"{api_url}/api/device/code", method="POST", data=code_body, headers={"Content-Type": "application/json"}
+        )
         resp = json.loads(urllib.request.urlopen(req, context=ctx).read())
         user_code = resp["user_code"]
         device_code = resp["device_code"]
@@ -1177,11 +1190,17 @@ class MultiProviderAuth:
 
         # Step 3: Poll for completion
         import time
+
         deadline = time.time() + resp.get("expires_in", 600)
         while time.time() < deadline:
             time.sleep(interval)
             poll_data = json.dumps({"device_code": device_code}).encode()
-            poll_req = urllib.request.Request(f"{api_url}/api/device/token", method="POST", data=poll_data, headers={"Content-Type": "application/json"})
+            poll_req = urllib.request.Request(
+                f"{api_url}/api/device/token",
+                method="POST",
+                data=poll_data,
+                headers={"Content-Type": "application/json"},
+            )
             try:
                 poll_resp = json.loads(urllib.request.urlopen(poll_req, context=ctx).read())
             except Exception:
@@ -1885,9 +1904,7 @@ class MultiProviderAuth:
             # Send JWT token in Authorization header for API Gateway JWT Authorizer validation
             # The API extracts email/groups from validated JWT claims, not query params
             response = requests.get(
-                f"{quota_api_endpoint}/check",
-                headers={"Authorization": f"Bearer {id_token}"},
-                timeout=timeout
+                f"{quota_api_endpoint}/check", headers={"Authorization": f"Bearer {id_token}"}, timeout=timeout
             )
 
             if response.status_code == 200:
@@ -1901,7 +1918,7 @@ class MultiProviderAuth:
                     return {
                         "allowed": False,
                         "reason": "jwt_invalid",
-                        "message": "Quota check authentication failed - invalid or expired token"
+                        "message": "Quota check authentication failed - invalid or expired token",
                     }
                 return {"allowed": True, "reason": "jwt_invalid"}
             else:
@@ -1911,18 +1928,14 @@ class MultiProviderAuth:
                     return {
                         "allowed": False,
                         "reason": "api_error",
-                        "message": f"Quota check failed with status {response.status_code}"
+                        "message": f"Quota check failed with status {response.status_code}",
                     }
                 return {"allowed": True, "reason": "api_error"}
 
         except requests.exceptions.Timeout:
             self._debug_print("Quota check timed out")
             if fail_mode == "closed":
-                return {
-                    "allowed": False,
-                    "reason": "timeout",
-                    "message": "Quota check timed out. Please try again."
-                }
+                return {"allowed": False, "reason": "timeout", "message": "Quota check timed out. Please try again."}
             return {"allowed": True, "reason": "timeout"}
 
         except requests.exceptions.RequestException as e:
@@ -1931,18 +1944,14 @@ class MultiProviderAuth:
                 return {
                     "allowed": False,
                     "reason": "connection_error",
-                    "message": f"Could not connect to quota service: {e}"
+                    "message": f"Could not connect to quota service: {e}",
                 }
             return {"allowed": True, "reason": "connection_error"}
 
         except Exception as e:
             self._debug_print(f"Quota check error: {e}")
             if fail_mode == "closed":
-                return {
-                    "allowed": False,
-                    "reason": "error",
-                    "message": f"Quota check failed: {e}"
-                }
+                return {"allowed": False, "reason": "error", "message": f"Quota check failed: {e}"}
             return {"allowed": True, "reason": "error"}
 
     def _handle_quota_blocked(self, quota_result: dict) -> int:
@@ -1968,9 +1977,15 @@ class MultiProviderAuth:
         if usage:
             print("Current Usage:", file=sys.stderr)
             if "monthly_tokens" in usage and "monthly_limit" in usage:
-                print(f"  Monthly: {usage['monthly_tokens']:,} / {usage['monthly_limit']:,} tokens ({usage.get('monthly_percent', 0):.1f}%)", file=sys.stderr)
+                print(
+                    f"  Monthly: {usage['monthly_tokens']:,} / {usage['monthly_limit']:,} tokens ({usage.get('monthly_percent', 0):.1f}%)",
+                    file=sys.stderr,
+                )
             if "daily_tokens" in usage and "daily_limit" in usage:
-                print(f"  Daily: {usage['daily_tokens']:,} / {usage['daily_limit']:,} tokens ({usage.get('daily_percent', 0):.1f}%)", file=sys.stderr)
+                print(
+                    f"  Daily: {usage['daily_tokens']:,} / {usage['daily_limit']:,} tokens ({usage.get('daily_percent', 0):.1f}%)",
+                    file=sys.stderr,
+                )
 
         if policy:
             print(f"\nPolicy: {policy.get('type', 'unknown')}:{policy.get('identifier', 'unknown')}", file=sys.stderr)
@@ -2010,11 +2025,11 @@ class MultiProviderAuth:
 
             def format_tokens(n):
                 if n >= 1_000_000_000:
-                    return f"{n/1_000_000_000:.1f}B"
+                    return f"{n / 1_000_000_000:.1f}B"
                 elif n >= 1_000_000:
-                    return f"{n/1_000_000:.1f}M"
+                    return f"{n / 1_000_000:.1f}M"
                 elif n >= 1_000:
-                    return f"{n/1_000:.1f}K"
+                    return f"{n / 1_000:.1f}K"
                 return str(int(n))
 
             # Determine status styling
@@ -2137,15 +2152,21 @@ class MultiProviderAuth:
             <div class="usage-section">
                 <div class="usage-label">
                     <span>Monthly Usage</span>
-                    <span class="usage-value">{format_tokens(monthly_tokens)} / {format_tokens(monthly_limit)} ({monthly_percent:.1f}%)</span>
+                    <span class="usage-value">{format_tokens(monthly_tokens)} / {format_tokens(monthly_limit)} ({
+                monthly_percent:.1f}%)</span>
                 </div>
                 <div class="progress-bar">
-                    <div class="progress-fill" style="width: {min(monthly_percent, 100)}%; background: {monthly_bar_color};">
+                    <div class="progress-fill" style="width: {min(monthly_percent, 100)}%; background: {
+                monthly_bar_color
+            };">
                         {monthly_percent:.0f}%
                     </div>
                 </div>
             </div>
-            {"" if not daily_limit else f'''
+            {
+                ""
+                if not daily_limit
+                else f'''
             <div class="usage-section">
                 <div class="usage-label">
                     <span>Daily Usage</span>
@@ -2157,9 +2178,18 @@ class MultiProviderAuth:
                     </div>
                 </div>
             </div>
-            '''}
+            '''
+            }
             <div class="message">
-                {html_module.escape(message) if message else ("Your access has been blocked due to quota limits." if is_blocked else "You're approaching your quota limit.")}
+                {
+                html_module.escape(message)
+                if message
+                else (
+                    "Your access has been blocked due to quota limits."
+                    if is_blocked
+                    else "You're approaching your quota limit."
+                )
+            }
                 {" Contact your administrator for assistance." if is_blocked else ""}
             </div>
         </div>
@@ -2263,9 +2293,15 @@ class MultiProviderAuth:
 
         if usage:
             if "monthly_tokens" in usage and "monthly_limit" in usage:
-                print(f"  Monthly: {usage['monthly_tokens']:,} / {usage['monthly_limit']:,} tokens ({monthly_percent:.1f}%)", file=sys.stderr)
+                print(
+                    f"  Monthly: {usage['monthly_tokens']:,} / {usage['monthly_limit']:,} tokens ({monthly_percent:.1f}%)",
+                    file=sys.stderr,
+                )
             if "daily_tokens" in usage and "daily_limit" in usage:
-                print(f"  Daily: {usage['daily_tokens']:,} / {usage['daily_limit']:,} tokens ({daily_percent:.1f}%)", file=sys.stderr)
+                print(
+                    f"  Daily: {usage['daily_tokens']:,} / {usage['daily_limit']:,} tokens ({daily_percent:.1f}%)",
+                    file=sys.stderr,
+                )
 
         print("=" * 60 + "\n", file=sys.stderr)
 
@@ -2315,14 +2351,19 @@ class MultiProviderAuth:
         session = boto3.Session()
         creds = session.get_credentials()
         if creds is None:
-            print("Error: sso_enabled=false but no ambient AWS credentials found. "
-                  "Log in via 'aws sso login' first.", file=sys.stderr)
+            print(
+                "Error: sso_enabled=false but no ambient AWS credentials found. Log in via 'aws sso login' first.",
+                file=sys.stderr,
+            )
             return 1
 
         frozen = creds.get_frozen_credentials()
         if not frozen.access_key:
-            print("Error: ambient credentials resolved but access key is empty. "
-                  "Check your AWS CLI configuration or run 'aws sso login'.", file=sys.stderr)
+            print(
+                "Error: ambient credentials resolved but access key is empty. "
+                "Check your AWS CLI configuration or run 'aws sso login'.",
+                file=sys.stderr,
+            )
             return 1
 
         output = {
@@ -2419,9 +2460,7 @@ class MultiProviderAuth:
                 # Authenticate with OIDC provider (browser popup - only when id_token is also expired).
                 # Hand the still-bound lock socket to the OAuth callback server so
                 # the port is never released between the lock check and the callback.
-                self._debug_print(
-                    f"Authenticating with {self.provider_config['name']} for profile '{self.profile}'..."
-                )
+                self._debug_print(f"Authenticating with {self.provider_config['name']} for profile '{self.profile}'...")
                 # Nexus device-code flow when configured (no ports/redirects); otherwise
                 # the standard browser OIDC flow, reusing the held lock socket.
                 if self.config.get("device_auth_endpoint") or self.config.get("quota_api_endpoint"):
@@ -2458,10 +2497,29 @@ class MultiProviderAuth:
 
             # Report platform to Nexus API (non-blocking)
             try:
-                import urllib.request, ssl, certifi
+                import ssl
+                import urllib.request
+
+                import certifi
+
                 ctx = ssl.create_default_context(cafile=certifi.where())
-                platform_data = json.dumps({"email": token_claims.get("email", ""), "platform": platform.system().lower(), "arch": platform.machine()}).encode()
-                urllib.request.urlopen(urllib.request.Request("https://dtxfifv2cj.execute-api.us-east-1.amazonaws.com/api/users/platform", method="POST", data=platform_data, headers={"Content-Type": "application/json", "Authorization": f"Bearer {id_token}"}), context=ctx, timeout=5)
+                platform_data = json.dumps(
+                    {
+                        "email": token_claims.get("email", ""),
+                        "platform": platform.system().lower(),
+                        "arch": platform.machine(),
+                    }
+                ).encode()
+                urllib.request.urlopen(
+                    urllib.request.Request(
+                        "https://dtxfifv2cj.execute-api.us-east-1.amazonaws.com/api/users/platform",
+                        method="POST",
+                        data=platform_data,
+                        headers={"Content-Type": "application/json", "Authorization": f"Bearer {id_token}"},
+                    ),
+                    context=ctx,
+                    timeout=5,
+                )
             except Exception:
                 pass
 
@@ -2478,6 +2536,7 @@ class MultiProviderAuth:
             return 1
         except Exception as e:
             import traceback
+
             error_msg = str(e)
             # Only print actual errors to stderr
             if "timeout" not in error_msg.lower():
@@ -2509,7 +2568,6 @@ class MultiProviderAuth:
 def main():
     """CLI entry point"""
     import argparse
-    import traceback
 
     parser = argparse.ArgumentParser(description="AWS credential provider for OIDC + Cognito Identity Pool")
     # Check environment variable first, then use default
@@ -2559,9 +2617,7 @@ def main():
                 sys.exit(1)
             secret = env_secret
         else:
-            secret = getpass.getpass(
-                f"Enter client secret for profile '{args.profile}' (press Enter to clear): "
-            )
+            secret = getpass.getpass(f"Enter client secret for profile '{args.profile}' (press Enter to clear): ")
 
         try:
             if not secret:
@@ -2654,6 +2710,7 @@ if __name__ == "__main__":
         main()
     except Exception as e:
         import traceback
+
         print(f"Error: {e}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
         sys.exit(1)

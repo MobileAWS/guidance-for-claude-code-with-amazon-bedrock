@@ -405,10 +405,44 @@
 
 <!-- ===================== PHASE 3 ===================== -->
 <section id="p3">
-  <span class="phase-label pending">Phase 3 · not started</span>
+  <span class="phase-label done">Phase 3a · structural move done</span>
+  <span class="phase-label pending">Phase 3b · contracts/pipeline pending</span>
   <h2 class="section" style="border-top:none;margin-top:6px;padding-top:0;">Extract console + API into the UI repo</h2>
-  <p class="muted">Relocate the Nexus API, Lambdas, and infrastructure into <code>allcode-nexus-ui</code> with
-  preserved history; formalize the three cross-repo contracts. No entries yet.</p>
+  <p>The Nexus management backend was relocated to <code>MobileAWS/allcode-nexus-ui</code> with <strong>full git
+  history preserved</strong>, leaving the kit clean. Done on branches in both repos; <strong>nothing pushed</strong>.</p>
+
+  <h3>What moved (15 files → product repo)</h3>
+  <table>
+    <thead><tr><th>From (kit)</th><th>To (allcode-nexus-ui)</th></tr></thead>
+    <tbody>
+      <tr><td><code>lambda-functions/nexus-api</code></td><td><code>api/</code></td></tr>
+      <tr><td><code>lambda-functions/nexus-{device-auth,metering,registration,package-gen,post-confirm}</code></td><td><code>functions/{device-auth,…}</code></td></tr>
+      <tr><td><code>nexus-governance-agent/</code></td><td><code>governance-agent/</code></td></tr>
+      <tr><td><code>nexus-{ui,marketplace,transform,customer-onboarding,connector}.yaml</code> + <code>nexus-transform-mcp.json</code></td><td><code>infra/</code></td></tr>
+    </tbody>
+  </table>
+  <h3>Method &amp; verification</h3>
+  <ul>
+    <li><strong>History-preserving:</strong> <code>git filter-repo</code> on a throwaway fork clone kept only the 15
+      paths (13 commits preserved), imported into product branch <code>import/nexus-backend</code> via
+      <code>merge --allow-unrelated-histories</code>, then <code>git mv</code> into the product layout. Verified:
+      <code>git log --follow api/index.py</code> shows the full original history; product <code>src/</code> intact; no kit files leaked.</li>
+    <li><strong>Kit kept:</strong> <code>source/go/internal/nexus</code> (the credential-helper's device-flow /
+      platform-report <em>client</em> — the runtime contract, not the backend) and all auth/monitoring/quota CFN.</li>
+    <li><strong>Fork deletion</strong> (commit <span class="commit">873806e</span> on <code>upgrade/upstream-sync</code>):
+      removed the 15 files. Python suite 896 pass (the ~30 dropped cases were parametrized over the removed nexus
+      templates; glob tests handle fewer files gracefully); Go build/test unaffected.</li>
+  </ul>
+  <div class="callout warn"><strong>Both branches are unpushed</strong> — product <code>import/nexus-backend</code> and
+  kit <code>upgrade/upstream-sync</code> — for review. Don't push until the live identifiers are externalized
+  (the moved code still carries them).</div>
+
+  <h3 id="p3b">Phase 3b — remaining (not started)</h3>
+  <p class="muted">Formalize the 3 cross-repo contracts (versioned installer artifacts; an <code>/api/v1</code> OpenAPI
+  spec; stack-output-driven IAM with no hard-coded ARNs); stand up the product repo's deploy pipeline (replace
+  <code>nexus-ui.yaml</code>'s inline Lambda placeholder with a real S3-deployed package; build/push the
+  governance-agent image); externalize the hard-coded AllCode account values; resolve shared-table ownership. See the
+  plan's Phase 3 · contracts / deploy sections.</p>
 </section>
 
 <footer>

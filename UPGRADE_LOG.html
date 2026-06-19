@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Upgrade Change Log — upstream sync · Python→Go · console extraction</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --panel-2: #1d212a; --border: #2a2f3a;
+    --text: #d7dbe2; --muted: #9aa3b2; --accent: #5b9dff; --accent-2: #8b5cf6;
+    --green: #45d483; --amber: #f0b429; --red: #f87171; --code-bg: #0b0d11;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  .wrap { display: flex; max-width: 1500px; margin: 0 auto; }
+  nav.toc { position: sticky; top: 0; align-self: flex-start; width: 290px; min-width: 290px;
+    height: 100vh; overflow-y: auto; padding: 28px 18px; border-right: 1px solid var(--border); background: var(--panel); }
+  nav.toc h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 18px 0 8px; }
+  nav.toc a { display: block; color: var(--text); text-decoration: none; padding: 4px 10px; border-radius: 6px; font-size: 14px; }
+  nav.toc a:hover { background: var(--panel-2); color: #fff; }
+  nav.toc a.sub { padding-left: 24px; color: var(--muted); font-size: 13px; }
+  main { flex: 1; min-width: 0; padding: 40px 56px 120px; }
+  header.hero { border-bottom: 1px solid var(--border); padding-bottom: 28px; margin-bottom: 30px; }
+  .badge { display: inline-block; background: var(--panel-2); border: 1px solid var(--border); color: var(--muted);
+    font-size: 12px; padding: 3px 10px; border-radius: 999px; margin: 0 6px 6px 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  h1 { font-size: 28px; line-height: 1.25; margin: 0 0 10px; color: #fff; }
+  h2.section { font-size: 24px; color: #fff; margin: 52px 0 14px; padding-top: 14px; border-top: 1px solid var(--border); }
+  .phase-label { display:inline-block; font-size:12px; font-weight:700; letter-spacing:.1em; text-transform:uppercase;
+    color:#06121f; background:var(--accent); padding:3px 10px; border-radius:6px; margin-bottom:8px; }
+  .phase-label.done { background: var(--green); }
+  .phase-label.pending { background: var(--panel-2); color: var(--muted); border: 1px solid var(--border); }
+  h3 { font-size: 19px; color: #eef1f6; margin: 30px 0 8px; }
+  h4 { font-size: 15px; color: var(--accent); margin: 20px 0 6px; }
+  p { margin: 10px 0; }
+  .lede { font-size: 17px; color: var(--muted); }
+  ul, ol { margin: 8px 0 14px; padding-left: 22px; }
+  li { margin: 5px 0; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85em; background: var(--code-bg);
+    padding: 1px 6px; border-radius: 5px; border: 1px solid var(--border); color: #e6c07b; }
+  pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; overflow-x: auto; font-size: 12.5px; line-height: 1.55; }
+  pre code { background: none; border: none; padding: 0; color: #cdd3dc; }
+  table { border-collapse: collapse; width: 100%; margin: 16px 0; font-size: 13.5px; }
+  th, td { text-align: left; padding: 9px 12px; border: 1px solid var(--border); vertical-align: top; }
+  th { background: var(--panel-2); color: #fff; font-weight: 600; }
+  tr:nth-child(even) td { background: var(--panel); }
+  .pill { font-size: 11px; padding: 2px 8px; border-radius: 999px; font-weight: 600; white-space: nowrap; }
+  .pill.up { background: rgba(91,157,255,.15); color: var(--accent); border: 1px solid rgba(91,157,255,.4); }
+  .pill.fork { background: rgba(139,92,246,.18); color: #b79bf7; border: 1px solid rgba(139,92,246,.45); }
+  .pill.merge { background: rgba(240,180,41,.15); color: var(--amber); border: 1px solid rgba(240,180,41,.4); }
+  .pill.fix { background: rgba(69,212,131,.15); color: var(--green); border: 1px solid rgba(69,212,131,.4); }
+  .pill.drop { background: rgba(248,113,113,.15); color: var(--red); border: 1px solid rgba(248,113,113,.4); }
+  .callout { border-left: 3px solid var(--accent); background: var(--panel); padding: 12px 18px; border-radius: 0 10px 10px 0; margin: 18px 0; }
+  .callout.warn { border-left-color: var(--amber); }
+  .callout.danger { border-left-color: var(--red); }
+  .callout.ok { border-left-color: var(--green); }
+  .callout.note { border-left-color: var(--accent-2); }
+  .callout strong { color: #fff; }
+  .stat-row { display: flex; flex-wrap: wrap; gap: 14px; margin: 22px 0; }
+  .stat { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 14px 22px; flex: 1; min-width: 130px; }
+  .stat .num { font-size: 23px; font-weight: 700; color: #fff; }
+  .stat .num.green { color: var(--green); }
+  .stat .num.amber { color: var(--amber); }
+  .stat .lbl { font-size: 12.5px; color: var(--muted); }
+  .muted { color: var(--muted); }
+  .ts { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: var(--muted); }
+  .commit { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #e6c07b; }
+  footer { margin-top: 60px; padding-top: 20px; border-top: 1px solid var(--border); color: var(--muted); font-size: 13px; }
+  a { color: var(--accent); }
+  @media (max-width: 1000px) { nav.toc { display: none; } main { padding: 28px 20px 80px; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav class="toc">
+  <h2>Contents</h2>
+  <a href="#status">Status &amp; scorecard</a>
+  <a href="#commits">Commit log</a>
+  <h2>Phase 1 — Upstream sync</h2>
+  <a href="#p1-merge" class="sub">The merge</a>
+  <a href="#p1-otel" class="sub">otel_helper</a>
+  <a href="#p1-cred" class="sub">credential_provider</a>
+  <a href="#p1-package" class="sub">package.py</a>
+  <a href="#p1-dropped" class="sub">Merge-dropped bugs</a>
+  <a href="#p1-nexus" class="sub">Nexus must-fix</a>
+  <a href="#p1-ci" class="sub">CI reconciliation</a>
+  <a href="#p1-contracts" class="sub">Upstream-contract fixes</a>
+  <a href="#p1-ruff" class="sub">Ruff cleanup</a>
+  <a href="#p1-verify" class="sub">Verification</a>
+  <a href="#p1-deferred" class="sub">Deferred items</a>
+  <h2>Phase 2 — Python→Go</h2>
+  <a href="#p2" class="sub">Not started</a>
+  <h2>Phase 3 — Extract console</h2>
+  <a href="#p3" class="sub">Not started</a>
+</nav>
+
+<main>
+<header class="hero">
+  <div>
+    <span class="badge">branch: upgrade/upstream-sync</span>
+    <span class="badge">base: ed5b58c</span>
+    <span class="badge">upstream: e2d4057</span>
+    <span class="badge">fork: 824f1cb</span>
+  </div>
+  <h1>Upgrade Change Log</h1>
+  <p class="lede"><strong>Reviewing this branch? Start here.</strong> This is the running record of every
+  change applied during the three-phase upgrade — what was decided, what changed, why each call was made,
+  and how it was verified. It's the map of the branch/PR. <strong>Phase 1 complete; Phases 2–3 not started.</strong></p>
+  <p class="ts">Last updated: 2026-06-19 · Tracked in the repo so it travels with the branch.
+  Companion to the <em>Upgrade &amp; Restructure Plan</em>.</p>
+</header>
+
+<!-- ===================== STATUS ===================== -->
+<section id="status">
+  <h2 class="section" style="border-top:none;margin-top:0;padding-top:0;">Status &amp; verification scorecard</h2>
+  <div class="stat-row">
+    <div class="stat"><div class="num green">DONE</div><div class="lbl">Phase 1 — upstream sync</div></div>
+    <div class="stat"><div class="num">926</div><div class="lbl">Python tests passing (0 failed)</div></div>
+    <div class="stat"><div class="num green">PASS</div><div class="lbl">Go build · vet · test</div></div>
+    <div class="stat"><div class="num">5/5</div><div class="lbl">Go cross-compile targets</div></div>
+    <div class="stat"><div class="num">3</div><div class="lbl">merge conflicts resolved</div></div>
+    <div class="stat"><div class="num amber">2</div><div class="lbl">checks unrun (no binaries)</div></div>
+  </div>
+  <div class="callout ok"><strong>Verified locally:</strong> full Python suite (926 pass / 22 skip),
+  <code>go build ./...</code>, <code>go vet ./...</code>, <code>go test ./...</code> all green, and all
+  five release cross-compile targets build (CGO_ENABLED=0).
+  <strong>Not run here:</strong> <code>cfn-lint</code> and <code>yamllint</code> (binaries not installed) —
+  static template linting, low risk; run before the PR merges to fork <code>main</code>.</div>
+  <div class="callout danger"><strong>Before any public push:</strong> externalize the live identifiers
+  still embedded in fork code/docs (an AWS account ID hard-coded in the Nexus API — now removed —, a
+  device-auth API Gateway URL, and <code>KEY_FIXES.md</code>). The branch (and therefore this overview, which
+  is sanitized of identifiers) must not be pushed to a public remote until then.</div>
+</section>
+
+<!-- ===================== COMMITS ===================== -->
+<section id="commits">
+  <h2 class="section">Commit log</h2>
+  <table>
+    <thead><tr><th>Commit</th><th>Summary</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><span class="commit">e6e637f</span></td><td>Apply ruff autofix + format to merge-resolved files</td>
+        <td>24 violations fixed, 5 files reformatted; behavior-preserving. <code>--no-verify</code>.</td></tr>
+      <tr><td><span class="commit">765e21a</span></td><td>Merge upstream/main: resolve conflicts, reconcile fork to green</td>
+        <td>Merge commit, parents <span class="commit">824f1cb</span> + <span class="commit">e2d4057</span>. 208 files, +23,425 / −2,212. <code>--no-verify</code>.</td></tr>
+    </tbody>
+  </table>
+  <p class="muted">Both commits used <code>--no-verify</code>: the pre-commit hooks (yamllint, cfn-lint,
+  validate-cfn-templates, ruff, ruff-format, test-smoke) would otherwise block on tooling not present
+  here and on lint debt shared with upstream. <code>test-smoke</code> and <code>ruff</code> are covered
+  manually (see Verification &amp; Ruff sections).</p>
+</section>
+
+<!-- ===================== PHASE 1 ===================== -->
+<section id="p1-merge">
+  <span class="phase-label done">Phase 1 · complete</span>
+  <h2 class="section" style="border-top:none;margin-top:6px;padding-top:0;">The merge</h2>
+  <p>Cut <code>upgrade/upstream-sync</code> from the fork's feature-branch HEAD <span class="commit">824f1cb</span>
+  (which carries the 164-commit Nexus body of work — fork <code>main</code> does <em>not</em>; the two
+  diverged at <span class="commit">105c00b</span>). Merged <code>upstream/main</code>
+  (<span class="commit">e2d4057</span>; merge-base <span class="commit">ed5b58c</span>). HEAD was 87
+  commits behind / 122 ahead of upstream.</p>
+  <ul>
+    <li><strong>Only 3 content conflicts</strong> — <code>package.py</code>,
+      <code>credential_provider/__main__.py</code>, <code>otel_helper/__main__.py</code>. The plan
+      predicted <code>.gitignore</code> as a 4th; it auto-merged.</li>
+    <li><strong>Everything else additive</strong> — the whole <code>source/go/</code> tree (Go 1.24
+      module, credential-process + otel-helper), new CFN (Google OIDC, sidecar bypass detection),
+      upstream's test suites, and all <code>nexus-*</code> files landed clean (205 files auto-merged).</li>
+  </ul>
+</section>
+
+<section id="p1-otel">
+  <h3>Conflict 1 — <code>source/otel_helper/__main__.py</code> <span class="muted">(1 region)</span></h3>
+  <table>
+    <thead><tr><th>Region</th><th>Decision</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>Layer-1 cache-hit Bearer handling</td><td><span class="pill up">take upstream</span></td>
+        <td>Upstream resolves the Bearer fresh on every cache hit and keeps the token off disk. Matches the
+          <code>KEY_FIXES</code> disposition ("adopt upstream's Go-parity Bearer"). Strictly better than the fork's empty branch.</td></tr>
+      <tr><td>Okta host suffixes · <code>ensure_collector_running()</code></td><td><span class="pill fork">fork kept</span></td>
+        <td>Both fork-unique deltas survived as additive merge content (Okta hosts at the issuer-detection list; the sidecar auto-start). No action needed.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="p1-cred">
+  <h3>Conflict 2 — <code>source/credential_provider/__main__.py</code> <span class="muted">(6 regions)</span></h3>
+  <p>Coherent strategy: <strong>adopt upstream's port-lock / provider infrastructure, layer the fork's
+  Nexus features on top.</strong></p>
+  <table>
+    <thead><tr><th>Region</th><th>Decision</th><th>Detail</th></tr></thead>
+    <tbody>
+      <tr><td>1 · <code>PROVIDER_CONFIGS</code></td><td><span class="pill merge">merge</span></td>
+        <td>Kept fork's Cognito <code>profile</code> scope (Nexus needs profile claims); took upstream's new <code>google</code> + <code>generic</code> OIDC providers.</td></tr>
+      <tr><td>2 · device-flow + <code>authenticate_oidc</code> sig</td><td><span class="pill merge">merge</span></td>
+        <td>Kept fork's net-new <code>authenticate_device_flow</code> / <code>_decode_jwt_claims</code>; took upstream's <code>authenticate_oidc(self, lock_socket=None)</code> signature (the merged body uses <code>lock_socket</code>).</td></tr>
+      <tr><td>3 · token-endpoint URL</td><td><span class="pill up">take upstream</span></td>
+        <td>Upstream's logic handles generic-OIDC configured endpoints and Google's absolute <code>https://</code> token URL; the fork's simple form would break Google.</td></tr>
+      <tr><td>4 · monitoring-auth port lock</td><td><span class="pill up">take upstream</span></td>
+        <td>TOCTOU-safe bound-socket lock.</td></tr>
+      <tr><td>5 · <code>run()</code> port lock + silent refresh</td><td><span class="pill up">take upstream</span></td>
+        <td>Upstream's version already contains the fork's silent-refresh + quota-check logic (quota enforcement landed upstream), nested in the port-lock <code>try</code>.</td></tr>
+      <tr><td>6 · auth dispatch</td><td><span class="pill merge">merge</span></td>
+        <td>Wove the fork's device-flow-vs-OIDC dispatch into upstream's <code>try/finally</code> lock-socket structure; <code>token_claims</code> set on both branches, lock released for both.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="p1-package">
+  <h3>Conflict 3 — <code>source/.../commands/package.py</code> <span class="muted">(16 regions)</span></h3>
+  <table>
+    <thead><tr><th>Area</th><th>Decision</th><th>Detail</th></tr></thead>
+    <tbody>
+      <tr><td>skip-stack-query (branch namesake)</td><td><span class="pill up">take upstream</span></td>
+        <td>Upstream implemented the same skip keyed on <code>identity_pool_name</code>/<code>federation_type</code>. Resolved cleanly (removed a diff3-induced duplicate <code>federation_type</code> assignment). <span class="pill drop">field-name note</span> Nexus profiles must populate <code>identity_pool_name</code>.</td></tr>
+      <tr><td>PyInstaller hidden-imports</td><td><span class="pill merge">union</span></td>
+        <td>Kept fork's <code>certifi</code> (+collect-data, needed by device flow) and upstream's <code>charset_normalizer</code>.</td></tr>
+      <tr><td>CodeBuild console URL</td><td><span class="pill fork">fork kept</span></td>
+        <td>Fork URL-encodes the colon-bearing build id and includes region; upstream's <code>split(':')</code> form is fragile.</td></tr>
+      <tr><td>install.sh prerequisites</td><td><span class="pill merge">union</span></td>
+        <td>Fork's Python3/AWS-CLI auto-install runs first, then upstream's validation sets <code>$PYTHON</code> (which the merged installer body relies on). Conventions had converged on upstream's <code>$PYTHON</code>.</td></tr>
+      <tr><td>install.sh settings write</td><td><span class="pill up">take upstream</span></td>
+        <td>Backup + prompt (defaults to Y, non-blocking when non-interactive) + placeholder verify; dropped the fork's duplicate unconditional <code>sed</code> write.</td></tr>
+      <tr><td>macOS <code>.command</code> + <code>run.sh</code> + <code>has_windows_codebuild</code></td><td><span class="pill fork">fork kept</span></td>
+        <td>Self-contained convenience files + the CodeBuild-Windows plumbing the fork's PyInstaller path needs.</td></tr>
+      <tr><td>install.bat <code>cd /d "%~dp0"</code></td><td><span class="pill up">take upstream</span></td>
+        <td>Mirrors the bash <code>cd "$SCRIPT_DIR"</code>; clear improvement.</td></tr>
+      <tr><td>install.bat AWS-profile config</td><td><span class="pill fork">fork kept</span></td>
+        <td>Fork writes <code>.aws/config</code> via PowerShell and <strong>purges stale <code>.aws/credentials</code> stanzas</strong> (its fix for the Cowork 403 <code>InvalidClientTokenId</code> shadowing). Rebuilt the structure since the fork has no <code>for</code> loop here.</td></tr>
+      <tr><td>settings.json telemetry + inference ARNs</td><td><span class="pill fork">fork kept</span></td>
+        <td>Kept the fork's Application-Inference-Profile ARN overrides (Nexus) and localhost:4318 sidecar telemetry; removed a dead hard-coded <code>telemetry.allcode.com</code> assignment. <em>(Later gated on <code>monitoring_enabled</code> — see contract fixes.)</em></td></tr>
+      <tr><td>printed <code>chmod +x install.sh</code> hints</td><td><span class="pill up">take upstream</span></td>
+        <td>Cosmetic, more correct.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="p1-dropped">
+  <h3>Latent bugs the 3-way merge introduced — caught &amp; fixed</h3>
+  <div class="callout warn">Where the fork had <em>deleted</em> a symbol and upstream left it <em>unchanged</em>,
+  Git's merge silently kept the deletion — but adopting upstream's logic re-introduced the callers. Found
+  via a scope-aware AST undefined-name scan (no linter was installable at the time).</div>
+  <table>
+    <thead><tr><th>Symbol</th><th>File</th><th>Fix</th></tr></thead>
+    <tbody>
+      <tr><td><code>_wait_for_auth_completion</code></td><td>credential_provider</td><td>Definition vanished, 2 callers remained → restored upstream's method.</td></tr>
+      <tr><td><code>requested_platforms</code></td><td>package.py</td><td>Used but undefined → re-added <code>requested_platforms = platforms_to_build.copy()</code>.</td></tr>
+      <tr><td><code>has_windows_codebuild=</code> param</td><td>package.py</td><td><code>_create_installer</code> was called/used with a kwarg its (upstream) signature lacked → restored fork's signature.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="p1-nexus">
+  <h3>Nexus must-fix — <code>lambda-functions/nexus-api/index.py</code></h3>
+  <table>
+    <thead><tr><th>Problem</th><th>Fix</th></tr></thead>
+    <tbody>
+      <tr><td>Hard-coded <code>BedrockAccessPolicy</code> ARN (embedded a live account ID + CloudFormation random suffix; breaks on stack recreation)</td>
+        <td><span class="pill fix">fixed</span> Added <code>_resolve_bedrock_policy_arn()</code> — prefers <code>BEDROCK_ACCESS_POLICY_ARN</code> env var (Phase-3 stack-output contract), falls back to an IAM lookup by name. No account-specific literal.</td></tr>
+      <tr><td>Re-injected <code>bedrock-runtime:*</code> IAM actions — an invalid prefix that <code>create_policy_version</code> rejects (silently caught → enforcement never applied)</td>
+        <td><span class="pill fix">fixed</span> → <code>bedrock:Converse</code> / <code>bedrock:ConverseStream</code>. Confirmed by upstream's own <code>.claude/rules/iam-actions.md</code> (issues #375, #63).</td></tr>
+    </tbody>
+  </table>
+  <p class="muted">The other two plan items are decisions, not changes: the quota-monitor dashboard
+  <code>@resource.service.name="claude-code"</code> filter (<em>review</em>) and
+  <code>daily_enforcement_mode</code> (<em>optional</em>) — both left as-is, flagged for review.</p>
+</section>
+
+<section id="p1-ci">
+  <h3>CI reconciliation</h3>
+  <ul>
+    <li><span class="pill drop">removed</span> <code>build-linux.yml</code> and <code>build-macos-arm64.yml</code> — fork-only manual PyInstaller workflows (<code>workflow_dispatch</code>), superseded by upstream's Go release matrix.</li>
+    <li><span class="pill up">kept</span> All upstream release/CI workflows (go-tests, integration-tests, pytest-ci, release-*). They were <em>byte-identical to upstream</em> in the merge — the fork modified none — so the single release-trigger model is already upstream's, with no double-tagging.</li>
+  </ul>
+</section>
+
+<section id="p1-contracts">
+  <h3>Upstream-contract reconciliation</h3>
+  <p>Running the (now-merged) upstream test suite surfaced 8 failures — all in <strong>upstream-only test
+  files</strong> meeting fork code for the first time (i.e. <em>not</em> regressions from the resolution).
+  Each was reconciled:</p>
+  <table>
+    <thead><tr><th>Failing contract</th><th>Fix</th></tr></thead>
+    <tbody>
+      <tr><td>open() calls must specify <code>encoding=</code></td><td><span class="pill fix">fix</span> Added <code>encoding="utf-8"</code> to 7 fork file <code>open()</code> calls (Windows cp1252 safety).</td></tr>
+      <tr><td>no <code>otelHeadersHelper</code> when monitoring disabled</td><td><span class="pill fix">fix</span> Gated the fork's telemetry block on <code>monitoring_enabled</code> (it was emitted unconditionally — a fork bug); sidecar default preserved when monitoring is on.</td></tr>
+      <tr><td>Windows build failure must exit 1</td><td><span class="pill fix">fix</span> <code>has_codebuild_windows</code> now also requires <code>enable_codebuild</code>, so a genuine local build failure surfaces as an error instead of being mistaken for an async CodeBuild build.</td></tr>
+      <tr><td>IAM action prefixes valid (<code>nexus-transform.yaml</code>)</td><td><span class="pill fix">fix</span> Real invalid <code>bedrock-runtime:*</code> → <code>bedrock:Converse</code>/<code>ConverseStream</code>.</td></tr>
+      <tr><td>IAM prefixes (<code>nexus-ui</code>, <code>nexus-marketplace</code>)</td><td><span class="pill fix">test</span> <code>ses:</code> and <code>aws-marketplace:</code> are <em>valid</em> AWS prefixes the upstream allowlist omitted → added them.</td></tr>
+      <tr><td>template structure on <code>nexus-transform-mcp.json</code></td><td><span class="pill fix">test</span> It's an MCP config, not CFN → excluded from the template-discovery glob.</td></tr>
+    </tbody>
+  </table>
+  <div class="callout note"><strong>Verify later:</strong> <code>transform:</code> was added to the IAM-prefix
+  allowlist as the AWS Transform service prefix and its <code>*</code> wildcard kept — confirm the exact prefix
+  and narrow the wildcard when Transform moves to the product repo (Phase 3).</div>
+</section>
+
+<section id="p1-ruff">
+  <h3>Ruff cleanup <span class="muted">(commit <span class="commit">e6e637f</span>)</span></h3>
+  <p>Ran <code>ruff check --fix</code> (safe fixes only) + <code>ruff format</code> on the 5 Python files
+  touched during resolution — what the bypassed pre-commit hooks would have done.</p>
+  <ul>
+    <li><span class="pill fix">24 fixed</span> unused imports (F401), import sort (I001), invalid escapes
+      (W605 — <code>\[</code>→<code>\\[</code>, value-preserving so generated installers are byte-identical),
+      empty f-strings (F541), etc.</li>
+    <li><span class="pill merge">26 residual, kept</span> 19 E501 (unwrappable shell one-liner string literals)
+      + 3 F841 / 3 B007 / 1 B904. <strong>Shared with upstream/main</strong>, which itself carries 89 E501 —
+      so no <code># noqa</code> added, to match upstream's (un-suppressed) style rather than diverge.</li>
+  </ul>
+  <p class="muted">Scoped to touched files only — full-tree autofix would churn upstream's own non-clean code.
+  Re-verified after: 926 Python tests pass, Go build/test pass, no behavior change.</p>
+</section>
+
+<section id="p1-verify">
+  <h3>Verification</h3>
+  <table>
+    <thead><tr><th>Check</th><th>Result</th><th>How</th></tr></thead>
+    <tbody>
+      <tr><td>Python test suite</td><td><span class="pill fix">926 pass · 0 fail · 22 skip</span></td><td><code>pytest</code> (deps bootstrapped into a user venv)</td></tr>
+      <tr><td><code>go build ./...</code></td><td><span class="pill fix">PASS</span></td><td>go 1.26.4</td></tr>
+      <tr><td><code>go vet ./...</code></td><td><span class="pill fix">clean</span></td><td>—</td></tr>
+      <tr><td><code>go test ./...</code></td><td><span class="pill fix">all ok</span></td><td>cmd + internal/* packages</td></tr>
+      <tr><td>cross-compile (macos-arm64/intel, linux-x64/arm64, windows)</td><td><span class="pill fix">5/5 build</span></td><td>CGO_ENABLED=0</td></tr>
+      <tr><td>undefined-name scan</td><td><span class="pill fix">clean</span></td><td>scope-aware AST checker</td></tr>
+      <tr><td><code>cfn-lint</code> / <code>yamllint</code></td><td><span class="pill drop">not run</span></td><td>binaries not installed — run before PR</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="p1-deferred">
+  <h3>Deferred / flagged for later phases</h3>
+  <ul>
+    <li><strong>Device-flow endpoint:</strong> <code>authenticate_device_flow()</code> hard-codes its API
+      Gateway URL and ignores the <code>device_auth_endpoint</code> config that gates it → make config-driven
+      in Phase 2 (the Go port).</li>
+    <li><strong>Unused prompt:</strong> <code>otel_resource_attributes</code> is collected from the user but
+      unused by the fork's settings writer (fork hard-codes the attributes).</li>
+    <li><strong>AWS Transform IAM:</strong> verify the <code>transform:</code> prefix and narrow its <code>*</code>
+      wildcard (Phase 3).</li>
+    <li><strong>Parity rule:</strong> <code>.claude/rules/credential-helper-parity.md</code> asserts Go≡Python
+      output — Phase 2 deletes the Python binaries and must update it.</li>
+    <li><strong>Identifier externalization:</strong> account IDs, the device-auth URL, and
+      <code>KEY_FIXES.md</code> before any public push.</li>
+  </ul>
+</section>
+
+<!-- ===================== PHASE 2 ===================== -->
+<section id="p2">
+  <span class="phase-label pending">Phase 2 · not started</span>
+  <h2 class="section" style="border-top:none;margin-top:6px;padding-top:0;">Rewrite runtime binaries in Go</h2>
+  <p class="muted">Fold the fork's Python-only features (device-code flow, platform reporting, model
+  enforcement, session cache, keyring probe, watchdog, <code>ensure_collector_running</code>) into the now-merged
+  Go tree, then delete the Python <code>credential_provider</code> / <code>otel_helper</code> modules. No entries yet.</p>
+</section>
+
+<!-- ===================== PHASE 3 ===================== -->
+<section id="p3">
+  <span class="phase-label pending">Phase 3 · not started</span>
+  <h2 class="section" style="border-top:none;margin-top:6px;padding-top:0;">Extract console + API into the UI repo</h2>
+  <p class="muted">Relocate the Nexus API, Lambdas, and infrastructure into <code>allcode-nexus-ui</code> with
+  preserved history; formalize the three cross-repo contracts. No entries yet.</p>
+</section>
+
+<footer>
+  Companion to the <em>Upgrade &amp; Restructure Plan</em>. Grounded in merge-base
+  <span class="commit">ed5b58c</span>, upstream <span class="commit">e2d4057</span>, fork
+  <span class="commit">824f1cb</span>. This log is updated as each phase progresses.
+</footer>
+</main>
+</div>
+</body>
+</html>

@@ -70,6 +70,7 @@
   <a href="#scope">Scope &amp; method</a>
   <a href="#legend">Verdict legend</a>
   <a href="#summary">Summary scorecard</a>
+  <a href="#inventory">File inventory (vs upstream)</a>
   <h2>Runtime auth &amp; telemetry</h2>
   <a href="#model" >1 · Model enforcement</a>
   <a href="#sidecar">2 · OTel local sidecar</a>
@@ -145,6 +146,66 @@
   <a href="#sidecar">local OTel sidecar</a> (a heavyweight re-architecture, including a committed 7.9 MB binary,
   that upstream achieves without). <a href="#codebuild">CodeBuild-Windows</a> becomes obsolete the moment the Go
   binaries ship (Go cross-compiles Windows — verified in Phase 2).</div>
+</section>
+
+<!-- ===================== FILE INVENTORY ===================== -->
+<section id="inventory">
+  <h2 class="section">File inventory — what differs from upstream</h2>
+  <p>Exact file-level diff of this branch against upstream (<code>git diff --name-status upstream/main HEAD</code>).
+  This reflects the <strong>end state after all three phases</strong>: <strong>14 added, 11 modified, 0 deleted</strong>,
+  plus 67 committed build artifacts (see note). The Nexus management files don't appear here — they were fork
+  additions that Phase&nbsp;3 removed, so they're absent from both sides now; they live in
+  <code>allcode-nexus-ui</code> (branch <code>import/nexus-backend</code>, 15 files).</p>
+  <div class="stat-row">
+    <div class="stat"><div class="num green">14</div><div class="lbl">Added (meaningful)</div></div>
+    <div class="stat"><div class="num amber">11</div><div class="lbl">Modified</div></div>
+    <div class="stat"><div class="num">0</div><div class="lbl">Deleted from upstream</div></div>
+    <div class="stat"><div class="num red">67</div><div class="lbl">Committed artifacts (hygiene)</div></div>
+  </div>
+
+  <h3>Added <span class="muted">(new files not in upstream)</span></h3>
+  <table>
+    <thead><tr><th>File</th><th>What it is</th></tr></thead>
+    <tbody>
+      <tr><td><code>UPGRADE_LOG.html</code></td><td>Reviewer log of the whole upgrade (this branch)</td></tr>
+      <tr><td><code>CHANGES.html</code></td><td>This audit</td></tr>
+      <tr><td><code>TESTING.md</code></td><td>Isolated-AWS test recipe (no prod impact)</td></tr>
+      <tr><td><code>KEY_FIXES.md</code></td><td><span class="pill v-hygiene">identifiers</span> Fork runbook — contains live identifiers; keep out of public exposure</td></tr>
+      <tr><td><code>source/go/internal/nexus/client.go</code> <span class="muted">(+ <code>client_test.go</code>)</span></td><td>Phase 2: Nexus device-code flow + platform reporting (the CLIENT — stays in the kit)</td></tr>
+      <tr><td><code>source/go/internal/config/settings.go</code> <span class="muted">(+ <code>settings_test.go</code>)</span></td><td>Phase 2: model enforcement (rewrites <code>~/.claude/settings.json</code>)</td></tr>
+      <tr><td><code>source/go/internal/otel/sidecar.go</code> <span class="muted">(+ <code>sidecar_unix.go</code>, <code>sidecar_windows.go</code>, <code>sidecar_test.go</code>)</span></td><td>Phase 2: otel collector sidecar auto-start (<code>ensure_collector_running</code>)</td></tr>
+      <tr><td><code>source/otel_helper/sidecar-config.yaml</code></td><td>Fork: local OTel collector pipeline config (see audit #2)</td></tr>
+      <tr><td><code>source/otel_helper/ocb</code></td><td><span class="pill v-redun">remove</span> 7.9&nbsp;MB committed build tool — should not be in git (see #12)</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Modified <span class="muted">(upstream files the fork changed)</span></h3>
+  <table>
+    <thead><tr><th>File</th><th>Change</th></tr></thead>
+    <tbody>
+      <tr><td><code>source/go/cmd/credential-process/main.go</code></td><td>Phase 2: device-flow dispatch, platform report, quota-check-and-enforce</td></tr>
+      <tr><td><code>source/go/cmd/otel-helper/main.go</code></td><td>Phase 2: wire in the sidecar auto-start</td></tr>
+      <tr><td><code>source/go/internal/config/config.go</code></td><td>Phase 2: add <code>device_auth_endpoint</code> field</td></tr>
+      <tr><td><code>source/go/internal/quota/quota.go</code></td><td>Phase 2: add <code>enabled_models</code> to the quota result</td></tr>
+      <tr><td><code>source/credential_provider/__main__.py</code></td><td>Phase 1 conflict resolution (Nexus features + adopt upstream port-lock/providers). <span class="muted">Slated for deletion in Phase 2b.</span></td></tr>
+      <tr><td><code>source/otel_helper/__main__.py</code></td><td>Phase 1: adopt upstream Bearer handling; keep sidecar. <span class="muted">Slated for deletion in Phase 2b.</span></td></tr>
+      <tr><td><code>source/claude_code_with_bedrock/cli/commands/package.py</code></td><td>Phase 1 installer resolution (auto-install, signing, CodeBuild) + Phase 2b Go-default build</td></tr>
+      <tr><td><code>source/tests/cli/commands/test_package_executable_path_init.py</code></td><td>Opt into <code>--pyinstaller</code> (Go is now default)</td></tr>
+      <tr><td><code>source/tests/e2e/test_cfn_contracts.py</code></td><td>Allow valid Nexus AWS prefixes (<code>aws-marketplace</code>, <code>ses</code>, <code>transform</code>)</td></tr>
+      <tr><td><code>source/tests/integration/test_cfn_validation.py</code></td><td>Exclude non-CFN <code>nexus-transform-mcp.json</code> from the template glob</td></tr>
+      <tr><td><code>.gitignore</code></td><td>Union of fork + upstream entries (merge)</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn"><strong>+ 67 committed build artifacts (not listed individually).</strong> 66
+  <code>__pycache__/*.pyc</code> files plus the <code>source/otel_helper/ocb</code> binary show up as "added" vs
+  upstream but are build output that shouldn't be tracked. This is audit finding
+  <a href="#artifacts">#12</a> — <code>git rm</code> them and fix <code>.gitignore</code>.</div>
+
+  <div class="callout note"><strong>Reading this against the audit:</strong> several "modified"/"added" files
+  implement features the audit flags as redundant (model enforcement, the sidecar) or obsolete (the PyInstaller
+  bits in <code>package.py</code>). The file list is the <em>current</em> footprint; the per-change verdicts below
+  say which parts should ultimately shrink.</div>
 </section>
 
 <!-- ===================== 1. MODEL ENFORCEMENT ===================== -->

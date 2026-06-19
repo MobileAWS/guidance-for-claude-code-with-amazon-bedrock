@@ -850,6 +850,28 @@ def handle_models(event):
     })
 
 
+def _resolve_bedrock_policy_arn(iam):
+    """Resolve the BedrockAccessPolicy ARN at runtime.
+
+    Prefers the BEDROCK_ACCESS_POLICY_ARN env var (populated from a CloudFormation
+    stack output — see the Phase 3 stack-output IAM contract); falls back to
+    discovering a customer-managed policy whose name contains 'BedrockAccessPolicy'.
+    Avoids hard-coding an account-specific ARN that breaks on stack recreation.
+    """
+    arn = os.environ.get("BEDROCK_ACCESS_POLICY_ARN", "")
+    if arn:
+        return arn
+    paginator = iam.get_paginator("list_policies")
+    for page in paginator.paginate(Scope="Local"):
+        for pol in page.get("Policies", []):
+            if "BedrockAccessPolicy" in pol.get("PolicyName", ""):
+                return pol["Arn"]
+    raise ValueError(
+        "Could not resolve BedrockAccessPolicy ARN: set BEDROCK_ACCESS_POLICY_ARN "
+        "or ensure a customer-managed policy named '*BedrockAccessPolicy*' exists."
+    )
+
+
 def handle_update_models(event):
     """PUT /api/config/models - update model configuration and enforce via IAM."""
     body = json.loads(event.get("body", "{}"))
@@ -868,7 +890,7 @@ def handle_update_models(event):
     # Update IAM policy to only allow enabled models
     try:
         iam = boto3.client("iam")
-        policy_arn = "arn:aws:iam::916587687563:policy/claude-code-auth-stack-BedrockAccessPolicy-4FU3jCRPH6D4"
+        policy_arn = _resolve_bedrock_policy_arn(iam)
 
         # Build resource list from enabled models
         if enabled_models:
@@ -894,10 +916,8 @@ def handle_update_models(event):
                     "Action": [
                         "bedrock:InvokeModel",
                         "bedrock:InvokeModelWithResponseStream",
-                        "bedrock-runtime:InvokeModel",
-                        "bedrock-runtime:InvokeModelWithResponseStream",
-                        "bedrock-runtime:ConverseStream",
-                        "bedrock-runtime:Converse"
+                        "bedrock:Converse",
+                        "bedrock:ConverseStream"
                     ],
                     "Resource": resources
                 },

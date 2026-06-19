@@ -71,21 +71,28 @@ def add_monitoring_config(mdm_config: dict, profile, console: Console) -> None:
     if not profile.monitoring_enabled:
         return
 
+    monitoring_mode = getattr(profile, "monitoring_mode", "central")
+
+    if monitoring_mode == "sidecar":
+        console.print("[dim]Sidecar mode — Cowork telemetry not supported, skipping OTLP config[/dim]")
+        return
+
     monitoring_stack = profile.stack_names.get(
         "monitoring", f"{profile.identity_pool_name}-otel-collector"
     )
-
     try:
         outputs = get_stack_outputs(monitoring_stack, profile.aws_region)
         endpoint = outputs.get("CollectorEndpoint")
-        if endpoint:
-            mdm_config["otlpEndpoint"] = endpoint
-            mdm_config["otlpProtocol"] = "http/protobuf"
-            console.print(f"[dim]OTLP endpoint: {endpoint}[/dim]")
-        else:
-            console.print("[dim]Monitoring stack not found — skipping OTLP config[/dim]")
     except Exception:
         console.print("[dim]Could not query monitoring stack — skipping OTLP config[/dim]")
+        return
+
+    if endpoint:
+        mdm_config["otlpEndpoint"] = endpoint
+        mdm_config["otlpProtocol"] = "http/protobuf"
+        console.print(f"[dim]OTLP endpoint: {endpoint}[/dim]")
+    else:
+        console.print("[dim]Monitoring endpoint not found — skipping OTLP config[/dim]")
 
 
 def _mdm_keys(config: dict) -> dict:
@@ -99,7 +106,7 @@ def generate_json(output_dir: Path, mdm_config: dict) -> Path:
     Returns the path to the generated file.
     """
     json_path = output_dir / "cowork-3p-config.json"
-    with open(json_path, "w") as f:
+    with open(json_path, "w", encoding="utf-8") as f:
         json.dump(_mdm_keys(mdm_config), f, indent=2)
     return json_path
 
@@ -162,7 +169,7 @@ def generate_mobileconfig(output_dir: Path, mdm_config: dict) -> Path:
 """
 
     mobileconfig_path = output_dir / "cowork-3p.mobileconfig"
-    with open(mobileconfig_path, "w") as f:
+    with open(mobileconfig_path, "w", encoding="utf-8") as f:
         f.write(mobileconfig)
     return mobileconfig_path
 
@@ -193,7 +200,7 @@ def generate_reg_file(output_dir: Path, mdm_config: dict) -> Path:
     lines.append("")  # Trailing newline
 
     reg_path = output_dir / "cowork-3p.reg"
-    with open(reg_path, "w", newline="\r\n") as f:
+    with open(reg_path, "w", encoding="utf-8", newline="\r\n") as f:
         f.write("\n".join(lines))
     return reg_path
 

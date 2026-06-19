@@ -90,9 +90,11 @@
   <a href="#p1-verify" class="sub">Verification</a>
   <a href="#p1-deferred" class="sub">Deferred items</a>
   <h2>Phase 2 — Python→Go</h2>
-  <a href="#p2" class="sub">Not started</a>
+  <a href="#p2" class="sub">Go port (2a done, 2b staged)</a>
   <h2>Phase 3 — Extract console</h2>
-  <a href="#p3" class="sub">Not started</a>
+  <a href="#p3" class="sub">Extraction (3a done, 3b in progress)</a>
+  <h2 style="color:var(--amber)">▸ Next steps</h2>
+  <a href="#next">Outstanding work</a>
 </nav>
 
 <main>
@@ -454,6 +456,52 @@
   + validate in a non-prod account; contract ① (versioned installer artifacts → package-gen); contract ③ (stack-output
   IAM); the product deploy pipeline (replace <code>nexus-ui.yaml</code>'s inline Lambda placeholder; governance-agent →
   ECR); shared-table ownership.</p>
+</section>
+
+<!-- ===================== NEXT STEPS ===================== -->
+<section id="next">
+  <h2 class="section">Next steps / outstanding work</h2>
+  <p>Consolidated view of what remains, grouped by what's <strong>doable now (local)</strong> vs
+  <strong>gated on an AWS deployment</strong> to validate. Nothing here is blocking the branches from review.</p>
+
+  <h3>Before any PUBLIC release / merge to upstream-tracking main</h3>
+  <div class="callout danger"><strong>Externalize live identifiers.</strong> The kit fork's GitHub remote is
+  <strong>public</strong>; the branches still carry hard-coded AllCode identifiers (account id, device-auth hub URL,
+  Cognito pool/client ids, <code>KEY_FIXES.md</code>). They already appear in the fork's pre-existing public branches,
+  but they must be externalized (see product <code>EXTERNALIZATION.md</code> + the kit Go <code>nexus.DefaultAPIBase</code>
+  constant) before this is treated as clean. Keep <code>KEY_FIXES.md</code> out of any new public exposure.</div>
+
+  <h3>Doable now — local, no AWS deploy needed</h3>
+  <ul>
+    <li><strong>Hygiene (CHANGES.html #12):</strong> <code>git rm</code> the committed 7.9&nbsp;MB <code>ocb</code> binary
+      and the <code>__pycache__/*.pyc</code> (67 files); add <code>.gitignore</code> entries; build <code>ocb</code>/<code>otelcol</code> in CI.</li>
+    <li><strong>Drop AWS-CLI auto-install (CHANGES.html #7)</strong> from <code>install.sh</code> — AWS CLI isn't required at runtime.</li>
+    <li><strong>Verify <code>CLAUDE_CODE_DISABLE_THINKING</code> (CHANGES.html #6)</strong> against current Bedrock models; remove if stale.</li>
+    <li><strong>Decisions to make</strong> (then implement): whether to drop client-side <strong>model enforcement</strong>
+      (redundant with IAM) and the <strong>OTel local sidecar</strong> (vs upstream's direct-to-ALB), per CHANGES.html.</li>
+    <li><strong>Run <code>cfn-lint</code> / <code>yamllint</code> / <code>ruff</code></strong> where the binaries exist (not installed in the dev env used here).</li>
+  </ul>
+
+  <h3>Phase 2b — step 2 (destructive; after Go binaries validated in a real deployment)</h3>
+  <ul>
+    <li>Delete <code>source/credential_provider/</code> + <code>source/otel_helper/__main__.py</code> and their ~20 referencing tests.</li>
+    <li>Remove the now-dead PyInstaller + CodeBuild-Windows path from <code>package.py</code>.</li>
+    <li>Update <code>.claude/rules/credential-helper-parity.md</code> for a Go-only world; refresh BUILD/ARCHITECTURE docs; prune unused Python runtime deps.</li>
+  </ul>
+
+  <h3>Phase 3b — remaining (gated on an AWS deploy to validate)</h3>
+  <ul>
+    <li><strong>Apply the identifier externalization</strong> (product <code>EXTERNALIZATION.md</code>) and validate in a non-prod account.</li>
+    <li><strong>Contract ①</strong> — kit release CI publishes versioned installer artifacts to a shared S3 prefix; <code>package-gen</code> pins a version.</li>
+    <li><strong>Contract ③</strong> — onboarding stack exports the <code>BedrockAccessPolicy</code> ARN + table names; the API reads them via the connector role (no hard-coded ARNs).</li>
+    <li><strong>Product deploy pipeline</strong> — replace <code>nexus-ui.yaml</code>'s inline Lambda placeholder with a real S3-deployed package; build/push the governance-agent image to ECR; UI → S3/CloudFront.</li>
+    <li><strong>Shared-table ownership</strong> — decide whether the kit quota stack or the product onboarding stack owns <code>QuotaPolicies</code>/<code>UserQuotaMetrics</code>.</li>
+  </ul>
+
+  <h3>Cross-repo state</h3>
+  <p>Kit branch <code>upgrade/upstream-sync</code> (Phases 1–3 + docs) and product branch
+  <code>import/nexus-backend</code> (imported backend + contract spec + externalization plan). Open a PR from each
+  for review. The product repo is private; the kit repo is public (externalize before relying on it being clean).</p>
 </section>
 
 <footer>

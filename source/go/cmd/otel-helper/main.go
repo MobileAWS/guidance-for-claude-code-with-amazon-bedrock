@@ -68,6 +68,11 @@ func run(testMode bool) int {
 		profile = "ClaudeCode"
 	}
 
+	// Ensure the OTel collector sidecar is running (no-op when not installed).
+	// Started before serving cached headers, matching the Python helper — the
+	// fork's telemetry routes through this local collector (localhost:4318).
+	otel.EnsureCollectorRunning(profile, debugPrint)
+
 	// Layer 1: Check file cache first (avoids credential-process entirely)
 	if !testMode {
 		headers, err := otel.ReadCachedHeaders(profile)

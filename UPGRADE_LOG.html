@@ -347,11 +347,51 @@
 
 <!-- ===================== PHASE 2 ===================== -->
 <section id="p2">
-  <span class="phase-label pending">Phase 2 · not started</span>
+  <span class="phase-label done">Phase 2a · complete</span>
+  <span class="phase-label pending">Phase 2b · decommission pending</span>
   <h2 class="section" style="border-top:none;margin-top:6px;padding-top:0;">Rewrite runtime binaries in Go</h2>
-  <p class="muted">Fold the fork's Python-only features (device-code flow, platform reporting, model
-  enforcement, session cache, keyring probe, watchdog, <code>ensure_collector_running</code>) into the now-merged
-  Go tree, then delete the Python <code>credential_provider</code> / <code>otel_helper</code> modules. No entries yet.</p>
+  <p>Phase 2a folds the fork's Python-only runtime features into the merged Go tree so the Go
+  credential-process / otel-helper reach feature parity with the fork's Python. Phase 2b (deleting the
+  Python modules + flipping the build to Go-only) is a separate, destructive step held for confirmation.</p>
+
+  <h3>Gap analysis (fork Python vs the merged Go tree)</h3>
+  <p>Most fork behaviors were <em>already present</em> in upstream's Go binaries — the real gaps were four
+  Nexus-specific features:</p>
+  <table>
+    <thead><tr><th>Fork feature</th><th>Status in Go</th></tr></thead>
+    <tbody>
+      <tr><td>TOCTOU port-lock, quota check, silent/refresh-token flows, keyring+session storage, Azure confidential client, session-tag attribution</td><td><span class="pill up">already in upstream Go</span></td></tr>
+      <tr><td>Extra Okta host suffixes (<code>.oktapreview.com</code>, <code>.okta-emea.com</code>)</td><td><span class="pill up">already in <code>provider.Detect</code></span></td></tr>
+      <tr><td>Device-code flow</td><td><span class="pill fix">ported (gap)</span></td></tr>
+      <tr><td>Platform reporting (<code>/api/users/platform</code>)</td><td><span class="pill fix">ported (gap)</span></td></tr>
+      <tr><td>Model enforcement (<code>enabled_models</code> → <code>ANTHROPIC_MODEL</code>)</td><td><span class="pill fix">ported (gap)</span></td></tr>
+      <tr><td><code>ensure_collector_running</code> (otel sidecar auto-start)</td><td><span class="pill fix">ported (gap)</span></td></tr>
+    </tbody>
+  </table>
+
+  <h3>What was ported</h3>
+  <table>
+    <thead><tr><th>Feature</th><th>Go landing</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>Device-code flow + dispatch</td><td>new <code>internal/nexus/client.go</code>; <code>authenticateForRun()</code> in credential-process</td><td>Dispatch on <code>device_auth_endpoint || quota_api_endpoint</code> (faithful to Python). Base URL config-driven via new <code>device_auth_endpoint</code> field; falls back to hub default. Monitoring/diagnostic paths keep browser OIDC (matches Python).</td></tr>
+      <tr><td>Platform reporting</td><td><code>internal/nexus.ReportPlatform</code></td><td>Best-effort POST after token save; gated to Nexus deployments only (non-Nexus profiles never POST to the hub).</td></tr>
+      <tr><td>Model enforcement</td><td><code>quota.Result.EnabledModels</code> + <code>config.EnforceEnabledModels</code></td><td>Rewrites <code>~/.claude/settings.json</code> on the quota-allowed path. <em>(See CHANGES.html — this is UX, not enforcement; IAM is the real gate.)</em></td></tr>
+      <tr><td>otel sidecar auto-start</td><td><code>internal/otel/sidecar.go</code> + <code>sidecar_unix.go</code> / <code>sidecar_windows.go</code></td><td>PID-guard + detached spawn under <code>&lt;profile&gt;-collector</code>; build-tagged per-OS process check (signal-0 / tasklist). Wired into otel-helper startup.</td></tr>
+      <tr><td>30s SIGALRM watchdog</td><td><span class="pill drop">NOT ported (intentional)</span></td><td>The Python alarm is never cancelled → would kill interactive device-flow (600s) / browser OIDC (300s) auth, and <code>signal.SIGALRM</code> doesn't exist on Windows (would crash the Python binary). Go uses targeted per-op timeouts instead.</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Verification (Phase 2a)</h3>
+  <ul>
+    <li><code>go build ./...</code>, <code>go vet ./...</code>, <code>go test ./...</code> — all green (new tests: nexus client via httptest, model-enforcement settings writer, sidecar guard).</li>
+    <li>All 5 cross-compile targets build, including the Windows-tagged sidecar (<code>CREATE_NEW_PROCESS_GROUP</code> + tasklist).</li>
+    <li>New Go files are gofmt-clean. No Python changed, so the 926-test Python suite is unaffected.</li>
+  </ul>
+
+  <h3 id="p2b">Phase 2b — decommission (pending confirmation)</h3>
+  <p class="muted">Delete <code>source/credential_provider/</code> and <code>source/otel_helper/__main__.py</code>;
+  remove/flip the PyInstaller path in <code>package.py</code> to Go-only; update the credential-helper-parity
+  rule for a Go-only world; refresh BUILD/ARCHITECTURE docs. This is the destructive half — held for sign-off.</p>
 </section>
 
 <!-- ===================== PHASE 3 ===================== -->

@@ -10,11 +10,15 @@ import (
 
 // Result represents the quota check API response.
 type Result struct {
-	Allowed bool              `json:"allowed"`
-	Reason  string            `json:"reason"`
-	Message string            `json:"message"`
+	Allowed bool                   `json:"allowed"`
+	Reason  string                 `json:"reason"`
+	Message string                 `json:"message"`
 	Usage   map[string]interface{} `json:"usage"`
 	Policy  map[string]interface{} `json:"policy"`
+	// EnabledModels is the admin-restricted model allowlist (Nexus model
+	// enforcement). When non-empty, the credential helper rewrites
+	// ~/.claude/settings.json so ANTHROPIC_MODEL is one of these.
+	EnabledModels []string `json:"enabled_models"`
 }
 
 // Check calls the quota API endpoint with the given JWT token.

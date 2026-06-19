@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Fork Changes Audit — what differs from upstream, and is it justified?</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --panel-2: #1d212a; --border: #2a2f3a;
+    --text: #d7dbe2; --muted: #9aa3b2; --accent: #5b9dff; --accent-2: #8b5cf6;
+    --green: #45d483; --amber: #f0b429; --red: #f87171; --code-bg: #0b0d11;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  .wrap { display: flex; max-width: 1500px; margin: 0 auto; }
+  nav.toc { position: sticky; top: 0; align-self: flex-start; width: 300px; min-width: 300px;
+    height: 100vh; overflow-y: auto; padding: 28px 18px; border-right: 1px solid var(--border); background: var(--panel); }
+  nav.toc h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 18px 0 8px; }
+  nav.toc a { display: block; color: var(--text); text-decoration: none; padding: 4px 10px; border-radius: 6px; font-size: 13.5px; }
+  nav.toc a:hover { background: var(--panel-2); color: #fff; }
+  main { flex: 1; min-width: 0; padding: 40px 56px 120px; }
+  header.hero { border-bottom: 1px solid var(--border); padding-bottom: 28px; margin-bottom: 30px; }
+  .badge { display: inline-block; background: var(--panel-2); border: 1px solid var(--border); color: var(--muted);
+    font-size: 12px; padding: 3px 10px; border-radius: 999px; margin: 0 6px 6px 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  h1 { font-size: 28px; line-height: 1.25; margin: 0 0 10px; color: #fff; }
+  h2.section { font-size: 23px; color: #fff; margin: 50px 0 14px; padding-top: 14px; border-top: 1px solid var(--border); }
+  h3 { font-size: 18px; color: #eef1f6; margin: 30px 0 6px; }
+  .verdict-tag { font-size: 12px; font-weight: 700; padding: 2px 9px; border-radius: 6px; margin-left: 8px; vertical-align: middle; }
+  p { margin: 10px 0; }
+  .lede { font-size: 17px; color: var(--muted); }
+  ul, ol { margin: 8px 0 14px; padding-left: 22px; }
+  li { margin: 5px 0; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85em; background: var(--code-bg);
+    padding: 1px 6px; border-radius: 5px; border: 1px solid var(--border); color: #e6c07b; }
+  table { border-collapse: collapse; width: 100%; margin: 14px 0; font-size: 13.5px; }
+  th, td { text-align: left; padding: 9px 12px; border: 1px solid var(--border); vertical-align: top; }
+  th { background: var(--panel-2); color: #fff; font-weight: 600; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 4px 22px 16px; margin: 18px 0; }
+  .row { display: grid; grid-template-columns: 110px 1fr; gap: 6px 16px; margin: 12px 0; }
+  .row .k { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .05em; padding-top: 2px; }
+  .row .v { font-size: 14.5px; }
+  .pill { font-size: 11px; padding: 2px 8px; border-radius: 999px; font-weight: 600; white-space: nowrap; }
+  .v-need   { background: rgba(69,212,131,.15); color: var(--green); border: 1px solid rgba(69,212,131,.45); }
+  .v-redun  { background: rgba(248,113,113,.15); color: var(--red); border: 1px solid rgba(248,113,113,.45); }
+  .v-simpl  { background: rgba(240,180,41,.15); color: var(--amber); border: 1px solid rgba(240,180,41,.45); }
+  .v-obsol  { background: rgba(248,113,113,.12); color: #f8a0a0; border: 1px solid rgba(248,113,113,.4); }
+  .v-hygiene{ background: rgba(139,92,246,.16); color: #b79bf7; border: 1px solid rgba(139,92,246,.45); }
+  .v-fixed  { background: rgba(91,157,255,.15); color: var(--accent); border: 1px solid rgba(91,157,255,.4); }
+  .callout { border-left: 3px solid var(--accent); background: var(--panel); padding: 12px 18px; border-radius: 0 10px 10px 0; margin: 18px 0; }
+  .callout.warn { border-left-color: var(--amber); } .callout.danger { border-left-color: var(--red); }
+  .callout.ok { border-left-color: var(--green); } .callout.note { border-left-color: var(--accent-2); }
+  .callout strong { color: #fff; }
+  .stat-row { display: flex; flex-wrap: wrap; gap: 14px; margin: 22px 0; }
+  .stat { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 14px 20px; flex: 1; min-width: 120px; }
+  .stat .num { font-size: 22px; font-weight: 700; color: #fff; }
+  .stat .num.red { color: var(--red); } .stat .num.amber { color: var(--amber); } .stat .num.green { color: var(--green); }
+  .stat .lbl { font-size: 12px; color: var(--muted); }
+  .muted { color: var(--muted); }
+  footer { margin-top: 60px; padding-top: 20px; border-top: 1px solid var(--border); color: var(--muted); font-size: 13px; }
+  a { color: var(--accent); }
+  @media (max-width: 1000px) { nav.toc { display: none; } main { padding: 28px 20px 80px; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav class="toc">
+  <h2>Contents</h2>
+  <a href="#scope">Scope &amp; method</a>
+  <a href="#legend">Verdict legend</a>
+  <a href="#summary">Summary scorecard</a>
+  <h2>Runtime auth &amp; telemetry</h2>
+  <a href="#model" >1 · Model enforcement</a>
+  <a href="#sidecar">2 · OTel local sidecar</a>
+  <a href="#platform">3 · Platform reporting</a>
+  <a href="#device">4 · Device-code flow</a>
+  <a href="#inference">5 · Inference-profile ARNs</a>
+  <a href="#thinking">6 · DISABLE_THINKING</a>
+  <h2>Packaging &amp; install</h2>
+  <a href="#autoinstall">7 · Auto-install prereqs</a>
+  <a href="#codebuild">8 · CodeBuild-Windows</a>
+  <a href="#credpurge">9 · .aws/credentials purge</a>
+  <a href="#signing">10 · macOS code-signing</a>
+  <a href="#launchers">11 · .command / run.sh</a>
+  <h2>Hygiene &amp; reconciled</h2>
+  <a href="#artifacts">12 · Committed binaries</a>
+  <a href="#reconciled">Already reconciled</a>
+</nav>
+
+<main>
+<header class="hero">
+  <div>
+    <span class="badge">fork vs upstream e2d4057</span>
+    <span class="badge">excludes: Nexus management API</span>
+    <span class="badge">12 changes audited</span>
+  </div>
+  <h1>Fork Changes Audit</h1>
+  <p class="lede">Every change in this repo that differs from upstream <code>aws-solutions-library-samples</code>,
+  with the reason it was made and a <strong>verified verdict on whether it's actually needed</strong> — calling out
+  what's redundant with AWS-native controls, obsolete after the Go port, or solvable with a simpler pattern.</p>
+</header>
+
+<section id="scope">
+  <h2 class="section" style="border-top:none;margin-top:0;padding-top:0;">Scope &amp; method</h2>
+  <ul>
+    <li><strong>In scope:</strong> the deployment-kit changes that <em>stay</em> in this repo — the credential
+      helper, the OTel helper/collector, <code>package.py</code> + install scripts, and the auth/monitoring
+      CloudFormation.</li>
+    <li><strong>Out of scope (per request):</strong> the Nexus <strong>management API</strong> and console platform
+      (<code>nexus-*</code> lambdas + infra) — those move to <code>allcode-nexus-ui</code> in Phase 3, so auditing them
+      here is moot. They <em>are</em> referenced where a kit-side feature depends on them.</li>
+    <li><strong>Method:</strong> each verdict is checked against the actual code/templates (file references given),
+      not asserted. The guiding question throughout: <em>could this be done with native AWS config/IAM, or is it
+      redundant with something upstream already provides?</em></li>
+  </ul>
+  <div class="callout note">Several fork features are being <strong>ported to Go in Phase 2</strong> (device flow,
+  platform reporting, model enforcement, sidecar). This audit judges the <em>feature</em>, not the language — a
+  "redundant" verdict means the feature should arguably be dropped, not merely re-implemented.</div>
+</section>
+
+<section id="legend">
+  <h2 class="section">Verdict legend</h2>
+  <p>
+    <span class="pill v-need">NEEDED</span> justified, keep &nbsp;
+    <span class="pill v-simpl">SIMPLIFY</span> keep the goal, simpler pattern exists &nbsp;
+    <span class="pill v-redun">REDUNDANT</span> duplicates an AWS-native / upstream control &nbsp;
+    <span class="pill v-obsol">OBSOLETE</span> no longer needed after the upgrade &nbsp;
+    <span class="pill v-hygiene">HYGIENE</span> repo-cleanliness issue &nbsp;
+    <span class="pill v-fixed">RECONCILED</span> already resolved in Phase 1
+  </p>
+</section>
+
+<section id="summary">
+  <h2 class="section">Summary scorecard</h2>
+  <div class="stat-row">
+    <div class="stat"><div class="num green">3</div><div class="lbl">Needed (keep)</div></div>
+    <div class="stat"><div class="num amber">5</div><div class="lbl">Simplify</div></div>
+    <div class="stat"><div class="num red">2</div><div class="lbl">Redundant</div></div>
+    <div class="stat"><div class="num red">1</div><div class="lbl">Obsolete after upgrade</div></div>
+    <div class="stat"><div class="num">1</div><div class="lbl">Hygiene</div></div>
+  </div>
+  <div class="callout warn"><strong>Headline:</strong> the two highest-value cuts are
+  <a href="#model">client-side model enforcement</a> (redundant — IAM is the real gate) and the
+  <a href="#sidecar">local OTel sidecar</a> (a heavyweight re-architecture, including a committed 7.9 MB binary,
+  that upstream achieves without). <a href="#codebuild">CodeBuild-Windows</a> becomes obsolete the moment the Go
+  binaries ship (Go cross-compiles Windows — verified in Phase 2).</div>
+</section>
+
+<!-- ===================== 1. MODEL ENFORCEMENT ===================== -->
+<section id="model">
+  <h2 class="section">Runtime auth &amp; telemetry</h2>
+  <div class="card">
+    <h3>1 · Client-side model enforcement <span class="pill v-redun verdict-tag">REDUNDANT</span></h3>
+    <div class="row"><div class="k">What</div><div class="v">The credential helper reads <code>enabled_models</code> from the quota response and rewrites <code>~/.claude/settings.json</code> so <code>ANTHROPIC_MODEL</code> is one of the admin-allowed models (<code>config.EnforceEnabledModels</code> / Python <code>_enforce_enabled_models</code>).</div></div>
+    <div class="row"><div class="k">Justification</div><div class="v">To stop users from using models the admin hasn't approved.</div></div>
+    <div class="row"><div class="k">Verified</div><div class="v"><strong>Enforcement is already done by IAM.</strong> The federated role's <code>BedrockAccessPolicy</code> scopes <code>bedrock:InvokeModel</code> by resource ARN (<code>bedrock-auth-cognito-pool.yaml:97-107</code>; default is <code>foundation-model/*</code>, narrowed to the enabled set). A user who picks a disallowed model gets an IAM <code>AccessDenied</code> regardless of <code>settings.json</code>. The client rewrite provides <em>no</em> security — a user can re-edit their own settings file and IAM still blocks them — so it's purely UX (avoids the error by auto-switching).</div></div>
+    <div class="row"><div class="k">Verdict</div><div class="v">Could be done <strong>purely in AWS IAM</strong>, and is. The model allowlist belongs in the role policy (one place, tamper-proof). The client rewrite is a redundant convenience layer at the wrong altitude.</div></div>
+    <div class="row"><div class="k">Recommend</div><div class="v"><strong>Drop client-side enforcement.</strong> Keep the IAM allowlist as the single control. If the "no confusing AccessDenied" UX matters, surface it once at install/auth time (a printed note of allowed models) rather than silently rewriting a user-owned file on every credential refresh.</div></div>
+  </div>
+</section>
+
+<!-- ===================== 2. OTEL SIDECAR ===================== -->
+<section id="sidecar">
+  <div class="card">
+    <h3>2 · Local OTel collector sidecar <span class="pill v-simpl verdict-tag">SIMPLIFY</span></h3>
+    <div class="row"><div class="k">What</div><div class="v">Claude Code exports OTLP to <code>localhost:4318</code>, where a per-machine <code>otelcol</code> daemon (auto-started by <code>ensure_collector_running</code>) batches and SigV4-exports straight to CloudWatch. Ships <code>sidecar-config.yaml</code>, a custom-built <code>otelcol</code>, and the <strong>7.9 MB <code>ocb</code> builder binary committed to git</strong>.</div></div>
+    <div class="row"><div class="k">Justification</div><div class="v">"Reliable token counting" / OTel latency fix — local batching + retry, and SigV4 via the machine's <code>&lt;profile&gt;-collector</code> credentials so export doesn't depend on JWT TTL.</div></div>
+    <div class="row"><div class="k">Verified</div><div class="v">Upstream needs <em>no</em> local sidecar: Claude Code exports OTLP directly to a central ECS/Fargate collector behind an ALB that JWT-validates (<code>otel-collector.yaml:158-252</code>), and <code>otelHeadersHelper</code> injects the bearer + attribution headers. The fork's sidecar instead pushes the SigV4→CloudWatch step onto every client (<code>sidecar-config.yaml</code> exporter), which removes the central collector but adds: a daemon, PID/auto-start management, per-user CloudWatch <code>PutMetricData</code> IAM, and a platform-specific compiled binary to distribute.</div></div>
+    <div class="row"><div class="k">Verdict</div><div class="v">A legitimate trade (drop the Fargate cost) but a <strong>heavyweight one</strong>. The reliability gain (retry buffer) is real; the cost is significant client complexity and a build artifact in the repo. Upstream's direct-to-ALB path is materially simpler and already battle-tested.</div></div>
+    <div class="row"><div class="k">Recommend</div><div class="v">Re-evaluate against upstream's direct model. If the central collector cost is the only driver, weigh it against the per-machine operational burden. At minimum, <strong>never commit <code>ocb</code></strong> (build it in CI) and don't auto-spawn a daemon from a credential/telemetry helper if the direct OTLP path meets the SLA.</div></div>
+  </div>
+</section>
+
+<!-- ===================== 3. PLATFORM REPORTING ===================== -->
+<section id="platform">
+  <div class="card">
+    <h3>3 · Platform reporting (<code>/api/users/platform</code>) <span class="pill v-redun verdict-tag">REDUNDANT</span></h3>
+    <div class="row"><div class="k">What</div><div class="v">After auth, the credential helper POSTs <code>{email, platform, arch}</code> to the Nexus hub (best-effort).</div></div>
+    <div class="row"><div class="k">Justification</div><div class="v">Inventory of which OS/arch each user runs, for the management console.</div></div>
+    <div class="row"><div class="k">Verified</div><div class="v">The kit <em>already</em> emits per-user attributed telemetry through OTel (email, user id, org, dept, etc. — <code>otel/extract.go</code>). OS/arch is trivially addable to that existing stream. A second bespoke POST to a hardcoded hub endpoint duplicates a channel that already exists and carries the same identity.</div></div>
+    <div class="row"><div class="k">Verdict</div><div class="v">Low-value duplication. It also re-introduces a hardcoded hub URL on the auth hot path (the <a href="#device">device-flow</a> caveat applies).</div></div>
+    <div class="row"><div class="k">Recommend</div><div class="v">Drop the dedicated POST; if platform inventory is wanted, add <code>os.type</code>/<code>os.arch</code> as OTel resource attributes (one line in the extractor) and read them in the console from the data you already collect.</div></div>
+  </div>
+</section>
+
+<!-- ===================== 4. DEVICE FLOW ===================== -->
+<section id="device">
+  <div class="card">
+    <h3>4 · Device-code flow <span class="pill v-need verdict-tag">NEEDED (conditional)</span></h3>
+    <div class="row"><div class="k">What</div><div class="v">Portless OAuth device-code auth: the CLI gets a code from the Nexus hub, the user approves in a browser, the CLI polls for tokens. Used when <code>device_auth_endpoint</code>/<code>quota_api_endpoint</code> is set.</div></div>
+    <div class="row"><div class="k">Justification</div><div class="v">Lets the Nexus hub broker auth centrally (multi-tenant), and works where a local redirect server can't bind (locked-down/headless machines).</div></div>
+    <div class="row"><div class="k">Verified</div><div class="v">This is genuinely distinct from upstream's browser-redirect OIDC — it has no local equivalent. It's justified <em>for the multi-tenant hub model</em>. For a single-org deployment authenticating straight to Cognito/Okta, upstream's browser OIDC already works and device flow adds a hub dependency.</div></div>
+    <div class="row"><div class="k">Verdict</div><div class="v">Keep where the hub brokers auth; it's not redundant. But it's only <em>necessary</em> for the centralized multi-tenant story — single-tenant installs don't need it.</div></div>
+    <div class="row"><div class="k">Recommend</div><div class="v">Keep, but <strong>make the hub base URL config-driven</strong> (still falls back to a hardcoded default today — see <code>nexus.DefaultAPIBase</code>). Externalize before any public push.</div></div>
+  </div>
+</section>
+
+<!-- ===================== 5. INFERENCE PROFILE ARNS ===================== -->
+<section id="inference">
+  <div class="card">
+    <h3>5 · Application-inference-profile ARN overrides <span class="pill v-simpl verdict-tag">SIMPLIFY</span></h3>
+    <div class="row"><div class="k">What</div><div class="v">Optional <code>inference_profile_{opus,sonnet,haiku}_arn</code> profile fields that override <code>ANTHROPIC_*_MODEL</code> / <code>ANTHROPIC_MODEL</code> in the generated settings with Application Inference Profile ARNs (<code>config.py:107</code>, <code>package.py</code> settings writer).</div></div>
+    <div class="row"><div class="k">Justification</div><div class="v">Native AWS cost allocation — Application Inference Profiles carry cost-allocation tags so spend shows up per-team in Cost Explorer.</div></div>
+    <div class="row"><div class="k">Verified</div><div class="v">Upstream already resolves models per-tier via <code>cross_region_profile</code> (CRIS) and attributes cost via <strong>session tags</strong> (<code>showTags</code>/<code>getTag</code>, the <code>Project</code>/<code>CostCenter</code> principal tag → OTel <code>x-project</code>). That's a second, overlapping cost-attribution mechanism.</div></div>
+    <div class="row"><div class="k">Verdict</div><div class="v">Not strictly redundant (inference profiles tag at the Bedrock-invocation layer; session tags attribute in telemetry) — but maintaining <em>both</em> cost-attribution paths is complexity. One is likely enough.</div></div>
+    <div class="row"><div class="k">Recommend</div><div class="v">Pick one cost-attribution mechanism. If Cost Explorer allocation is the goal, standardize on inference profiles and drop the session-tag path (or vice-versa). Don't ship both half-wired.</div></div>
+  </div>
+</section>
+
+<!-- ===================== 6. DISABLE THINKING ===================== -->
+<section id="thinking">
+  <div class="card">
+    <h3>6 · <code>CLAUDE_CODE_DISABLE_THINKING=1</code> <span class="pill v-simpl verdict-tag">VERIFY / likely stale</span></h3>
+    <div class="row"><div class="k">What</div><div class="v">Generated settings disable extended thinking.</div></div>
+    <div class="row"><div class="k">Justification</div><div class="v">A historical 400 error — some Bedrock models rejected the thinking message format.</div></div>
+    <div class="row"><div class="k">Verified</div><div class="v">This was a point-in-time model-compatibility workaround (per <code>KEY_FIXES.md</code>). Current Bedrock Claude models support extended thinking.</div></div>
+    <div class="row"><div class="k">Verdict</div><div class="v">Likely stale — and it degrades the product (thinking off by default) to dodge a bug that's probably gone.</div></div>
+    <div class="row"><div class="k">Recommend</div><div class="v">Test against current models; if the 400 is gone, remove it so users get thinking by default.</div></div>
+  </div>
+</section>
+
+<!-- ===================== 7. AUTO-INSTALL ===================== -->
+<section id="autoinstall">
+  <h2 class="section">Packaging &amp; install</h2>
+  <div class="card">
+    <h3>7 · Auto-install prerequisites (Python 3 + AWS CLI) <span class="pill v-simpl verdict-tag">SIMPLIFY</span></h3>
+    <div class="row"><div class="k">What</div><div class="v"><code>install.sh</code> auto-installs Python 3 (via brew/apt/yum/dnf) and the AWS CLI if missing.</div></div>
+    <div class="row"><div class="k">Justification</div><div class="v">Smoother onboarding — don't make users hand-install dependencies.</div></div>
+    <div class="row"><div class="k">Verified</div><div class="v"><strong>AWS CLI is not required at runtime</strong> — upstream's own installer says so ("the credential process binary handles authentication directly") and the Go binaries are self-contained. Python 3 is only needed by the install script itself to parse <code>config.json</code>.</div></div>
+    <div class="row"><div class="k">Verdict</div><div class="v">The AWS-CLI auto-install is <strong>unnecessary</strong>. The Python 3 auto-install is a means to an end (script-time JSON parsing) that pulls a system-package install with <code>sudo</code> — heavy for what it does.</div></div>
+    <div class="row"><div class="k">Recommend</div><div class="v">Drop AWS-CLI auto-install. Avoid the Python dependency in the installer entirely — the credential-process Go binary can emit the parsed config (or accept a <code>--print-config</code> helper), removing the need to <code>sudo apt install python3</code> at install time.</div></div>
+  </div>
+</section>
+
+<!-- ===================== 8. CODEBUILD WINDOWS ===================== -->
+<section id="codebuild">
+  <div class="card">
+    <h3>8 · CodeBuild-Windows build path <span class="pill v-obsol verdict-tag">OBSOLETE after Go</span></h3>
+    <div class="row"><div class="k">What</div><div class="v">Windows binaries are built asynchronously in AWS CodeBuild (<code>has_codebuild_windows</code>, <code>nexus</code>/CodeBuild plumbing, console URL helpers in <code>package.py</code>).</div></div>
+    <div class="row"><div class="k">Justification</div><div class="v">PyInstaller can't cross-compile; building Windows binaries required a Windows runner.</div></div>
+    <div class="row"><div class="k">Verified</div><div class="v">The Go binaries <strong>cross-compile to Windows from any host</strong> — verified in Phase 2 (<code>GOOS=windows</code> builds both <code>credential-process</code> and <code>otel-helper</code> cleanly). Once the build is Go-only, the entire CodeBuild-for-Windows apparatus has nothing to do.</div></div>
+    <div class="row"><div class="k">Verdict</div><div class="v">Obsolete the moment Phase 2b flips the build to Go. It's pure carrying cost (a whole async build path, status polling, console-URL formatting) for a problem Go doesn't have.</div></div>
+    <div class="row"><div class="k">Recommend</div><div class="v">Remove with the PyInstaller path in Phase 2b. This is one of the largest simplifications available.</div></div>
+  </div>
+</section>
+
+<!-- ===================== 9. CREDENTIALS PURGE ===================== -->
+<section id="credpurge">
+  <div class="card">
+    <h3>9 · <code>.aws/credentials</code> stale-stanza purge (Windows) <span class="pill v-need verdict-tag">NEEDED</span></h3>
+    <div class="row"><div class="k">What</div><div class="v"><code>install.bat</code> purges any leftover <code>[profile]</code> stanza from <code>%USERPROFILE%\.aws\credentials</code> before writing <code>config</code>.</div></div>
+    <div class="row"><div class="k">Justification</div><div class="v">A stale stanza there (e.g. an EXPIRED placeholder) is resolved by the AWS credential chain <em>before</em> <code>credential_process</code> in <code>config</code>, shadowing it and breaking Cowork Desktop with a 403 <code>InvalidClientTokenId</code>.</div></div>
+    <div class="row"><div class="k">Verified</div><div class="v">This is a real, specific failure mode of the AWS credential-resolution order, not something IAM or config alone fixes — the two files genuinely conflict.</div></div>
+    <div class="row"><div class="k">Verdict</div><div class="v">Justified bug fix. Keep.</div></div>
+    <div class="row"><div class="k">Recommend</div><div class="v">Keep, but consider upstreaming it — it's a generic correctness fix, not Nexus-specific. (Confirm the macOS/Linux installer has the equivalent guard.)</div></div>
+  </div>
+</section>
+
+<!-- ===================== 10. SIGNING ===================== -->
+<section id="signing">
+  <div class="card">
+    <h3>10 · macOS code-signing &amp; quarantine handling <span class="pill v-simpl verdict-tag">PARTLY REDUNDANT</span></h3>
+    <div class="row"><div class="k">What</div><div class="v"><code>package.py</code> signs macOS binaries and strips the quarantine xattr (~11 references vs upstream's ~3).</div></div>
+    <div class="row"><div class="k">Justification</div><div class="v">Gatekeeper blocks unsigned/quarantined executables.</div></div>
+    <div class="row"><div class="k">Verified</div><div class="v">Upstream <em>also</em> signs (3 references), so the fork's signing partly duplicates upstream logic — the fork added ~8 references on top, the merge-resolution kept the fork's variant.</div></div>
+    <div class="row"><div class="k">Verdict</div><div class="v">The capability is needed (cross-compiled <code>darwin</code> binaries still need signing); the fork-specific extra is largely redundant with upstream's.</div></div>
+    <div class="row"><div class="k">Recommend</div><div class="v">Diff the fork's signing block against upstream's and keep only the genuine delta; let upstream own the rest so future merges stay clean.</div></div>
+  </div>
+</section>
+
+<!-- ===================== 11. LAUNCHERS ===================== -->
+<section id="launchers">
+  <div class="card">
+    <h3>11 · <code>Install Claude Code.command</code> + <code>run.sh</code> <span class="pill v-need verdict-tag">NEEDED (minor)</span></h3>
+    <div class="row"><div class="k">What</div><div class="v">A macOS double-click installer wrapper and a quick-launch script that sets the profile + verifies creds.</div></div>
+    <div class="row"><div class="k">Justification</div><div class="v">Non-technical-user convenience (double-click install; one-command launch).</div></div>
+    <div class="row"><div class="k">Verified</div><div class="v">Small, self-contained, no AWS-native equivalent. Low cost, low risk.</div></div>
+    <div class="row"><div class="k">Verdict</div><div class="v">Fine to keep — genuinely additive UX.</div></div>
+    <div class="row"><div class="k">Recommend</div><div class="v">Keep. (<code>run.sh</code> uses <code>python3</code> for config parsing — same dependency note as #7.)</div></div>
+  </div>
+</section>
+
+<!-- ===================== 12. ARTIFACTS ===================== -->
+<section id="artifacts">
+  <h2 class="section">Hygiene &amp; reconciled</h2>
+  <div class="card">
+    <h3>12 · Committed build artifacts <span class="pill v-hygiene verdict-tag">HYGIENE</span></h3>
+    <div class="row"><div class="k">What</div><div class="v"><strong>67 tracked artifact files</strong> differ from upstream: the 7.9 MB <code>source/otel_helper/ocb</code> binary (a macOS-arm64 build tool — useless on other platforms) and a large set of committed <code>__pycache__/*.pyc</code> bytecode.</div></div>
+    <div class="row"><div class="k">Justification</div><div class="v">None intended — accidental commits / a <code>.gitignore</code> gap.</div></div>
+    <div class="row"><div class="k">Verified</div><div class="v">Upstream tracks none of these. They bloat the repo, are platform-specific, and go stale.</div></div>
+    <div class="row"><div class="k">Verdict</div><div class="v">Remove from version control; build tools/bytecode don't belong in git.</div></div>
+    <div class="row"><div class="k">Recommend</div><div class="v"><code>git rm</code> the <code>ocb</code> binary and all <code>__pycache__</code>; add/repair <code>.gitignore</code> entries (<code>__pycache__/</code>, <code>*.pyc</code>, the collector build output). Build <code>ocb</code>/<code>otelcol</code> in CI.</div></div>
+  </div>
+
+  <h3 id="reconciled">Already reconciled in Phase 1 <span class="pill v-fixed verdict-tag">RECONCILED</span></h3>
+  <table>
+    <thead><tr><th>Fork change</th><th>Resolution</th></tr></thead>
+    <tbody>
+      <tr><td>ALB <code>aud</code>-claim validation <em>disabled</em> (any token from the pool passed — a security regression)</td><td>Reverted to upstream's correct array→string <code>aud</code> validation; the ALB validates audience again (<code>otel-collector.yaml:41,242</code>).</td></tr>
+      <tr><td>skip-stack-query keyed on fork's <code>identity_pool_id</code></td><td>Adopted upstream's equivalent keyed on <code>identity_pool_name</code>/<code>federation_type</code>.</td></tr>
+      <tr><td>Invalid <code>bedrock-runtime:*</code> IAM actions (nexus-api + <code>nexus-transform.yaml</code>)</td><td>Replaced with valid <code>bedrock:Converse</code>/<code>ConverseStream</code> (matches the <code>iam-actions</code> rule).</td></tr>
+      <tr><td>Hardcoded <code>BedrockAccessPolicy</code> ARN (live account id)</td><td>Runtime resolution via env var + IAM lookup.</td></tr>
+      <tr><td>Extra Okta host suffixes; otel Bearer-everywhere</td><td>Already present upstream — no fork delta remains.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<footer>
+  Companion to <code>UPGRADE_LOG.html</code> and the <em>Upgrade &amp; Restructure Plan</em>. Verdicts checked against
+  the working tree at the head of <code>upgrade/upstream-sync</code>. The Nexus management API is intentionally
+  excluded (moving to <code>allcode-nexus-ui</code>). Re-verify the "likely stale" items (#6) against current Bedrock
+  models before removing.
+</footer>
+</main>
+</div>
+</body>
+</html>

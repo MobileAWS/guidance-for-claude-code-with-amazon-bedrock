@@ -8,9 +8,11 @@ import (
 	"strconv"
 	"time"
 
+	"ccwb-go/internal/browser"
 	"ccwb-go/internal/config"
 	"ccwb-go/internal/federation"
 	"ccwb-go/internal/jwt"
+	"ccwb-go/internal/nexus"
 	"ccwb-go/internal/oidc"
 	"ccwb-go/internal/otel"
 	"ccwb-go/internal/portlock"
@@ -399,14 +401,9 @@ func (a *credentialApp) run() int {
 
 	// Try silent refresh using cached id_token before opening browser
 	if creds := a.trySilentRefresh(); creds != nil {
-		if a.cfg.QuotaAPIEndpoint != "" {
-			token, _ := storage.GetMonitoringToken(a.profile, a.cfg.CredentialStorage)
-			if token != "" {
-				qr := quota.Check(a.cfg.QuotaAPIEndpoint, token, a.cfg.QuotaCheckTimeout, a.cfg.QuotaFailMode)
-				if !qr.Allowed {
-					printQuotaBlocked(qr)
-					return 1
-				}
+		if token, _ := storage.GetMonitoringToken(a.profile, a.cfg.CredentialStorage); token != "" {
+			if a.checkQuotaAndEnforce(token) {
+				return 1
 			}
 		}
 		outputJSON(creds)
@@ -417,35 +414,26 @@ func (a *credentialApp) run() int {
 	// This enables Cowork 3P (Claude Desktop) to refresh silently even after
 	// the id_token expires, since Claude Desktop cannot open a browser popup.
 	if creds := a.tryRefreshToken(); creds != nil {
-		if a.cfg.QuotaAPIEndpoint != "" {
-			token, _ := storage.GetMonitoringToken(a.profile, a.cfg.CredentialStorage)
-			if token != "" {
-				qr := quota.Check(a.cfg.QuotaAPIEndpoint, token, a.cfg.QuotaCheckTimeout, a.cfg.QuotaFailMode)
-				if !qr.Allowed {
-					printQuotaBlocked(qr)
-					return 1
-				}
+		if token, _ := storage.GetMonitoringToken(a.profile, a.cfg.CredentialStorage); token != "" {
+			if a.checkQuotaAndEnforce(token) {
+				return 1
 			}
 		}
 		outputJSON(creds)
 		return 0
 	}
 
-	// Authenticate with OIDC provider (browser popup)
-	debugPrint("Authenticating with %s for profile '%s'...", a.providerType, a.profile)
-	authResult, err := a.authenticate()
+	// Authenticate. Nexus deployments use the portless device-code flow; everyone
+	// else uses the browser OIDC redirect flow.
+	authResult, err := a.authenticateForRun()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return 1
 	}
 
-	// Quota check before issuing credentials
-	if a.cfg.QuotaAPIEndpoint != "" {
-		qr := quota.Check(a.cfg.QuotaAPIEndpoint, authResult.IDToken, a.cfg.QuotaCheckTimeout, a.cfg.QuotaFailMode)
-		if !qr.Allowed {
-			printQuotaBlocked(qr)
-			return 1
-		}
+	// Quota check before issuing credentials (also enforces the admin model list)
+	if a.checkQuotaAndEnforce(authResult.IDToken) {
+		return 1
 	}
 
 	// Get AWS credentials
@@ -470,11 +458,51 @@ func (a *credentialApp) run() int {
 	_ = storage.SaveMonitoringToken(a.profile, a.cfg.CredentialStorage,
 		authResult.IDToken, map[string]interface{}(authResult.TokenClaims))
 
+	// Report platform to the Nexus hub (best-effort, never blocks issuance).
+	// Only for Nexus deployments — non-Nexus profiles must not POST to the hub.
+	if a.useDeviceFlow() {
+		_ = nexus.ReportPlatform(a.cfg.DeviceAuthEndpoint, authResult.TokenClaims.GetString("email"), authResult.IDToken)
+	}
+
 	// Persist refresh_token for silent renewal (Cowork 3P support)
 	_ = storage.SaveRefreshToken(a.profile, a.cfg.CredentialStorage, authResult.RefreshToken)
 
 	outputJSON(awsCreds)
 	return 0
+}
+
+// useDeviceFlow reports whether this profile authenticates via the Nexus
+// portless device-code flow. Nexus deployments are detected by a configured
+// device_auth_endpoint or quota_api_endpoint (mirrors the Python dispatch).
+func (a *credentialApp) useDeviceFlow() bool {
+	return a.cfg.DeviceAuthEndpoint != "" || a.cfg.QuotaAPIEndpoint != ""
+}
+
+// authenticateForRun selects the auth mechanism for the primary credential flow:
+// the Nexus device-code flow when configured, otherwise browser OIDC. The
+// monitoring-token and tag-diagnostic paths intentionally always use browser
+// OIDC, matching the Python credential_provider.
+func (a *credentialApp) authenticateForRun() (*oidc.AuthResult, error) {
+	if a.useDeviceFlow() {
+		debugPrint("Authenticating via Nexus device-code flow for profile '%s'...", a.profile)
+		return a.authenticateDeviceFlow()
+	}
+	debugPrint("Authenticating with %s for profile '%s'...", a.providerType, a.profile)
+	return a.authenticate()
+}
+
+// authenticateDeviceFlow runs the Nexus device-code flow and decodes the
+// returned id_token into claims. This flow issues no refresh_token.
+func (a *credentialApp) authenticateDeviceFlow() (*oidc.AuthResult, error) {
+	res, err := nexus.DeviceFlow(a.cfg.DeviceAuthEndpoint, browser.OpenURL, debugPrint)
+	if err != nil {
+		return nil, err
+	}
+	claims, err := jwt.DecodePayload(res.IDToken)
+	if err != nil {
+		return nil, fmt.Errorf("decoding device-flow id_token: %w", err)
+	}
+	return &oidc.AuthResult{IDToken: res.IDToken, TokenClaims: claims}, nil
 }
 
 func (a *credentialApp) authenticate() (*oidc.AuthResult, error) {
@@ -675,6 +703,26 @@ func (a *credentialApp) tryRefreshToken() *federation.AWSCredentials {
 	return creds
 }
 
+// checkQuotaAndEnforce runs a quota check (when a quota endpoint and token are
+// available) and, on the allowed path, enforces the admin-restricted model list
+// against ~/.claude/settings.json. Returns true when access is blocked (the
+// block message is printed; the caller should exit 1).
+func (a *credentialApp) checkQuotaAndEnforce(idToken string) (blocked bool) {
+	if a.cfg.QuotaAPIEndpoint == "" || idToken == "" {
+		return false
+	}
+	qr := quota.Check(a.cfg.QuotaAPIEndpoint, idToken, a.cfg.QuotaCheckTimeout, a.cfg.QuotaFailMode)
+	if !qr.Allowed {
+		printQuotaBlocked(qr)
+		return true
+	}
+	// Quota allowed: enforce admin model restrictions (Nexus).
+	if err := config.EnforceEnabledModels(qr.EnabledModels); err != nil {
+		debugPrint("Could not enforce model restriction: %v", err)
+	}
+	return false
+}
+
 func (a *credentialApp) shouldRecheckQuota() bool {
 	if a.cfg.QuotaAPIEndpoint == "" {
 		return false
@@ -684,18 +732,8 @@ func (a *credentialApp) shouldRecheckQuota() bool {
 }
 
 func (a *credentialApp) performQuotaRecheck() {
-	token, _ := storage.GetMonitoringToken(a.profile, a.cfg.CredentialStorage)
-	if token == "" {
-		return
-	}
-	claims, err := jwt.DecodePayload(token)
-	if err != nil {
-		return
-	}
-	qr := quota.Check(a.cfg.QuotaAPIEndpoint, token, a.cfg.QuotaCheckTimeout, a.cfg.QuotaFailMode)
-	_ = claims // suppress unused
-	if !qr.Allowed {
-		printQuotaBlocked(qr)
+	if token, _ := storage.GetMonitoringToken(a.profile, a.cfg.CredentialStorage); token != "" {
+		a.checkQuotaAndEnforce(token)
 	}
 }
 

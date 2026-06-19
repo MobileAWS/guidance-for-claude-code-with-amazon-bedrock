@@ -35,6 +35,14 @@ type ProfileConfig struct {
 	QuotaCheckInterval int    `json:"quota_check_interval"`
 	QuotaCheckTimeout  int    `json:"quota_check_timeout"`
 
+	// Nexus device-code auth + platform reporting base URL (e.g.
+	// https://<id>.execute-api.<region>.amazonaws.com). When set, the credential
+	// helper uses the portless device-code flow against the Nexus hub instead of
+	// the browser OIDC redirect flow. A configured quota_api_endpoint also opts a
+	// profile into device flow (Nexus deployments), in which case nexus.DefaultAPIBase
+	// is used unless device_auth_endpoint overrides it.
+	DeviceAuthEndpoint string `json:"device_auth_endpoint,omitempty"`
+
 	// Okta Custom Authorization Server id. Absent / empty / "default" all
 	// mean "use the default CAS" -- the Go code normalizes these equivalently.
 	OktaAuthServerID string `json:"okta_auth_server_id"`

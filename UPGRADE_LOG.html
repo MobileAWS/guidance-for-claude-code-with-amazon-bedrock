@@ -462,7 +462,9 @@
 <section id="next">
   <h2 class="section">Next steps / outstanding work</h2>
   <p>Consolidated view of what remains, grouped by what's <strong>doable now (local)</strong> vs
-  <strong>gated on an AWS deployment</strong> to validate. Nothing here is blocking the branches from review.</p>
+  <strong>gated on an AWS deployment</strong> to validate. Nothing here is blocking the branches from review.
+  For validating the deploy-gated items safely, see <code>TESTING.md</code> — an isolated (separate-account)
+  test recipe that doesn't touch the deployed prod environment.</p>
 
   <h3>Before any PUBLIC release / merge to upstream-tracking main</h3>
   <div class="callout danger"><strong>Externalize live identifiers.</strong> The kit fork's GitHub remote is

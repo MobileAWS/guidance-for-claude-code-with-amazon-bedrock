@@ -437,12 +437,23 @@
   kit <code>upgrade/upstream-sync</code> — for review. Don't push until the live identifiers are externalized
   (the moved code still carries them).</div>
 
-  <h3 id="p3b">Phase 3b — remaining (not started)</h3>
-  <p class="muted">Formalize the 3 cross-repo contracts (versioned installer artifacts; an <code>/api/v1</code> OpenAPI
-  spec; stack-output-driven IAM with no hard-coded ARNs); stand up the product repo's deploy pipeline (replace
-  <code>nexus-ui.yaml</code>'s inline Lambda placeholder with a real S3-deployed package; build/push the
-  governance-agent image); externalize the hard-coded AllCode account values; resolve shared-table ownership. See the
-  plan's Phase 3 · contracts / deploy sections.</p>
+  <h3 id="p3b">Phase 3b — in progress (local changes only, no AWS deploys)</h3>
+  <p>Started in the product repo on branch <code>import/nexus-backend</code> (unpushed):</p>
+  <ul>
+    <li><span class="pill fix">done</span> <strong>Contract ② — <code>shared/openapi.yaml</code></strong>: the
+      kit↔API contract (device code/token, platform report, quota check) with request/response schemas + bearer auth,
+      derived from the handlers. Validated (4 paths, 7 schemas). The kit depends only on these URLs/shapes.</li>
+    <li><span class="pill keep">documented, not applied</span> <strong>Identifier externalization
+      (<code>EXTERNALIZATION.md</code>)</strong>: a sanitized, per-identifier plan (account id → <code>${AWS::AccountId}</code>
+      where same-account; Cognito pool / domains → new parameters; the already-parameterized files just need their live
+      <code>Default</code> dropped; the kit's hub-URL constant ties into contract ②). <strong>Not applied</strong> because
+      every variant is deploy-coupled and can't be validated without a CloudFormation deploy (none performed) — and the
+      cross-vs-same-account classification needs the live architecture to confirm. Doing it blind would risk broken infra.</li>
+  </ul>
+  <p class="muted"><strong>Remaining (need an AWS deploy to validate, so deferred):</strong> apply the externalization
+  + validate in a non-prod account; contract ① (versioned installer artifacts → package-gen); contract ③ (stack-output
+  IAM); the product deploy pipeline (replace <code>nexus-ui.yaml</code>'s inline Lambda placeholder; governance-agent →
+  ECR); shared-table ownership.</p>
 </section>
 
 <footer>

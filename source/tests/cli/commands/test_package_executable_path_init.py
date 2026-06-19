@@ -56,9 +56,11 @@ def test_build_failure_before_assignment_does_not_crash(mock_config):
         mock_confirm.return_value.ask.return_value = False
 
         # Build only Windows so the loop's single iteration fails before assignment.
+        # --pyinstaller selects the legacy PyInstaller path being tested here (Go is now
+        # the default and cross-compiles Windows without _build_executable).
         # Before the fix this raised UnboundLocalError out of handle(); the assertion
         # below is unreachable because tester.execute() would propagate that exception.
-        result = tester.execute("--target-platform windows")
+        result = tester.execute("--target-platform windows --pyinstaller")
 
     # Reaches the "No binaries were successfully built" guard and exits cleanly (1)
     # instead of crashing with UnboundLocalError.

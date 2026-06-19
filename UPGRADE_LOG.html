@@ -388,10 +388,19 @@
     <li>New Go files are gofmt-clean. No Python changed, so the 926-test Python suite is unaffected.</li>
   </ul>
 
-  <h3 id="p2b">Phase 2b — decommission (pending confirmation)</h3>
-  <p class="muted">Delete <code>source/credential_provider/</code> and <code>source/otel_helper/__main__.py</code>;
-  remove/flip the PyInstaller path in <code>package.py</code> to Go-only; update the credential-helper-parity
-  rule for a Go-only world; refresh BUILD/ARCHITECTURE docs. This is the destructive half — held for sign-off.</p>
+  <h3 id="p2b">Phase 2b — decommission (staged)</h3>
+  <p><strong>Step 1 — done:</strong> flipped <code>package.py</code> so <strong>Go is the default build</strong>
+  (cross-compiles every platform incl. Windows — no CodeBuild round-trip). The legacy PyInstaller path is retained
+  behind a new <code>--pyinstaller</code> flag as a fallback / rollback hatch; <code>--go</code> still accepted. The
+  Python <code>credential_provider</code> / <code>otel_helper</code> modules and their ~20 tests are <em>kept</em>
+  for now — zero coverage loss, fully reversible. 926 Python tests still pass; one PyInstaller-path test now opts in
+  via <code>--pyinstaller</code>.</p>
+  <p class="muted"><strong>Step 2 — deferred (destructive):</strong> delete the Python modules + their tests, remove
+  the now-dead PyInstaller / CodeBuild-Windows path, update the credential-helper-parity rule for a Go-only world,
+  refresh BUILD/ARCHITECTURE docs, and prune unused Python runtime deps. Held until the Go binaries are validated in
+  a real deployment (can't be validated end-to-end in this dev env). Blast radius: ~20 Python test files reference the
+  modules, several with no Go equivalent, so this step also deletes/ports tests. See <code>CHANGES.html</code> for
+  what to trim alongside it (CodeBuild-Windows becomes obsolete once Go-only).</p>
 </section>
 
 <!-- ===================== PHASE 3 ===================== -->

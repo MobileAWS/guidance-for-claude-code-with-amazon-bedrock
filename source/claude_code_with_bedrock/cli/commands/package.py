@@ -173,7 +173,12 @@ class PackageCommand(Command):
         ),
         option(
             "go",
-            description="Build binaries using Go cross-compilation (native binaries, no AV false positives)",
+            description="[DEFAULT] Build binaries using Go cross-compilation (native binaries, no AV false positives)",
+            flag=True,
+        ),
+        option(
+            "pyinstaller",
+            description="Legacy: build binaries via PyInstaller instead of Go (fallback / rollback hatch)",
             flag=True,
         ),
     ]
@@ -209,8 +214,11 @@ class PackageCommand(Command):
         if self.option("regenerate-installers"):
             return self._regenerate_installers(profile, profile_name, console)
 
-        # Go build mode: all platforms always available via cross-compilation
-        use_go = self.option("go")
+        # Go is the default build mode (cross-compiles all platforms, including Windows,
+        # so no CodeBuild round-trip is needed). --pyinstaller selects the legacy
+        # PyInstaller path as a fallback / rollback hatch; the explicit --go flag is
+        # still accepted (a no-op now that Go is the default).
+        use_go = self.option("go") or not self.option("pyinstaller")
 
         # Interactive prompts if not provided via CLI
         target_platform = self.option("target-platform")

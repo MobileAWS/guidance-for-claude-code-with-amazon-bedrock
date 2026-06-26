@@ -2,6 +2,7 @@
 
 import json
 import os
+import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -19,6 +20,8 @@ metrics_table = dynamodb.Table(METRICS_TABLE)
 policies_table = dynamodb.Table(POLICIES_TABLE)
 quota_table = dynamodb.Table(QUOTA_TABLE)
 orgs_table = dynamodb.Table(ORGS_TABLE)
+MCP_TABLE = os.environ.get("MCP_TABLE", "NexusMcpCatalog")
+mcp_table = dynamodb.Table(MCP_TABLE)
 
 # Cache for assumed role sessions
 _role_cache: dict = {}
@@ -1403,7 +1406,6 @@ def handle_download(event):
     cowork_files = {
         "cowork-macos": "cowork/cowork-3p.mobileconfig",
         "cowork-windows": "cowork/cowork-3p.reg",
-        "cowork-json": "cowork/cowork-3p-config.json",
     }
     if platform in cowork_files:
         try:
@@ -1411,6 +1413,34 @@ def handle_download(event):
             return response(200, {"url": url, "filename": cowork_files[platform].split("/")[-1], "platform": platform})
         except Exception as e:
             return response(500, {"error": str(e)})
+
+    if platform == "cowork-json":
+        # Generate dynamic config with org's MCP servers
+        org_id = _get_org_from_event(event)
+        base_config = {
+            "inferenceProvider": "bedrock",
+            "inferenceBedrockRegion": "us-east-1",
+            "inferenceModels": ["sonnet", "haiku"],
+            "isClaudeCodeForDesktopEnabled": True,
+            "isDesktopExtensionEnabled": True,
+            "isDesktopExtensionDirectoryEnabled": True,
+            "isLocalDevMcpEnabled": True,
+            "inferenceCredentialHelper": "~/claude-code-with-bedrock/credential-process --profile allcode-dev-us-east-1",
+            "inferenceCredentialHelperTtlSec": "3500",
+            "inferenceBedrockProfile": "allcode-dev-us-east-1",
+        }
+        # Add managed MCP servers from catalog
+        try:
+            mcp_result = mcp_table.query(KeyConditionExpression=Key("pk").eq(f"ORG#{org_id}") & Key("sk").begins_with("MCP#"))
+            managed_mcps = []
+            for item in mcp_result.get("Items", []):
+                if item.get("enabled", True):
+                    managed_mcps.append({"name": item["name"], "url": item["url"], "transport": item.get("transport", "http")})
+            if managed_mcps:
+                base_config["managedMcpServers"] = json.dumps(managed_mcps)
+        except Exception:
+            pass
+        return response(200, {"config": base_config, "filename": "cowork-3p-config.json", "platform": platform})
 
     try:
         # Look for platform-specific package first
@@ -1822,6 +1852,8 @@ def handle_transform_jobs(event):
 
 ROUTES = {
     "GET /api/orgs": handle_list_orgs,
+    "GET /api/mcp-servers": handle_mcp_servers,
+    "POST /api/mcp-servers": handle_create_mcp_server,
     "GET /api/debug/claims": lambda event: response(200, {"claims": event.get("requestContext", {}).get("authorizer", {}), "headers": list((event.get("headers", {}) or {}).keys()), "email": get_caller_email(event)}),
     "POST /api/request-access": handle_request_access,
     "POST /api/chat": handle_chat,
@@ -1849,6 +1881,56 @@ ROUTES = {
 }
 
 
+
+def handle_mcp_servers(event):
+    """GET /api/mcp-servers - list MCP servers for org."""
+    org_id = _get_org_from_event(event)
+    try:
+        result = mcp_table.query(KeyConditionExpression=Key("pk").eq(f"ORG#{org_id}") & Key("sk").begins_with("MCP#"))
+        servers = [{"id": item["sk"].replace("MCP#", ""), "name": item.get("name", ""), "url": item.get("url", ""), "transport": item.get("transport", "http"), "description": item.get("description", ""), "enabled": item.get("enabled", True)} for item in result.get("Items", [])]
+    except Exception:
+        servers = []
+    return response(200, {"servers": servers})
+
+
+def handle_create_mcp_server(event):
+    """POST /api/mcp-servers - create MCP server."""
+    org_id = _get_org_from_event(event)
+    body = json.loads(event.get("body", "{}"))
+    if not body.get("name") or not body.get("url"):
+        return response(400, {"error": "name and url are required"})
+    server_id = str(uuid.uuid4())
+    item = {"pk": f"ORG#{org_id}", "sk": f"MCP#{server_id}", "name": body["name"], "url": body["url"], "transport": body.get("transport", "http"), "description": body.get("description", ""), "enabled": True, "created_at": datetime.now(timezone.utc).isoformat()}
+    mcp_table.put_item(Item=item)
+    return response(201, {"id": server_id, "name": body["name"], "url": body["url"], "transport": body.get("transport", "http"), "description": body.get("description", ""), "enabled": True})
+
+
+def handle_update_mcp_server(event):
+    """PUT /api/mcp-servers/{id} - update MCP server."""
+    org_id = _get_org_from_event(event)
+    path = event.get("requestContext", {}).get("http", {}).get("path", "")
+    server_id = path.split("/api/mcp-servers/")[-1]
+    body = json.loads(event.get("body", "{}"))
+    expr_parts, values, names = [], {}, {}
+    for field in ("name", "url", "transport", "description", "enabled"):
+        if field in body:
+            expr_parts.append(f"#{field} = :{field}")
+            values[f":{field}"] = body[field]
+            names[f"#{field}"] = field
+    if not expr_parts:
+        return response(400, {"error": "no fields to update"})
+    mcp_table.update_item(Key={"pk": f"ORG#{org_id}", "sk": f"MCP#{server_id}"}, UpdateExpression="SET " + ", ".join(expr_parts), ExpressionAttributeValues=values, ExpressionAttributeNames=names)
+    return response(200, {"id": server_id, **body})
+
+
+def handle_delete_mcp_server(event):
+    """DELETE /api/mcp-servers/{id} - delete MCP server."""
+    org_id = _get_org_from_event(event)
+    path = event.get("requestContext", {}).get("http", {}).get("path", "")
+    server_id = path.split("/api/mcp-servers/")[-1]
+    mcp_table.delete_item(Key={"pk": f"ORG#{org_id}", "sk": f"MCP#{server_id}"})
+    return response(200, {"deleted": server_id})
+
 def lambda_handler(event, context):
     """Main Lambda handler - routes requests."""
     # Handle EventBridge Transform events
@@ -1872,6 +1954,13 @@ def lambda_handler(event, context):
             handler = handle_update_quota
         elif method == "DELETE":
             handler = handle_delete_quota
+
+    # MCP server detail routes
+    if not handler and path.startswith("/api/mcp-servers/"):
+        if method == "PUT":
+            handler = handle_update_mcp_server
+        elif method == "DELETE":
+            handler = handle_delete_mcp_server
 
     # User detail, toggle, and delete
     if not handler and path.startswith("/api/users/") and path != "/api/users/me" and not path.endswith("/activity") and path != "/api/users/export":

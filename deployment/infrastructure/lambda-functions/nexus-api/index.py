@@ -1437,7 +1437,7 @@ def handle_download(event):
                 if item.get("enabled", True):
                     managed_mcps.append({"name": item["name"], "url": item["url"], "transport": item.get("transport", "http")})
             if managed_mcps:
-                base_config["managedMcpServers"] = json.dumps(managed_mcps)
+                base_config["managedMcpServers"] = managed_mcps
         except Exception:
             pass
         return response(200, {"config": base_config, "filename": "cowork-3p-config.json", "platform": platform})
@@ -1852,8 +1852,6 @@ def handle_transform_jobs(event):
 
 ROUTES = {
     "GET /api/orgs": handle_list_orgs,
-    "GET /api/mcp-servers": handle_mcp_servers,
-    "POST /api/mcp-servers": handle_create_mcp_server,
     "GET /api/debug/claims": lambda event: response(200, {"claims": event.get("requestContext", {}).get("authorizer", {}), "headers": list((event.get("headers", {}) or {}).keys()), "email": get_caller_email(event)}),
     "POST /api/request-access": handle_request_access,
     "POST /api/chat": handle_chat,
@@ -1882,6 +1880,72 @@ ROUTES = {
 
 
 
+
+def _regenerate_cowork_config(org_id):
+    """Regenerate and upload Cowork .mobileconfig and JSON config after MCP changes."""
+    import plistlib
+    try:
+        s3 = boto3.client("s3")
+        bucket = os.environ.get("DISTRIBUTION_BUCKET", "claude-code-auth-distribution-916587687563")
+        # Get all enabled MCPs for this org
+        result = mcp_table.query(KeyConditionExpression=Key("pk").eq(f"ORG#{org_id}") & Key("sk").begins_with("MCP#"))
+        managed_mcps = []
+        for item in result.get("Items", []):
+            if item.get("enabled", True):
+                entry = {"name": item["name"], "url": item["url"], "transport": item.get("transport", "http")}
+                if item.get("transport") == "stdio":
+                    parts = item["url"].split(" ")
+                    entry = {"name": item["name"], "transport": "stdio", "command": parts[0], "args": parts[1:]}
+                managed_mcps.append(entry)
+
+        # Generate .mobileconfig
+        config_payload = {
+            "PayloadType": "com.anthropic.claudefordesktop",
+            "PayloadVersion": 1,
+            "PayloadIdentifier": f"com.allcode.nexus.cowork.{org_id}",
+            "PayloadUUID": "A1B2C3D4-E5F6-7890-ABCD-EF1234567890",
+            "PayloadDisplayName": "AllCode Nexus - Claude Cowork",
+            "inferenceProvider": "bedrock",
+            "inferenceBedrockRegion": "us-east-1",
+            "inferenceModels": json.dumps(["sonnet", "haiku"]),
+            "isClaudeCodeForDesktopEnabled": "true",
+            "isDesktopExtensionEnabled": "true",
+            "isDesktopExtensionDirectoryEnabled": "true",
+            "isLocalDevMcpEnabled": "true",
+            "inferenceCredentialHelper": "~/claude-code-with-bedrock/credential-process --profile allcode-dev-us-east-1",
+            "inferenceCredentialHelperTtlSec": "3500",
+            "inferenceBedrockProfile": "allcode-dev-us-east-1",
+        }
+        if managed_mcps:
+            config_payload["managedMcpServers"] = json.dumps(managed_mcps)
+
+        profile = {
+            "PayloadContent": [config_payload],
+            "PayloadDisplayName": "AllCode Nexus - Claude Cowork",
+            "PayloadIdentifier": f"com.allcode.nexus.cowork.{org_id}.profile",
+            "PayloadUUID": "F1E2D3C4-B5A6-7890-1234-567890ABCDEF",
+            "PayloadType": "Configuration",
+            "PayloadVersion": 1,
+        }
+        mobileconfig = plistlib.dumps(profile)
+        s3.put_object(Bucket=bucket, Key="cowork/cowork-3p.mobileconfig", Body=mobileconfig, ContentType="application/x-apple-aspen-config")
+
+        # Also update JSON config
+        json_config = {k: v for k, v in config_payload.items() if not k.startswith("Payload")}
+        s3.put_object(Bucket=bucket, Key="cowork/cowork-3p-config.json", Body=json.dumps(json_config, indent=2), ContentType="application/json")
+
+        # Also update Claude Code MCP config (settings.json mcpServers format)
+        mcp_servers_config = {}
+        for mcp in managed_mcps:
+            name = mcp.get("name", "unknown").lower().replace(" ", "-")
+            if mcp.get("transport") == "stdio":
+                mcp_servers_config[name] = {"command": mcp.get("command", ""), "args": mcp.get("args", [])}
+            else:
+                mcp_servers_config[name] = {"url": mcp.get("url", ""), "transport": mcp.get("transport", "http")}
+        s3.put_object(Bucket=bucket, Key="cowork/claude-code-mcps.json", Body=json.dumps(mcp_servers_config, indent=2), ContentType="application/json")
+    except Exception as e:
+        print(f"Failed to regenerate cowork config: {e}")
+
 def handle_mcp_servers(event):
     """GET /api/mcp-servers - list MCP servers for org."""
     org_id = _get_org_from_event(event)
@@ -1902,6 +1966,7 @@ def handle_create_mcp_server(event):
     server_id = str(uuid.uuid4())
     item = {"pk": f"ORG#{org_id}", "sk": f"MCP#{server_id}", "name": body["name"], "url": body["url"], "transport": body.get("transport", "http"), "description": body.get("description", ""), "enabled": True, "created_at": datetime.now(timezone.utc).isoformat()}
     mcp_table.put_item(Item=item)
+    _regenerate_cowork_config(org_id)
     return response(201, {"id": server_id, "name": body["name"], "url": body["url"], "transport": body.get("transport", "http"), "description": body.get("description", ""), "enabled": True})
 
 
@@ -1920,6 +1985,7 @@ def handle_update_mcp_server(event):
     if not expr_parts:
         return response(400, {"error": "no fields to update"})
     mcp_table.update_item(Key={"pk": f"ORG#{org_id}", "sk": f"MCP#{server_id}"}, UpdateExpression="SET " + ", ".join(expr_parts), ExpressionAttributeValues=values, ExpressionAttributeNames=names)
+    _regenerate_cowork_config(org_id)
     return response(200, {"id": server_id, **body})
 
 
@@ -1929,7 +1995,91 @@ def handle_delete_mcp_server(event):
     path = event.get("requestContext", {}).get("http", {}).get("path", "")
     server_id = path.split("/api/mcp-servers/")[-1]
     mcp_table.delete_item(Key={"pk": f"ORG#{org_id}", "sk": f"MCP#{server_id}"})
+    _regenerate_cowork_config(org_id)
     return response(200, {"deleted": server_id})
+
+
+def handle_skills(event):
+    """GET /api/skills - list skills for org."""
+    org_id = _get_org_from_event(event)
+    try:
+        result = mcp_table.query(KeyConditionExpression=Key("pk").eq(f"ORG#{org_id}") & Key("sk").begins_with("SKILL#"))
+        skills = [{"id": item["sk"].replace("SKILL#", ""), "name": item.get("name", ""), "description": item.get("description", ""), "type": item.get("type", "custom"), "prompt": item.get("prompt", ""), "enabled": item.get("enabled", True)} for item in result.get("Items", [])]
+    except Exception:
+        skills = []
+    return response(200, {"skills": skills})
+
+
+def handle_create_skill(event):
+    """POST /api/skills - create skill."""
+    org_id = _get_org_from_event(event)
+    body = json.loads(event.get("body", "{}"))
+    if not body.get("name"):
+        return response(400, {"error": "name is required"})
+    skill_id = str(uuid.uuid4())
+    item = {"pk": f"ORG#{org_id}", "sk": f"SKILL#{skill_id}", "name": body["name"], "description": body.get("description", ""), "type": body.get("type", "custom"), "prompt": body.get("prompt", ""), "enabled": True, "created_at": datetime.now(timezone.utc).isoformat()}
+    mcp_table.put_item(Item=item)
+    return response(201, {"id": skill_id, "name": body["name"], "description": body.get("description", ""), "type": body.get("type", "custom"), "prompt": body.get("prompt", ""), "enabled": True})
+
+
+def handle_delete_skill(event):
+    """DELETE /api/skills/{id} - delete skill."""
+    org_id = _get_org_from_event(event)
+    path = event.get("requestContext", {}).get("http", {}).get("path", "")
+    skill_id = path.split("/api/skills/")[-1]
+    mcp_table.delete_item(Key={"pk": f"ORG#{org_id}", "sk": f"SKILL#{skill_id}"})
+    return response(200, {"deleted": skill_id})
+
+
+def handle_performance(event):
+    """GET /api/performance - per-user performance metrics from CloudWatch."""
+    now = datetime.now(timezone.utc)
+    cw = boto3.client("cloudwatch")
+    org_id = _get_org_from_event(event)
+
+    # Get user list from CloudWatch
+    metrics = cw.list_metrics(Namespace="ClaudeCode", MetricName="claude_code.session.count", Dimensions=[{"Name": "user.email"}])
+    users = []
+    total_sessions = 0
+    total_active = 0
+    total_tokens = 0
+    total_loc = 0
+
+    for m in metrics.get("Metrics", []):
+        email = ""
+        for d in m["Dimensions"]:
+            if d["Name"] == "user.email":
+                email = d["Value"]
+        if not email or "anonymous" in email or "example.com" in email:
+            continue
+        # Get metrics for this user
+        sessions = 0
+        active_min = 0
+        tokens = 0
+        loc = 0
+        try:
+            for metric, var_name in [("claude_code.session.count", "sessions"), ("claude_code.active_time.total", "active"), ("claude_code.token.usage", "tokens"), ("claude_code.lines_of_code.count", "loc")]:
+                r = cw.get_metric_statistics(Namespace="ClaudeCode", MetricName=metric, Dimensions=[{"Name": "user.email", "Value": email}, {"Name": "OTelLib", "Value": "com.anthropic.claude_code"}], StartTime=now - timedelta(days=30), EndTime=now, Period=2592000, Statistics=["Sum"])
+                val = int(sum(p.get("Sum", 0) for p in r.get("Datapoints", [])))
+                if var_name == "sessions": sessions = val
+                elif var_name == "active": active_min = int(val / 60)
+                elif var_name == "tokens": tokens = val
+                elif var_name == "loc": loc = val
+        except Exception:
+            pass
+        if sessions > 0 or tokens > 0:
+            users.append({"email": email, "sessions": sessions, "activeMinutes": active_min, "tokens": tokens, "linesOfCode": loc})
+            total_sessions += sessions
+            total_active += active_min
+            total_tokens += tokens
+            total_loc += loc
+
+    users.sort(key=lambda x: -x["tokens"])
+    return response(200, {
+        "users": users[:20],
+        "totals": {"sessions": total_sessions, "activeHours": round(total_active / 60, 1), "avgTokensPerSession": int(total_tokens / max(total_sessions, 1)), "linesOfCode": total_loc}
+    })
+
 
 def lambda_handler(event, context):
     """Main Lambda handler - routes requests."""
@@ -1955,12 +2105,26 @@ def lambda_handler(event, context):
         elif method == "DELETE":
             handler = handle_delete_quota
 
-    # MCP server detail routes
+    # MCP server routes
+    if not handler and path == "/api/mcp-servers" and method == "GET":
+        handler = handle_mcp_servers
+    if not handler and path == "/api/mcp-servers" and method == "POST":
+        handler = handle_create_mcp_server
     if not handler and path.startswith("/api/mcp-servers/"):
         if method == "PUT":
             handler = handle_update_mcp_server
         elif method == "DELETE":
             handler = handle_delete_mcp_server
+
+    # Skills routes
+    if not handler and path == "/api/performance" and method == "GET":
+        handler = handle_performance
+    if not handler and path == "/api/skills" and method == "GET":
+        handler = handle_skills
+    if not handler and path == "/api/skills" and method == "POST":
+        handler = handle_create_skill
+    if not handler and path.startswith("/api/skills/") and method == "DELETE":
+        handler = handle_delete_skill
 
     # User detail, toggle, and delete
     if not handler and path.startswith("/api/users/") and path != "/api/users/me" and not path.endswith("/activity") and path != "/api/users/export":

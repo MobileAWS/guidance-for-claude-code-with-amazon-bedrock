@@ -4,8 +4,12 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"ccwb-go/internal/config"
@@ -36,6 +40,7 @@ func main() {
 
 	profileFlag := flag.String("profile", defaultProfile, "Configuration profile to use")
 	shortProfile := flag.String("p", "", "Configuration profile to use (short)")
+	orgFlag := flag.String("org", "", "Select org for multi-org users (e.g. --org skematic)")
 	versionFlag := flag.Bool("version", false, "Show version")
 	shortVersion := flag.Bool("v", false, "Show version (short)")
 	getMonitoring := flag.Bool("get-monitoring-token", false, "Get cached monitoring token")
@@ -103,6 +108,7 @@ func main() {
 
 	app := &credentialApp{
 		profile:      profile,
+		orgFlag:      *orgFlag,
 		cfg:          cfg,
 		providerType: providerType,
 		redirectPort: redirectPort,
@@ -150,6 +156,7 @@ func main() {
 
 type credentialApp struct {
 	profile      string
+	orgFlag      string
 	cfg          *config.ProfileConfig
 	providerType string
 	redirectPort int
@@ -360,6 +367,14 @@ func (a *credentialApp) getTag(key string) int {
 }
 
 func (a *credentialApp) run() int {
+	// Save org selection if explicitly passed
+	if a.orgFlag != "" {
+		saveActiveOrg(a.profile, a.orgFlag)
+	}
+
+	// Sync MCP servers from Nexus (quick, with timeout)
+	syncMcpServers()
+
 	// Check cache first
 	if cached := a.getCachedCredentials(); cached != nil {
 		// Periodic quota re-check
@@ -472,6 +487,48 @@ func (a *credentialApp) run() int {
 
 	// Persist refresh_token for silent renewal (Cowork 3P support)
 	_ = storage.SaveRefreshToken(a.profile, a.cfg.CredentialStorage, authResult.RefreshToken)
+
+	// Org selection for multi-org users
+	if groups, ok := authResult.TokenClaims["cognito:groups"]; ok {
+		if groupList, ok := groups.([]interface{}); ok {
+			var orgs []string
+			for _, g := range groupList {
+				if s, ok := g.(string); ok && len(s) > 4 && s[:4] == "org-" && !strings.HasSuffix(s, "-admins") {
+					orgs = append(orgs, s[4:])
+				}
+			}
+			if len(orgs) > 0 {
+				selectedOrg := ""
+				if a.orgFlag != "" {
+					selectedOrg = a.orgFlag
+				} else if len(orgs) == 1 {
+					selectedOrg = orgs[0]
+				} else {
+					// Multiple orgs — check saved preference or prompt
+					savedOrg := readActiveOrg(a.profile)
+					if savedOrg != "" {
+						selectedOrg = savedOrg
+					} else {
+						fmt.Fprintf(os.Stderr, "\nYou belong to multiple organizations:\n")
+						for i, org := range orgs {
+							fmt.Fprintf(os.Stderr, "  [%d] %s\n", i+1, org)
+						}
+						fmt.Fprintf(os.Stderr, "Select org (1-%d): ", len(orgs))
+						var choice int
+						fmt.Scanln(&choice)
+						if choice >= 1 && choice <= len(orgs) {
+							selectedOrg = orgs[choice-1]
+						} else {
+							selectedOrg = orgs[0]
+						}
+					}
+				}
+				if selectedOrg != "" {
+					saveActiveOrg(a.profile, selectedOrg)
+				}
+			}
+		}
+	}
 
 	outputJSON(awsCreds)
 	return 0
@@ -712,4 +769,80 @@ func printQuotaBlocked(qr *quota.Result) {
 func outputJSON(v interface{}) {
 	data, _ := json.Marshal(v)
 	fmt.Println(string(data))
+}
+
+func readActiveOrg(profile string) string {
+	home, _ := os.UserHomeDir()
+	data, err := os.ReadFile(filepath.Join(home, ".claude-code-session", profile+"-active-org"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+func saveActiveOrg(profile, org string) {
+	home, _ := os.UserHomeDir()
+	dir := filepath.Join(home, ".claude-code-session")
+	os.MkdirAll(dir, 0700)
+	os.WriteFile(filepath.Join(dir, profile+"-active-org"), []byte(org), 0600)
+}
+
+func syncMcpServers() {
+	// Fetch MCP config from S3 and merge into ~/.claude/settings.json
+	// Non-blocking, best effort — failures are silent
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	settingsPath := filepath.Join(home, ".claude", "settings.json")
+
+	// Check if we synced recently (skip if < 5 min ago)
+	cachePath := filepath.Join(home, ".claude-code-session", "mcp-sync-ts")
+	if data, err := os.ReadFile(cachePath); err == nil {
+		if ts, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64); err == nil {
+			if time.Now().Unix()-ts < 300 {
+				return // Synced less than 5 min ago
+			}
+		}
+	}
+
+	// Fetch MCPs from S3
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get("https://claude-code-auth-distribution-916587687563.s3.amazonaws.com/cowork/claude-code-mcps.json")
+	if err != nil || resp.StatusCode != 200 {
+		return
+	}
+	defer resp.Body.Close()
+	mcpData, err := io.ReadAll(resp.Body)
+	if err != nil || len(mcpData) < 3 {
+		return
+	}
+
+	// Parse MCPs
+	var mcps map[string]interface{}
+	if err := json.Unmarshal(mcpData, &mcps); err != nil {
+		return
+	}
+
+	// Read current settings
+	settingsData, err := os.ReadFile(settingsPath)
+	if err != nil {
+		return
+	}
+	var settings map[string]interface{}
+	if err := json.Unmarshal(settingsData, &settings); err != nil {
+		return
+	}
+
+	// Merge MCPs
+	settings["mcpServers"] = mcps
+	newData, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return
+	}
+	os.WriteFile(settingsPath, newData, 0600)
+
+	// Update sync timestamp
+	os.MkdirAll(filepath.Dir(cachePath), 0700)
+	os.WriteFile(cachePath, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0600)
 }

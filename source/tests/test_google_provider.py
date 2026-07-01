@@ -48,18 +48,13 @@ class TestGoogleProviderDetection:
 class TestGoogleTokenEndpoint:
     """Verify absolute token endpoint is handled correctly."""
 
-    def test_google_token_endpoint_is_absolute(self):
-        """Google's token_endpoint starts with https:// (absolute URL)."""
-        cp_path = Path(__file__).resolve().parents[1] / "credential_provider" / "__main__.py"
-        source = cp_path.read_text(encoding="utf-8")
-        assert '"token_endpoint": "https://oauth2.googleapis.com/token"' in source
-
     def test_absolute_url_detection_logic(self):
         """Absolute URLs (https://) should be used directly, not prefixed with base_url."""
         token_endpoint = "https://oauth2.googleapis.com/token"
         base_url = "https://accounts.google.com"
 
-        # This replicates the logic in credential_provider/__main__.py line 1029-1031
+        # Mirrors the credential-process token-URL resolution: absolute URLs are
+        # used as-is; relative paths are appended to the issuer base_url.
         if token_endpoint.startswith("https://"):
             token_url = token_endpoint
         else:

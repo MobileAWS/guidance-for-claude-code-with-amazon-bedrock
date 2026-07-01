@@ -1156,21 +1156,6 @@ class InitCommand(Command):
             # Save monitoring progress
             progress.save_step("monitoring_complete", config)
 
-        # Additional optional features
-        console.print("\n[bold]Windows Build Support[/bold]")
-        console.print("Build Windows binaries using AWS CodeBuild")
-        enable_codebuild = questionary.confirm(
-            "Enable Windows builds?", default=config.get("codebuild", {}).get("enabled", False)
-        ).ask()
-
-        # Preserve existing codebuild settings, only update enabled flag
-        if "codebuild" not in config:
-            config["codebuild"] = {}
-        config["codebuild"]["enabled"] = enable_codebuild
-
-        if enable_codebuild:
-            console.print("[green]✓[/green] CodeBuild for Windows builds will be deployed")
-
         # Claude Cowork 3P MDM configuration
         console.print("\n[bold]Claude Cowork (Desktop) Support[/bold]")
         console.print("Generate MDM configuration for Claude Cowork with third-party platforms")
@@ -1863,9 +1848,6 @@ class InitCommand(Command):
                 console.print("• DynamoDB tables for quota tracking")
                 console.print("• Lambda function for quota checking")
                 console.print("• API Gateway for real-time quota API")
-        if config.get("codebuild", {}).get("enabled", False):
-            console.print("• CodeBuild project for Windows binary builds")
-            console.print("• S3 bucket for build artifacts")
         if config.get("distribution", {}).get("enabled", False):
             dist_type = config.get("distribution", {}).get("type")
             if dist_type == "landing-page":
@@ -2060,7 +2042,6 @@ class InitCommand(Command):
             "azure_auth_mode": config_data.get("azure_auth_mode"),
             "client_certificate_path": config_data.get("client_certificate_path"),
             "client_certificate_key_path": config_data.get("client_certificate_key_path"),
-            "enable_codebuild": config_data.get("codebuild", {}).get("enabled", False),
             "enable_distribution": config_data.get("distribution", {}).get("enabled", False),
             "distribution_type": config_data.get("distribution", {}).get("type"),
             "distribution_idp_provider": config_data.get("distribution", {}).get("idp_provider"),
@@ -2425,10 +2406,6 @@ class InitCommand(Command):
             for arn_key in ["inference_profile_opus_arn", "inference_profile_sonnet_arn", "inference_profile_haiku_arn"]:
                 if getattr(profile, arn_key, None):
                     existing_config["aws"][arn_key] = getattr(profile, arn_key)
-
-            # Add CodeBuild configuration if present
-            if hasattr(profile, "enable_codebuild"):
-                existing_config["codebuild"] = {"enabled": profile.enable_codebuild}
 
             # Add CoWork 3P configuration
             existing_config["cowork_3p"] = {"enabled": profile.cowork_3p_enabled}

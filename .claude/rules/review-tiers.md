@@ -20,7 +20,8 @@ all users.
 - Regression test for every changed code path
 - Backward-compat test (old configs still load and work)
 - Cross-platform CI must pass (no admin merge override)
-- Parity check if touching Go ↔ Python equivalents
+- If touching `buildSessionName`, preserve the session-name output contract ([[credential-helper-parity]])
+- Keep the Go `ProfileConfig` struct in sync with the Python `Profile` dataclass ([[config-sync]])
 - Test with all auth types: oidc, idc, none
 
 ## Tier 2 — High (subset of users affected)
@@ -28,7 +29,6 @@ all users.
 **Files:**
 - `source/claude_code_with_bedrock/cli/commands/init.py`
 - `source/claude_code_with_bedrock/cli/commands/package.py`
-- `source/credential_provider/__main__.py`
 - `deployment/infrastructure/otel-collector.yaml`
 - `deployment/infrastructure/quota-monitoring.yaml`
 - `source/go/internal/oidc/`, `source/go/internal/federation/`

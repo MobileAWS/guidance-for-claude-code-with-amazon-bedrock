@@ -1,5 +1,8 @@
 .DS_Store
 
+# Local deploy/test helper — carries account id + SSO URL, must not be committed (public repo)
+deploy-test.sh
+
 # Build artifacts
 dist/
 build/

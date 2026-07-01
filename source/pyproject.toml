@@ -19,14 +19,12 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 packages = [
-    { include = "credential_provider" },
     { include = "claude_code_with_bedrock" }
 ]
 
 [tool.poetry.scripts]
 claude-code-with-bedrock = "claude_code_with_bedrock.cli:main"
 ccwb = "claude_code_with_bedrock.cli:main"
-credential-provider = "credential_provider:main"
 
 [tool.poetry.dependencies]
 python = ">=3.10,<3.13"
@@ -46,10 +44,6 @@ cfn-flip = "^1.3.0"
 pytest = "^9.0.3"
 pytest-cov = "^7.1.0"
 black = "^26.3.1"
-nuitka = "^4.0.8"
-ordered-set = "^4.1.0"
-zstandard = "^0.25.0"
-pyinstaller = "^6.19.0"
 ruff = "^0.15.10"
 mypy = ">=1.20,<3.0"
 types-requests = "*"

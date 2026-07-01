@@ -49,7 +49,6 @@ class Profile:
     oidc_token_endpoint: str | None = None  # Full URL or path appended to issuer
     oidc_jwks_uri: str | None = None  # Full URL to JWKS endpoint
     oidc_thumbprint: str | None = None  # SHA-1 thumbprint of root cert in JWKS TLS chain
-    enable_codebuild: bool = False  # Enable CodeBuild for Windows binary builds
     enable_distribution: bool = False  # Enable package distribution features (legacy, use distribution_type)
 
     # Distribution platform configuration

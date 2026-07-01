@@ -90,7 +90,7 @@
   <a href="#p1-verify" class="sub">Verification</a>
   <a href="#p1-deferred" class="sub">Deferred items</a>
   <h2>Phase 2 — Python→Go</h2>
-  <a href="#p2" class="sub">Go port (2a done, 2b staged)</a>
+  <a href="#p2" class="sub">Go port (2a + 2b done)</a>
   <h2>Phase 3 — Extract console</h2>
   <a href="#p3" class="sub">Extraction (3a done, 3b in progress)</a>
   <h2 style="color:var(--amber)">▸ Next steps</h2>
@@ -108,8 +108,9 @@
   <h1>Upgrade Change Log</h1>
   <p class="lede"><strong>Reviewing this branch? Start here.</strong> This is the running record of every
   change applied during the three-phase upgrade — what was decided, what changed, why each call was made,
-  and how it was verified. It's the map of the branch/PR. <strong>Phase 1 complete; Phases 2–3 not started.</strong></p>
-  <p class="ts">Last updated: 2026-06-19 · Tracked in the repo so it travels with the branch.
+  and how it was verified. It's the map of the branch/PR. <strong>Phase 1 complete; Phase 2 complete (2a + 2b);
+  Phase 3a complete, 3b in progress.</strong></p>
+  <p class="ts">Last updated: 2026-06-23 · Tracked in the repo so it travels with the branch.
   Companion to the <em>Upgrade &amp; Restructure Plan</em>.</p>
 </header>
 
@@ -340,8 +341,9 @@
       unused by the fork's settings writer (fork hard-codes the attributes).</li>
     <li><strong>AWS Transform IAM:</strong> verify the <code>transform:</code> prefix and narrow its <code>*</code>
       wildcard (Phase 3).</li>
-    <li><strong>Parity rule:</strong> <code>.claude/rules/credential-helper-parity.md</code> asserts Go≡Python
-      output — Phase 2 deletes the Python binaries and must update it.</li>
+    <li><strong>Parity rule:</strong> <code>.claude/rules/credential-helper-parity.md</code> asserted Go≡Python
+      output — <strong>✓ resolved in Phase 2b step 2:</strong> Python deleted, rule rewritten as the Go-only
+      session-name output contract.</li>
     <li><strong>Identifier externalization:</strong> account IDs, the device-auth URL, and
       <code>KEY_FIXES.md</code> before any public push.</li>
   </ul>
@@ -350,11 +352,12 @@
 <!-- ===================== PHASE 2 ===================== -->
 <section id="p2">
   <span class="phase-label done">Phase 2a · complete</span>
-  <span class="phase-label pending">Phase 2b · decommission pending</span>
+  <span class="phase-label done">Phase 2b · decommission complete</span>
   <h2 class="section" style="border-top:none;margin-top:6px;padding-top:0;">Rewrite runtime binaries in Go</h2>
   <p>Phase 2a folds the fork's Python-only runtime features into the merged Go tree so the Go
   credential-process / otel-helper reach feature parity with the fork's Python. Phase 2b (deleting the
-  Python modules + flipping the build to Go-only) is a separate, destructive step held for confirmation.</p>
+  Python modules + flipping the build to Go-only) is now complete — the Go binaries are the sole runtime
+  and build path. See the Phase 2b detail below.</p>
 
   <h3>Gap analysis (fork Python vs the merged Go tree)</h3>
   <p>Most fork behaviors were <em>already present</em> in upstream's Go binaries — the real gaps were four
@@ -390,19 +393,30 @@
     <li>New Go files are gofmt-clean. No Python changed, so the 926-test Python suite is unaffected.</li>
   </ul>
 
-  <h3 id="p2b">Phase 2b — decommission (staged)</h3>
+  <h3 id="p2b">Phase 2b — decommission (complete)</h3>
   <p><strong>Step 1 — done:</strong> flipped <code>package.py</code> so <strong>Go is the default build</strong>
   (cross-compiles every platform incl. Windows — no CodeBuild round-trip). The legacy PyInstaller path is retained
   behind a new <code>--pyinstaller</code> flag as a fallback / rollback hatch; <code>--go</code> still accepted. The
   Python <code>credential_provider</code> / <code>otel_helper</code> modules and their ~20 tests are <em>kept</em>
   for now — zero coverage loss, fully reversible. 926 Python tests still pass; one PyInstaller-path test now opts in
   via <code>--pyinstaller</code>.</p>
-  <p class="muted"><strong>Step 2 — deferred (destructive):</strong> delete the Python modules + their tests, remove
-  the now-dead PyInstaller / CodeBuild-Windows path, update the credential-helper-parity rule for a Go-only world,
-  refresh BUILD/ARCHITECTURE docs, and prune unused Python runtime deps. Held until the Go binaries are validated in
-  a real deployment (can't be validated end-to-end in this dev env). Blast radius: ~20 Python test files reference the
-  modules, several with no Go equivalent, so this step also deletes/ports tests. See <code>CHANGES.html</code> for
-  what to trim alongside it (CodeBuild-Windows becomes obsolete once Go-only).</p>
+  <p><strong>Step 2 — done (destructive), 2026-06-23:</strong> executed <strong>without the AWS-deploy
+  validation this step was gated on</strong> — a deliberate call because "we can't ship Python" is a hard product
+  constraint that outranks validate-first (the Go binaries already had unit-test + 5-platform cross-compile coverage).
+  Deleted <code>credential_provider/</code> + <code>otel_helper/__main__.py</code>; stripped the PyInstaller / Nuitka /
+  Docker / CodeBuild-Windows build paths from <code>package.py</code> (3397→1804 lines); deleted
+  <code>codebuild-windows.yaml</code>, the <code>builds</code> + <code>package-cb</code> commands, the
+  <code>--pyinstaller</code> + <code>--status</code> flags, and the <code>enable_codebuild</code> Profile field with
+  all CodeBuild wiring across deploy/init/destroy/context/helpers/distribute. Removed ~17 Python-impl test files (+ trimmed 6).
+  <em>Kept</em> <code>otel_helper/collector-config.yaml</code> + <code>otel-helper.sh</code> (the Go sidecar reads them).
+  Rewrote the credential-helper-parity rule (Go↔Python parity → stable session-name contract), refreshed
+  the build/architecture docs (Go-only), and pruned the <code>pyinstaller</code>/<code>nuitka</code> dev deps.</p>
+  <p class="muted"><strong>Verification (no live AWS):</strong> pytest <strong>723 pass / 0 fail / 0 collection errors</strong>
+  (was 896 — the drop is the deleted Python-impl tests, whose behaviors are covered by the green Go suite);
+  <code>go build/vet/test ./...</code> all green; <code>ruff</code> introduced zero new errors. The 20 remaining pytest
+  "errors" are the pre-existing cfn-lint env gap, not failures. Backward-compat held: <code>Profile.from_dict</code>
+  filters unknown keys, so old configs carrying <code>enable_codebuild</code> still load. Not committed — left in the
+  working tree for review.</p>
 </section>
 
 <!-- ===================== PHASE 3 ===================== -->
@@ -484,11 +498,12 @@
     <li><strong>Run <code>cfn-lint</code> / <code>yamllint</code> / <code>ruff</code></strong> where the binaries exist (not installed in the dev env used here).</li>
   </ul>
 
-  <h3>Phase 2b — step 2 (destructive; after Go binaries validated in a real deployment)</h3>
+  <h3>Phase 2b — step 2 ✓ DONE 2026-06-23 (destructive; done without the AWS-deploy gate)</h3>
   <ul>
-    <li>Delete <code>source/credential_provider/</code> + <code>source/otel_helper/__main__.py</code> and their ~20 referencing tests.</li>
-    <li>Remove the now-dead PyInstaller + CodeBuild-Windows path from <code>package.py</code>.</li>
-    <li>Update <code>.claude/rules/credential-helper-parity.md</code> for a Go-only world; refresh BUILD/ARCHITECTURE docs; prune unused Python runtime deps.</li>
+    <li>✓ Deleted <code>source/credential_provider/</code> + <code>source/otel_helper/__main__.py</code> and their ~17 referencing tests.</li>
+    <li>✓ Removed the PyInstaller / Nuitka / Docker / CodeBuild-Windows paths from <code>package.py</code> (3397→1804 lines); deleted <code>codebuild-windows.yaml</code>, the <code>builds</code>/<code>package-cb</code> commands, the <code>--pyinstaller</code>/<code>--status</code> flags, and the <code>enable_codebuild</code> field + all CodeBuild wiring (11 files).</li>
+    <li>✓ Rewrote <code>.claude/rules/credential-helper-parity.md</code> (Go-only session-name contract); refreshed build/architecture docs; pruned the <code>pyinstaller</code>/<code>nuitka</code> dev deps.</li>
+    <li><strong>Done without the "validate in a real deployment first" gate</strong> — "can't ship Python" overrode it. Verified by pytest (723 pass / 0 fail) + <code>go build/vet/test</code> + <code>ruff</code>; <em>not</em> yet validated by a live AWS deploy. See <a href="#p2b">Phase 2b</a> detail. Not committed.</li>
   </ul>
 
   <h3>Phase 3b — remaining (gated on an AWS deploy to validate)</h3>

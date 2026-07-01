@@ -18,7 +18,6 @@ from claude_code_with_bedrock.config import Config
 # All destroyable stacks in reverse dependency order (destroy-all uses this sequence).
 # Keep in sync with deploy.py's stack types when adding new stacks.
 DESTROYABLE_STACKS = [
-    "codebuild",
     "analytics",
     "quota",
     "cowork-dashboard",
@@ -141,8 +140,6 @@ class DestroyCommand(Command):
             if stack == "quota" and not getattr(profile, "quota_monitoring_enabled", False):
                 continue
             if stack == "distribution" and not getattr(profile, "enable_distribution", False):
-                continue
-            if stack == "codebuild" and not getattr(profile, "enable_codebuild", False):
                 continue
 
             stack_name = profile.stack_names.get(stack, f"{profile.identity_pool_name}-{stack}")

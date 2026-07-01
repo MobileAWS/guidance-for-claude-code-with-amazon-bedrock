@@ -25,7 +25,6 @@ def _profile(**overrides):
     p.monitoring_mode = "central"
     p.quota_monitoring_enabled = False
     p.enable_distribution = False
-    p.enable_codebuild = False
     p.aws_region = "us-east-1"
     for k, v in overrides.items():
         setattr(p, k, v)
@@ -68,13 +67,6 @@ class TestSkipGuards:
         _, without_it = _run_destroy(_profile(enable_distribution=False))
         assert "distribution" not in without_it
 
-    def test_codebuild_deleted_only_when_enabled(self):
-        _, with_it = _run_destroy(_profile(enable_codebuild=True))
-        assert "codebuild" in with_it
-
-        _, without_it = _run_destroy(_profile(enable_codebuild=False))
-        assert "codebuild" not in without_it
-
     def test_monitoring_stacks_skipped_when_monitoring_disabled(self):
         _, deleted = _run_destroy(_profile(monitoring_enabled=False))
         for stack in ("monitoring", "dashboard", "networking", "analytics", "s3bucket"):
@@ -94,12 +86,12 @@ class TestSkipGuards:
         assert "quota" not in without_it
 
     def test_full_profile_deletes_new_stacks(self):
-        # A profile with everything on must tear down distribution AND codebuild
-        # (the two stacks this PR adds) -- the orphaned-stack regression.
+        # A profile with everything on must tear down distribution
+        # (the orphaned-stack regression).
         _, deleted = _run_destroy(
-            _profile(enable_distribution=True, enable_codebuild=True, quota_monitoring_enabled=True)
+            _profile(enable_distribution=True, quota_monitoring_enabled=True)
         )
-        assert {"distribution", "codebuild"} <= deleted
+        assert {"distribution"} <= deleted
 
 
 class TestSingleStackArg:
@@ -107,11 +99,6 @@ class TestSingleStackArg:
         exit_code, deleted = _run_destroy(_profile(enable_distribution=True), stack_arg="distribution")
         assert exit_code == 0
         assert deleted == {"distribution"}
-
-    def test_codebuild_arg_accepted(self):
-        exit_code, deleted = _run_destroy(_profile(enable_codebuild=True), stack_arg="codebuild")
-        assert exit_code == 0
-        assert deleted == {"codebuild"}
 
     def test_unknown_stack_arg_rejected(self):
         exit_code, deleted = _run_destroy(_profile(), stack_arg="nonexistent")

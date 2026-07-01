@@ -195,7 +195,6 @@ class TestQuotaSkippedWhenSsoDisabled:
         profile.quota_monitoring_enabled = quota_enabled
         profile.sso_enabled = sso_enabled
         profile.enable_distribution = False
-        profile.enable_codebuild = False
         profile.analytics_enabled = False
         profile.stack_names = {}
         return profile
@@ -227,8 +226,6 @@ class TestQuotaSkippedWhenSsoDisabled:
             if getattr(profile, "quota_monitoring_enabled", False):
                 if getattr(profile, "sso_enabled", True):
                     stacks.append("quota")
-        if getattr(profile, "enable_codebuild", False):
-            stacks.append("codebuild")
         return stacks
 
     def test_quota_stack_scheduled_when_sso_enabled(self):

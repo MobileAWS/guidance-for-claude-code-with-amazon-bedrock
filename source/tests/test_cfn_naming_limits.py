@@ -133,7 +133,6 @@ class TestIdentityPoolNameOverflow:
         "s3bucket": "-s3bucket",
         "distribution": "-distribution",
         "quota": "-quota",
-        "codebuild": "-codebuild",
     }
 
     def test_default_name_fits_all_stacks(self):

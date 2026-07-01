@@ -23,7 +23,6 @@ class TestCoreModuleImports:
             "claude_code_with_bedrock.validators",
             "claude_code_with_bedrock.migration",
             "claude_code_with_bedrock.cli",
-            "credential_provider",
         ],
     )
     def test_core_module_import(self, module_path):
@@ -137,7 +136,6 @@ class TestCommandImports:
                     "ConfigImportCommand",
                 ],
             ),
-            ("claude_code_with_bedrock.cli.commands.builds", ["BuildsCommand"]),
             (
                 "claude_code_with_bedrock.cli.commands.quota",
                 [
@@ -190,7 +188,6 @@ class TestCommandImports:
             ("claude_code_with_bedrock.cli.commands.context", "ConfigValidateCommand"),
             ("claude_code_with_bedrock.cli.commands.context", "ConfigExportCommand"),
             ("claude_code_with_bedrock.cli.commands.context", "ConfigImportCommand"),
-            ("claude_code_with_bedrock.cli.commands.builds", "BuildsCommand"),
             ("claude_code_with_bedrock.cli.commands.quota", "QuotaSetUserCommand"),
             ("claude_code_with_bedrock.cli.commands.quota", "QuotaSetGroupCommand"),
             ("claude_code_with_bedrock.cli.commands.quota", "QuotaSetDefaultCommand"),
@@ -316,7 +313,6 @@ class TestCommandDefinitions:
         This catches common definition errors across all commands.
         """
         from claude_code_with_bedrock.cli.commands import (
-            builds,
             cleanup,
             context,
             deploy,
@@ -329,7 +325,7 @@ class TestCommandDefinitions:
             test,
         )
 
-        modules = [builds, cleanup, context, deploy, destroy, distribute, init, package, quota, status, test]
+        modules = [cleanup, context, deploy, destroy, distribute, init, package, quota, status, test]
 
         for module in modules:
             # Get all Command subclasses from the module

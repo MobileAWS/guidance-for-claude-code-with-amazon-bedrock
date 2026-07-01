@@ -3,7 +3,6 @@
 
 """CLI commands for Claude Code with Bedrock."""
 
-from .builds import BuildsCommand
 from .cowork import CoworkGenerateCommand
 from .deploy import DeployCommand
 from .destroy import DestroyCommand
@@ -19,7 +18,6 @@ __all__ = [
     "StatusCommand",
     "TestCommand",
     "PackageCommand",
-    "BuildsCommand",
     "DestroyCommand",
     "CoworkGenerateCommand",
     "QuotaCommand",

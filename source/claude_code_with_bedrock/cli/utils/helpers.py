@@ -47,12 +47,3 @@ def clear_cached_credentials(profile_name: str) -> bool:
         return False
 
 
-def get_codebuild_region(profile) -> str:
-    """Get the region where CodeBuild resources are deployed.
-
-    Currently returns profile.aws_region. Extracted as a helper so
-    future cross-region CodeBuild support has a single point of change.
-
-    Co-authored-by: peepeepopapapeepeepo (from PR #330)
-    """
-    return getattr(profile, "codebuild_region", None) or profile.aws_region

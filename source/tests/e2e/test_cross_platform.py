@@ -27,10 +27,8 @@ import pytest
 # Source directories to scan
 SOURCE_ROOT = Path(__file__).parent.parent.parent
 CLI_DIR = SOURCE_ROOT / "claude_code_with_bedrock"
-CREDENTIAL_DIR = SOURCE_ROOT / "credential_provider"
-OTEL_DIR = SOURCE_ROOT / "otel_helper"
 
-ALL_SOURCE_DIRS = [CLI_DIR, CREDENTIAL_DIR, OTEL_DIR]
+ALL_SOURCE_DIRS = [CLI_DIR]
 
 
 # ---------------------------------------------------------------------------
@@ -374,75 +372,6 @@ class TestPlatformCodePaths:
         assert "hello" in result.stdout
 
 
-# ---------------------------------------------------------------------------
-# Windows-Specific: Keyring Chunking & Cache Atomicity
-# ---------------------------------------------------------------------------
-
-
-class TestWindowsKeyringContract:
-    """Tests for Windows keyring chunking contract (PR #429)."""
-
-    def test_monitoring_chunk_size_constant_exists(self):
-        """Verify the chunk size constant is defined and reasonable."""
-        # The credential provider must define a chunk size for Windows keyring
-        source_file = CREDENTIAL_DIR / "__main__.py"
-        content = source_file.read_text(encoding="utf-8")
-        assert "_MONITORING_CHUNK_SIZE" in content or "MONITORING_CHUNK_SIZE" in content, (
-            "credential_provider must define a monitoring chunk size constant for Windows keyring"
-        )
-
-    def test_chunked_methods_exist(self):
-        """Verify Windows keyring chunk methods are defined."""
-        source_file = CREDENTIAL_DIR / "__main__.py"
-        content = source_file.read_text(encoding="utf-8")
-        assert "_save_monitoring_keyring_windows" in content, "Missing chunked save method"
-        assert "_read_monitoring_keyring_windows" in content, "Missing chunked read method"
-
-    def test_so_reuseaddr_before_bind(self):
-        """Verify SO_REUSEADDR is set on lock sockets (prevents EADDRINUSE on macOS/Linux)."""
-        source_file = CREDENTIAL_DIR / "__main__.py"
-        content = source_file.read_text(encoding="utf-8")
-        # platform: SO_REUSEADDR is guarded in source via sys.platform != 'win32'
-        assert "SO_REUSEADDR" in content, (
-            "credential_provider must set SO_REUSEADDR on OAuth lock sockets "
-            "to prevent EADDRINUSE after TIME_WAIT (PR #429 fix)"
-        )
-
-
-class TestOtelHelperContract:
-    """Tests for otel-helper empty-headers contract (PR #441)."""
-
-    def test_python_helper_emits_empty_json_on_error(self):
-        """The Python otel-helper must emit {} on error path, not exit 1."""
-        source_file = OTEL_DIR / "__main__.py"
-        content = source_file.read_text(encoding="utf-8")
-        # Must have a fallback that prints {} (empty headers) and exits 0
-        assert 'print("{}")' in content or "print('{}')" in content or 'json.dumps({})' in content, (
-            "otel_helper must emit empty JSON object on error path "
-            "to satisfy Claude Code's otelHeadersHelper contract"
-        )
-
-    def test_cache_uses_os_replace(self):
-        """Cache writes must use os.replace (not rename) for Windows atomicity."""
-        source_file = OTEL_DIR / "__main__.py"
-        content = source_file.read_text(encoding="utf-8")
-        # platform: this test validates Windows-safe file operations
-        RENAME_CALL = "os" + ".rename("  # noqa: avoid cross-platform lint match
-        assert "os.replace(" in content, (
-            "otel_helper cache writes must use os.replace() for atomic overwrite on Windows "
-            "(rename raises FileExistsError on Windows)"
-        )
-        # Should NOT have rename-based cache writes (old pattern)
-        # Allow rename in non-cache contexts if any exist
-        lines_with_rename = [
-            l for l in content.split("\n")
-            if RENAME_CALL in l and "cache" in l.lower()
-        ]
-        assert len(lines_with_rename) == 0, (
-            f"Found {RENAME_CALL} in cache context (should be os.replace): {lines_with_rename}"
-        )
-
-
 class TestInstallerScriptSafety:
     """Tests for installer script correctness."""
 
@@ -658,7 +587,6 @@ class TestProfilePreservation:
 # ---------------------------------------------------------------------------
 
 GO_OTEL_HELPER = SOURCE_ROOT / "go" / "cmd" / "otel-helper" / "main.go"
-PY_OTEL_HELPER = SOURCE_ROOT / "otel_helper" / "__main__.py"
 
 
 class TestAuthContractAlignment:
@@ -684,22 +612,6 @@ class TestAuthContractAlignment:
         helper_code = GO_OTEL_HELPER.read_text(encoding="utf-8")
         assert '"authorization"' in helper_code, (
             "otel-collector.yaml has jwt-validation action but Go otel-helper "
-            "does not output an 'authorization' header. "
-            "Server/client auth contract mismatch — ALB will reject all OTLP requests. "
-            "See issue #126, PR #129."
-        )
-
-    def test_alb_jwt_auth_has_python_helper_bearer_output(self):
-        """If otel-collector.yaml has jwt-validation, Python otel-helper must output authorization header."""
-        template = DEPLOYMENT_DIR / "otel-collector.yaml"
-        content = template.read_text(encoding="utf-8")
-
-        if "jwt-validation" not in content:
-            pytest.skip("No JWT validation configured in otel-collector.yaml")
-
-        helper_code = PY_OTEL_HELPER.read_text(encoding="utf-8")
-        assert '"authorization"' in helper_code or "'authorization'" in helper_code, (
-            "otel-collector.yaml has jwt-validation action but Python otel-helper "
             "does not output an 'authorization' header. "
             "Server/client auth contract mismatch — ALB will reject all OTLP requests. "
             "See issue #126, PR #129."

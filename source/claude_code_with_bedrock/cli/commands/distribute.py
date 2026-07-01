@@ -132,7 +132,7 @@ class DistributeCommand(Command):
                     # Not a package directory, skip
                     continue
 
-                # Detect platforms (may be empty for CodeBuild-only packages)
+                # Detect platforms present in this package directory
                 platforms = self._detect_platforms(timestamp_dir)
 
                 # Calculate size
@@ -522,45 +522,16 @@ class DistributeCommand(Command):
             console.print("Deploy the distribution stack first: poetry run ccwb deploy distribution")
             return 1
 
-        # Check for Windows binaries and auto-download if needed
+        # Check for Windows binaries (produced by the Go cross-compile in `ccwb package`)
         console.print("\n[bold]Checking for Windows binaries...[/bold]")
         windows_exe = package_path / "credential-process-windows.exe"
-        if not windows_exe.exists():
-            # Check if Windows build is completed and download it
-            try:
-                project_name = f"{profile.identity_pool_name}-windows-build"
-                codebuild = boto3.client("codebuild", region_name=profile.aws_region)
-
-                # List recent builds
-                response = codebuild.list_builds_for_project(projectName=project_name, sortOrder="DESCENDING")
-
-                if response.get("ids"):
-                    # Get details of recent builds
-                    build_ids = response["ids"][:5]  # Check last 5 builds
-                    builds_response = codebuild.batch_get_builds(ids=build_ids)
-
-                    for build in builds_response.get("builds", []):
-                        if build["buildStatus"] == "SUCCEEDED":
-                            # Found a successful build, download it
-                            build_time = build.get("endTime", build.get("startTime"))
-                            console.print(
-                                f"  [cyan]Found completed Windows build from "
-                                f"{build_time.strftime('%Y-%m-%d %H:%M')}[/cyan]"
-                            )
-                            console.print("  [cyan]Downloading Windows artifacts...[/cyan]")
-
-                            if self._download_windows_artifacts(profile, package_path, console):
-                                console.print("  [green]✓ Downloaded Windows artifacts[/green]")
-                            else:
-                                console.print("  [yellow]⚠️  Failed to download Windows artifacts[/yellow]")
-                            break
-                        elif build["buildStatus"] == "IN_PROGRESS":
-                            console.print("  [yellow]⚠️  Windows build in progress[/yellow]")
-                            break
-            except Exception as e:
-                console.print(f"  [dim]Could not check Windows build status: {e}[/dim]")
-        else:
+        if windows_exe.exists():
             console.print("  [green]✓ Windows binaries found[/green]")
+        else:
+            console.print(
+                "  [yellow]⚠️  No Windows binary in package. "
+                "Re-run 'ccwb package' to cross-compile all platforms (Go).[/yellow]"
+            )
 
         # Map available binaries to platforms
         console.print("\n[bold]Scanning package directory...[/bold]")
@@ -776,124 +747,14 @@ class DistributeCommand(Command):
             console.print(f"  ✓ macOS Intel executable (built: {mod_time.strftime('%Y-%m-%d %H:%M')})")
             found_platforms.append("macos-intel")
 
-        # Check for Windows executables
+        # Check for Windows executable (produced by the Go cross-compile in `ccwb package`)
         windows_exe = package_path / "credential-process-windows.exe"
-        windows_exe_time = None
         if windows_exe.exists():
-            from datetime import timezone
-
-            windows_exe_time = datetime.fromtimestamp(windows_exe.stat().st_mtime, tz=timezone.utc)
-            console.print(f"  ✓ Windows executable (built: {windows_exe_time.strftime('%Y-%m-%d %H:%M')})")
+            mod_time = datetime.fromtimestamp(windows_exe.stat().st_mtime)
+            console.print(f"  ✓ Windows executable (built: {mod_time.strftime('%Y-%m-%d %H:%M')})")
             found_platforms.append("windows")
-
-            # Check if there are newer Windows builds available and download them
-            try:
-                # Get CodeBuild project name from profile
-                project_name = f"{profile.identity_pool_name}-windows-build"
-                codebuild = boto3.client("codebuild", region_name=profile.aws_region)
-
-                # List recent builds
-                response = codebuild.list_builds_for_project(projectName=project_name, sortOrder="DESCENDING")
-
-                if response.get("ids"):
-                    # Get details of recent successful builds
-                    build_ids = response["ids"][:3]  # Check last 3 builds
-                    builds_response = codebuild.batch_get_builds(ids=build_ids)
-
-                    for build in builds_response.get("builds", []):
-                        if build["buildStatus"] == "SUCCEEDED":
-                            build_time = build.get("endTime", build.get("startTime"))
-                            if build_time and build_time > windows_exe_time:
-                                console.print(
-                                    f"    [yellow]⚠️  Newer Windows build available "
-                                    f"(completed {build_time.strftime('%Y-%m-%d %H:%M')})[/yellow]"
-                                )
-
-                                # Automatically download the newer build
-                                console.print("    [cyan]Downloading newer Windows artifacts...[/cyan]")
-                                if self._download_windows_artifacts(profile, package_path, console):
-                                    console.print("    [green]✓ Downloaded newer Windows artifacts[/green]")
-                                    # Update the timestamp
-                                    windows_exe_time = datetime.fromtimestamp(
-                                        windows_exe.stat().st_mtime, tz=timezone.utc
-                                    )
-                                else:
-                                    console.print(
-                                        "    [yellow]Failed to download newer artifacts, using existing[/yellow]"
-                                    )
-                            break
-            except Exception:
-                pass  # Silently ignore if we can't check
         else:
-            # Check if Windows build is completed and download it
-            windows_downloaded = False
-
-            # First check for any completed builds
-            try:
-                project_name = f"{profile.identity_pool_name}-windows-build"
-                codebuild = boto3.client("codebuild", region_name=profile.aws_region)
-
-                # List recent builds
-                response = codebuild.list_builds_for_project(projectName=project_name, sortOrder="DESCENDING")
-
-                if response.get("ids"):
-                    # Get details of recent builds
-                    build_ids = response["ids"][:5]  # Check last 5 builds
-                    builds_response = codebuild.batch_get_builds(ids=build_ids)
-
-                    for build in builds_response.get("builds", []):
-                        if build["buildStatus"] == "SUCCEEDED":
-                            # Found a successful build, download it
-                            build_time = build.get("endTime", build.get("startTime"))
-                            console.print(
-                                f"  ⚠️  Windows executable [yellow](found completed build from "
-                                f"{build_time.strftime('%Y-%m-%d %H:%M')})[/yellow]"
-                            )
-                            console.print("    [cyan]Downloading Windows artifacts...[/cyan]")
-
-                            if self._download_windows_artifacts(profile, package_path, console):
-                                console.print("    [green]✓ Downloaded Windows artifacts[/green]")
-                                found_platforms.append("windows")
-                                windows_downloaded = True
-                            else:
-                                console.print("    [yellow]Failed to download Windows artifacts[/yellow]")
-                            break
-                        elif build["buildStatus"] == "IN_PROGRESS":
-                            console.print("  ⚠️  Windows executable [yellow](build in progress)[/yellow]")
-                            break
-            except Exception:
-                pass  # Continue to check for build info file
-
-            # If we didn't download, check build info file
-            if not windows_downloaded:
-                build_info_file = Path.home() / ".claude-code" / "latest-build.json"
-                if build_info_file.exists():
-                    with open(build_info_file, encoding="utf-8") as f:
-                        build_info = json.load(f)
-
-                    # Check build status
-                    try:
-                        codebuild = boto3.client("codebuild", region_name=profile.aws_region)
-                        response = codebuild.batch_get_builds(ids=[build_info["build_id"]])
-                        if response.get("builds"):
-                            build = response["builds"][0]
-                            if build["buildStatus"] == "IN_PROGRESS":
-                                console.print("  ⚠️  Windows executable [yellow](build in progress)[/yellow]")
-                            elif build["buildStatus"] == "SUCCEEDED":
-                                console.print("  ⚠️  Windows executable [yellow](build completed)[/yellow]")
-                                console.print("    [cyan]Downloading Windows artifacts...[/cyan]")
-
-                                if self._download_windows_artifacts(profile, package_path, console):
-                                    console.print("    [green]✓ Downloaded Windows artifacts[/green]")
-                                    found_platforms.append("windows")
-                                else:
-                                    console.print("    [yellow]Failed to download Windows artifacts[/yellow]")
-                            else:
-                                console.print("  ✗ Windows executable [red](build failed)[/red]")
-                    except Exception:
-                        console.print("  ✗ Windows executable [red](not found)[/red]")
-                elif not windows_downloaded:
-                    console.print("  ✗ Windows executable [red](not built)[/red]")
+            console.print("  ✗ Windows executable [red](not built — re-run 'ccwb package')[/red]")
 
         # Check for Linux executables
         linux_x64 = package_path / "credential-process-linux-x64"
@@ -1603,79 +1464,3 @@ class DistributeCommand(Command):
                 return f"{size_bytes:.1f} {unit}"
             size_bytes /= 1024.0
         return f"{size_bytes:.1f} TB"
-
-    def _download_windows_artifacts(self, profile, package_path: Path, console: Console) -> bool:
-        """Download Windows build artifacts from S3."""
-        import zipfile
-
-        from botocore.exceptions import ClientError
-
-        from claude_code_with_bedrock.cli.utils.aws import get_stack_outputs
-
-        try:
-            # Windows artifacts are always in the CodeBuild bucket
-            if not profile.enable_codebuild:
-                console.print("[red]CodeBuild is not enabled for this profile[/red]")
-                return False
-
-            codebuild_stack_name = profile.stack_names.get("codebuild", f"{profile.identity_pool_name}-codebuild")
-            codebuild_outputs = get_stack_outputs(codebuild_stack_name, profile.aws_region)
-
-            if not codebuild_outputs:
-                console.print("[red]CodeBuild stack not found[/red]")
-                return False
-
-            bucket_name = codebuild_outputs.get("BuildBucket")
-            project_name = codebuild_outputs.get("ProjectName")
-
-            if not bucket_name or not project_name:
-                console.print("[red]Could not get CodeBuild bucket or project name from stack outputs[/red]")
-                return False
-
-            # Download from S3
-            s3 = boto3.client("s3", region_name=profile.aws_region)
-            zip_path = package_path / "windows-binaries.zip"
-
-            # CodeBuild stores artifacts at root of bucket
-            artifact_key = "windows-binaries.zip"
-
-            try:
-                s3.download_file(bucket_name, artifact_key, str(zip_path))
-
-                # Extract binaries one-by-one using read/write to avoid
-                # Windows Defender file locking issues with extractall()
-                with zipfile.ZipFile(zip_path, "r") as zip_ref:
-                    for member in zip_ref.namelist():
-                        # Skip directories
-                        if member.endswith("/"):
-                            continue
-                        # Extract just the filename (flatten any directory structure)
-                        filename = Path(member).name
-                        if not filename:
-                            continue
-                        target_path = package_path / filename
-                        data = zip_ref.read(member)
-                        # Write with retry for Windows Defender scan locks
-                        for attempt in range(3):
-                            try:
-                                target_path.write_bytes(data)
-                                break
-                            except PermissionError:
-                                if attempt < 2:
-                                    import time
-                                    time.sleep(1)
-                                else:
-                                    raise
-
-                # Clean up
-                zip_path.unlink()
-                return True
-
-            except ClientError as e:
-                console.print(f"[red]Failed to download artifacts: {e}[/red]")
-                console.print(f"[dim]Tried: s3://{bucket_name}/{artifact_key}[/dim]")
-                return False
-
-        except Exception as e:
-            console.print(f"[red]Error downloading Windows artifacts: {e}[/red]")
-            return False

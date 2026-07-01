@@ -84,6 +84,7 @@
   <a href="#credpurge">9 · .aws/credentials purge</a>
   <a href="#signing">10 · macOS code-signing</a>
   <a href="#launchers">11 · .command / run.sh</a>
+  <a href="#goonly">13 · Python→Go decommission</a>
   <h2>Hygiene &amp; reconciled</h2>
   <a href="#artifacts">12 · Committed binaries</a>
   <a href="#reconciled">Already reconciled</a>
@@ -94,7 +95,7 @@
   <div>
     <span class="badge">fork vs upstream e2d4057</span>
     <span class="badge">excludes: Nexus management API</span>
-    <span class="badge">12 changes audited</span>
+    <span class="badge">13 changes audited</span>
   </div>
   <h1>Fork Changes Audit</h1>
   <p class="lede">Every change in this repo that differs from upstream <code>aws-solutions-library-samples</code>,
@@ -297,12 +298,24 @@
 <!-- ===================== 8. CODEBUILD WINDOWS ===================== -->
 <section id="codebuild">
   <div class="card">
-    <h3>8 · CodeBuild-Windows build path <span class="pill v-obsol verdict-tag">OBSOLETE after Go</span></h3>
+    <h3>8 · CodeBuild-Windows build path <span class="pill v-fixed verdict-tag">✓ DONE — removed (Phase 2b step 2)</span></h3>
     <div class="row"><div class="k">What</div><div class="v">Windows binaries are built asynchronously in AWS CodeBuild (<code>has_codebuild_windows</code>, <code>nexus</code>/CodeBuild plumbing, console URL helpers in <code>package.py</code>).</div></div>
     <div class="row"><div class="k">Justification</div><div class="v">PyInstaller can't cross-compile; building Windows binaries required a Windows runner.</div></div>
     <div class="row"><div class="k">Verified</div><div class="v">The Go binaries <strong>cross-compile to Windows from any host</strong> — verified in Phase 2 (<code>GOOS=windows</code> builds both <code>credential-process</code> and <code>otel-helper</code> cleanly). Once the build is Go-only, the entire CodeBuild-for-Windows apparatus has nothing to do.</div></div>
     <div class="row"><div class="k">Verdict</div><div class="v">Obsolete the moment Phase 2b flips the build to Go. It's pure carrying cost (a whole async build path, status polling, console-URL formatting) for a problem Go doesn't have.</div></div>
-    <div class="row"><div class="k">Recommend</div><div class="v">Remove with the PyInstaller path in Phase 2b. This is one of the largest simplifications available.</div></div>
+    <div class="row"><div class="k">Done</div><div class="v"><strong>Removed in Phase 2b step 2 (2026-06-23):</strong> deleted <code>codebuild-windows.yaml</code>, the <code>builds</code> + <code>package-cb</code> commands, <code>has_codebuild_windows</code> and all CodeBuild plumbing in <code>package.py</code>, and the <code>enable_codebuild</code> field + wiring across 11 files. Windows now cross-compiles via Go like every other target. See #13.</div></div>
+  </div>
+</section>
+
+<!-- ===================== 13. PYTHON→GO DECOMMISSION ===================== -->
+<section id="goonly">
+  <div class="card">
+    <h3>13 · Python runtime decommission → Go-only build <span class="pill v-fixed verdict-tag">✓ DONE (Phase 2b step 2)</span></h3>
+    <div class="row"><div class="k">What</div><div class="v">Deleted the Python <code>credential_provider/</code> + <code>otel_helper/__main__.py</code> runtime and the entire PyInstaller / Nuitka / Docker / CodeBuild build pipeline. <code>package.py</code> dropped 3397→1804 lines; removed the <code>builds</code>/<code>package-cb</code> commands and the <code>--pyinstaller</code>/<code>--status</code> flags. The Go binaries are now the sole runtime and build path (cross-compiling all 5 platforms). Kept <code>otel_helper/collector-config.yaml</code> + <code>otel-helper.sh</code> (the Go sidecar reads them).</div></div>
+    <div class="row"><div class="k">Justification</div><div class="v">"Can't ship Python" — a hard product constraint. Completes #8 and removes the build half of #7's Python dependency.</div></div>
+    <div class="row"><div class="k">Verified</div><div class="v">Done <strong>without</strong> the AWS-deploy gate the plan called for (the Go binaries already had unit + 5-platform cross-compile coverage). pytest <strong>723 pass / 0 fail</strong> (was 896 — the drop is deleted Python-impl tests, now covered by the green Go suite); <code>go build/vet/test</code> green; <code>ruff</code> zero new errors. Not yet validated by a live deploy.</div></div>
+    <div class="row"><div class="k">Docs strategy</div><div class="v"><strong>Upstream-tracked prose docs were deliberately NOT edited</strong> (README, QUICK_START, ARCHITECTURE, CLI_REFERENCE, DEPLOYMENT, WINDOWS_BUILD_SYSTEM, distribution guide) — editing AWS-maintained docs creates merge conflicts on every <code>upstream</code> sync for little benefit. The Go-only build reality is recorded here + in <code>UPGRADE_LOG.html</code> (both fork-only). Only the 4 fork-specific <code>.claude/rules</code> were updated (credential-helper-parity → Go-only session-name contract; review-tiers; region-availability; binary-distribution), since reverting those would re-introduce references to the now-deleted Python.</div></div>
+    <div class="row"><div class="k">Status</div><div class="v">Uncommitted in the working tree, pending review + a real sandbox deploy.</div></div>
   </div>
 </section>
 

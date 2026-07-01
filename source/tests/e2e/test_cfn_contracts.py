@@ -117,7 +117,6 @@ class TestIAMPolicyValidity:
         "glue",
         "athena",
         "kms",
-        "codebuild",
         "ec2",
         "ecs",
         "ecr",

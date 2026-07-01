@@ -3,9 +3,9 @@
 
 """Tests that `ccwb destroy` covers all deployable stacks.
 
-Regression coverage for the gap where `distribution`, `codebuild`, and
+Regression coverage for the gap where `distribution` and
 `cowork-dashboard` stacks were deployed but never destroyed, leaving
-orphaned S3/IAM, CodeBuild projects, and dashboards behind.
+orphaned S3/IAM and dashboards behind.
 """
 
 import re
@@ -43,7 +43,7 @@ class TestDestroyStackCoverage:
         assert not phantom, f"destroy lists non-deployable stacks: {sorted(phantom)}"
 
     def test_previously_missing_stacks_present(self):
-        for stack in ("distribution", "codebuild", "cowork-dashboard"):
+        for stack in ("distribution", "cowork-dashboard"):
             assert stack in DESTROYABLE_STACKS, f"{stack} must be destroyable"
 
     def test_no_duplicate_stacks(self):

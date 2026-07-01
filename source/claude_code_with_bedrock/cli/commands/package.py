@@ -5,7 +5,6 @@
 
 import json
 import os
-import platform
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -15,7 +14,6 @@ from cleo.commands.command import Command
 from cleo.helpers import option
 from rich.console import Console
 from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from claude_code_with_bedrock.cli.utils.aws import get_stack_outputs
 from claude_code_with_bedrock.cli.utils.display import display_configuration_info
@@ -23,120 +21,6 @@ from claude_code_with_bedrock.config import Config
 from claude_code_with_bedrock.models import (
     get_source_region_for_profile,
 )
-
-# Runtime packages bundled into the credential provider binary.
-_CREDENTIAL_PROVIDER_RUNTIME_DEPS = ["boto3", "requests", "PyJWT", "keyring", "cryptography"]
-_OTEL_HELPER_RUNTIME_DEPS: list[str] = []  # otel_helper uses only stdlib
-_PYINSTALLER_PIN = "pyinstaller==6.*"
-
-
-def _find_universal2_python() -> Path | None:
-    """Return the first universal2 Python ≥3.10 found in the standard python.org install location, or None."""
-    import glob
-
-    candidates = sorted(
-        glob.glob("/Library/Frameworks/Python.framework/Versions/*/bin/python3*"),
-        reverse=True,  # prefer higher versions
-    )
-    for candidate in candidates:
-        p = Path(candidate)
-        if not p.is_file() or not p.stat().st_size:
-            continue
-        result = subprocess.run(["/usr/bin/lipo", "-info", str(p)], capture_output=True, text=True)  # nosec B603 B607
-        if result.returncode != 0:
-            continue
-        out = result.stdout.strip()
-        # universal2 shows "are: x86_64 arm64" or "are: arm64 x86_64"
-        if "are:" in out and "x86_64" in out and "arm64" in out:
-            # Verify version ≥3.10
-            ver = subprocess.run([str(p), "--version"], capture_output=True, text=True)  # nosec B603 B607
-            if ver.returncode == 0:
-                try:
-                    parts = ver.stdout.strip().split()[1].split(".")
-                    if int(parts[0]) >= 3 and int(parts[1]) >= 10:
-                        return p
-                except (IndexError, ValueError):
-                    continue
-    return None
-
-
-def _ensure_cross_arch_venv(arch: str, universal2_python: Path, runtime_packages: list[str], console: Console) -> Path:
-    """Create (or reuse) ~/.ccwb/build-venvs/<arch>/ seeded from a universal2 Python.
-
-    The venv is created under `arch -<arch>` so pip pulls arch-matched wheels for every
-    native extension (cffi, cryptography, etc.). Reused on subsequent runs unless stale.
-    """
-    venv_dir = Path.home() / ".ccwb" / "build-venvs" / arch
-    pyinstaller_bin = venv_dir / "bin" / "pyinstaller"
-    python_bin = venv_dir / "bin" / "python3"
-
-    if pyinstaller_bin.exists() and python_bin.exists():
-        # Validate the venv's Python is actually the right arch
-        result = subprocess.run(["/usr/bin/lipo", "-info", str(python_bin)], capture_output=True, text=True)  # nosec B603 B607
-        if result.returncode == 0 and arch in result.stdout:
-            return venv_dir
-        # Wrong arch — rebuild
-        import shutil
-
-        console.print(f"[yellow]Rebuilding {arch} build venv (wrong architecture detected)[/yellow]")
-        shutil.rmtree(venv_dir, ignore_errors=True)
-
-    venv_dir.parent.mkdir(parents=True, exist_ok=True)
-    console.print(f"[cyan]Preparing {arch} build venv at {venv_dir} (first run, ~30s)...[/cyan]")
-
-    create = subprocess.run(  # nosec B603 B607
-        ["/usr/bin/arch", f"-{arch}", str(universal2_python), "-m", "venv", str(venv_dir)],
-        capture_output=True,
-        text=True,
-    )
-    if create.returncode != 0:
-        raise RuntimeError(f"Failed to create {arch} build venv: {create.stderr}")
-
-    pip = venv_dir / "bin" / "pip"
-    install = subprocess.run(  # nosec B603 B607
-        ["/usr/bin/arch", f"-{arch}", str(pip), "install", "--quiet", _PYINSTALLER_PIN, *runtime_packages],
-        capture_output=True,
-        text=True,
-    )
-    if install.returncode != 0:
-        raise RuntimeError(f"Failed to install deps into {arch} build venv: {install.stderr or install.stdout}")
-
-    console.print(f"[green]✓ {arch} build venv ready[/green]")
-    return venv_dir
-
-
-def _assert_host_os_can_build_macos() -> None:
-    """Refuse to produce macOS binaries from a non-macOS host.
-
-    PyInstaller is not a cross-OS compiler: run on Linux, it emits Linux ELF
-    binaries regardless of --target-arch. Without this guard, a Linux-host
-    build would write ELF content into a macOS-named output file, and the
-    resulting package would fail on end-user Macs with "exec format error"
-    (the macOS kernel cannot load ELF binaries and Rosetta only translates
-    Mach-O, not ELF).
-
-    macOS binaries must be built on macOS — this is a property of Apple's
-    platform, not a limitation of this tool.
-    """
-    host = platform.system().lower()
-    if host == "darwin":
-        return
-    raise RuntimeError(
-        f"Cannot build macOS binaries on {platform.system()}.\n"
-        f"\n"
-        f"PyInstaller cannot cross-compile across operating systems. On "
-        f"{platform.system()}, it produces {platform.system()}-native binaries "
-        f"regardless of --target-arch.\n"
-        f"\n"
-        f"Options for producing macOS binaries:\n"
-        f"  1. Run `ccwb package` on a macOS workstation\n"
-        f"  2. Use a CI macOS runner (GitHub Actions `macos-latest`, AWS\n"
-        f"     CodeBuild macOS project, or a self-hosted Mac runner) and\n"
-        f"     collect the artifacts from there\n"
-        f"  3. Drop macOS targets from this build — run with\n"
-        f"     --target-platform=linux-x64,linux-arm64,windows\n"
-        f"     to build only the platforms your current host supports"
-    )
 
 
 class PackageCommand(Command):
@@ -158,15 +42,6 @@ class PackageCommand(Command):
             "profile", description="Configuration profile to use (defaults to active profile)", flag=False, default=None
         ),
         option(
-            "status",
-            description="[DEPRECATED] Use 'ccwb builds' instead. Check build status by ID or 'latest'",
-            flag=False,
-            default=None,
-        ),
-        option("build-local", description="Build binaries locally instead of downloading pre-built", flag=True),
-        option("no-cache", description="Force re-download of pre-built binaries", flag=True),
-        option("build-verbose", description="Enable verbose logging for build processes", flag=True),
-        option(
             "regenerate-installers",
             description="Regenerate installer scripts using existing binaries from latest dist",
             flag=True,
@@ -176,31 +51,13 @@ class PackageCommand(Command):
             description="[DEFAULT] Build binaries using Go cross-compilation (native binaries, no AV false positives)",
             flag=True,
         ),
-        option(
-            "pyinstaller",
-            description="Legacy: build binaries via PyInstaller instead of Go (fallback / rollback hatch)",
-            flag=True,
-        ),
     ]
 
     def handle(self) -> int:
         """Execute the package command."""
-        import platform
-        import subprocess
-
         console = Console()
 
-        # Check if this is a status check (deprecated - moved to builds command)
-        if self.option("status") is not None:
-            console.print("[yellow]⚠️  DEPRECATED: Status check has moved to the builds command[/yellow]")
-            console.print("\nUse one of these commands instead:")
-            console.print("  • [cyan]poetry run ccwb builds[/cyan]                    (list all recent builds)")
-            console.print("  • [cyan]poetry run ccwb builds --status <build-id>[/cyan] (check specific build)")
-            console.print("  • [cyan]poetry run ccwb builds --status latest[/cyan]    (check latest build)")
-            console.print("\nRedirecting to builds command...\n")
-            return self._check_build_status(self.option("status"), console)
-
-        # Load configuration first (needed to check CodeBuild status)
+        # Load configuration first
         config = Config.load()
         # Use specified profile or default to active profile, or fall back to "ClaudeCode"
         profile_name = self.option("profile") or config.active_profile or "ClaudeCode"
@@ -214,30 +71,25 @@ class PackageCommand(Command):
         if self.option("regenerate-installers"):
             return self._regenerate_installers(profile, profile_name, console)
 
-        # Go is the default build mode (cross-compiles all platforms, including Windows,
-        # so no CodeBuild round-trip is needed). --pyinstaller selects the legacy
-        # PyInstaller path as a fallback / rollback hatch; the explicit --go flag is
-        # still accepted (a no-op now that Go is the default).
-        use_go = self.option("go") or not self.option("pyinstaller")
+        # The explicit --go flag is still accepted (a no-op now that Go is the
+        # only build path). Go cross-compiles all platforms, including Windows,
+        # from a single machine.
 
         # Interactive prompts if not provided via CLI
         target_platform = self.option("target-platform")
         if target_platform == "all":  # Default value, prompt user
-            # Build list of available platform choices
-            # Note: "macos" is omitted because it's just a smart alias for the current architecture
-            # Users should explicitly choose macos-arm64 or macos-intel for clarity
+            # Build list of available platform choices.
+            # Note: the bare "macos"/"linux" aliases (still accepted via --target-platform) are
+            # omitted here because they resolve to a fixed default arch, not the host's. The prompt
+            # offers the explicit arch variants so the user picks deliberately.
+            # With Go cross-compilation, every platform (including Windows) is always available.
             platform_choices = [
                 "macos-arm64",
                 "macos-intel",
                 "linux-x64",
                 "linux-arm64",
+                "windows",
             ]
-
-            # With Go, Windows is always available
-            if use_go:
-                platform_choices.append("windows")
-            elif hasattr(profile, "enable_codebuild") and profile.enable_codebuild:
-                platform_choices.append("windows")
 
             # Use checkbox for multiple selection (require at least one)
             selected_platforms = questionary.checkbox(
@@ -342,11 +194,11 @@ class PackageCommand(Command):
         )
 
         # Create timestamped output directory under profile name.
-        # Resolve to absolute immediately: subsequent Go / CodeBuild builds run
-        # subprocesses with cwd=<elsewhere>, and a relative path here would be
-        # interpreted relative to THAT cwd (binaries would land in source/go/
-        # dist/... while the config files stay in source/dist/...). Absolute
-        # path keeps binaries and config co-located.
+        # Resolve to absolute immediately: the Go build runs subprocesses with
+        # cwd=<go source dir>, and a relative path here would be interpreted
+        # relative to THAT cwd (binaries would land in source/go/dist/... while
+        # the config files stay in source/dist/...). Absolute path keeps binaries
+        # and config co-located.
         timestamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
         output_dir = (Path.cwd() / "dist" / profile_name / timestamp).resolve()
 
@@ -377,174 +229,42 @@ class PackageCommand(Command):
         # Build package
         console.print("\n[bold]Building package...[/bold]")
 
-        # Cross-arch macOS builds auto-create per-arch venvs from a universal2 Python.
-        # Detect once here so both the platforms_to_build assembly and _build_macos_pyinstaller share the same result.
-        _universal2_python = _find_universal2_python() if platform.system().lower() == "darwin" else None
-
-        # Build executable(s)
-        # With Go, all platforms available from any machine
-        if (use_go) and not isinstance(target_platform, list) and target_platform == "all":
-            platforms_to_build = ["macos-arm64", "macos-intel", "linux-x64", "linux-arm64", "windows"]
-        elif (use_go) and isinstance(target_platform, list) and "all" in target_platform:
-            platforms_to_build = ["macos-arm64", "macos-intel", "linux-x64", "linux-arm64", "windows"]
+        # Build executable(s) via Go cross-compilation. Every platform builds from
+        # any machine, so "all" always expands to the full target matrix.
+        all_platforms = ["macos-arm64", "macos-intel", "linux-x64", "linux-arm64", "windows"]
+        if target_platform == "all" or (isinstance(target_platform, list) and "all" in target_platform):
+            # Go cross-compiles every platform, so "all" always expands to the full matrix.
+            platforms_to_build = all_platforms.copy()
         elif isinstance(target_platform, list):
             # User selected multiple platforms via checkbox
             platforms_to_build = []
             for platform_choice in target_platform:
-                if platform_choice == "all":
-                    # If "all" is in the list, expand it based on current OS
-                    current_os = platform.system().lower()
-                    current_machine = platform.machine().lower()
-
-                    if current_os == "darwin":
-                        host_arch = current_machine  # arm64 or x86_64
-                        platforms_to_build.append(f"macos-{'arm64' if host_arch == 'arm64' else 'intel'}")
-                        cross_arch = "x86_64" if host_arch == "arm64" else "arm64"
-                        cross_platform = "macos-intel" if host_arch == "arm64" else "macos-arm64"
-                        if _universal2_python:
-                            platforms_to_build.append(cross_platform)
-                        else:
-                            console.print(
-                                f"[dim]Note: {cross_platform} skipped — install Python universal2 from python.org to enable.[/dim]"
-                            )
-
-                        try:
-                            docker_check = subprocess.run(["docker", "--version"], capture_output=True)
-                            docker_available = docker_check.returncode == 0
-                        except FileNotFoundError:
-                            docker_available = False
-                        if docker_available:
-                            platforms_to_build.append("linux-x64")
-                            platforms_to_build.append("linux-arm64")
-                    elif current_os == "linux":
-                        platforms_to_build.append("linux")
-                    elif current_os == "windows":
-                        platforms_to_build.append("windows")
-
-                    if current_os != "windows" and profile and profile.enable_codebuild:
-                        platforms_to_build.append("windows")
-                else:
-                    # Add individual platform choice
-                    if platform_choice not in platforms_to_build:
-                        platforms_to_build.append(platform_choice)
-        elif target_platform == "all":
-            # For "all", try to build what's possible on current platform
-            platforms_to_build = []
-            current_os = platform.system().lower()
-            current_machine = platform.machine().lower()
-
-            if current_os == "darwin":
-                host_arch = current_machine  # arm64 or x86_64
-                platforms_to_build.append(f"macos-{'arm64' if host_arch == 'arm64' else 'intel'}")
-                cross_platform = "macos-intel" if host_arch == "arm64" else "macos-arm64"
-                if _universal2_python:
-                    platforms_to_build.append(cross_platform)
-                else:
-                    console.print(
-                        f"[dim]Note: {cross_platform} skipped — install Python universal2 from python.org to enable.[/dim]"
-                    )
-
-                # Check if Docker is available for Linux builds
-                try:
-                    docker_check = subprocess.run(["docker", "--version"], capture_output=True)
-                    docker_available = docker_check.returncode == 0
-                except FileNotFoundError:
-                    docker_available = False
-                if docker_available:
-                    platforms_to_build.append("linux-x64")
-                    platforms_to_build.append("linux-arm64")
-
-            elif current_os == "linux":
-                platforms_to_build.append("linux")
-            elif current_os == "windows":
-                platforms_to_build.append("windows")
-
-            # Always try Windows via CodeBuild if not on Windows
-            if current_os != "windows" and profile and profile.enable_codebuild:
-                platforms_to_build.append("windows")
+                if platform_choice not in platforms_to_build:
+                    platforms_to_build.append(platform_choice)
         else:
             # Single platform specified
             platforms_to_build = [target_platform]
-
-        # Snapshot the requested platform set before building, so an async Windows
-        # CodeBuild job (which produces no local binary) can still be detected later.
-        requested_platforms = platforms_to_build.copy()
 
         built_executables = []
         built_otel_helpers = []
 
         console.print()
 
-        if use_go:
-            # Go cross-compilation: build all selected platforms at once
-            console.print("[cyan]Building Go binaries (cross-compilation)...[/cyan]")
-            try:
-                go_results = self._build_go_binaries(output_dir, platforms_to_build, profile.monitoring_enabled)
-                built_executables = go_results["executables"]
-                built_otel_helpers = go_results["otel_helpers"]
-            except Exception as e:
-                console.print(f"[red]Go build failed: {e}[/red]")
-                return 1
-        else:
-            for platform_name in platforms_to_build:
-                # Initialize so the `executable_path is None` checks below are safe even if
-                # _build_executable() raises before assigning (UnboundLocalError, PR #320 bug 1).
-                executable_path = None
-                # Build credential process
-                console.print(f"[cyan]Building credential process for {platform_name}...[/cyan]")
-                try:
-                    executable_path = self._build_executable(output_dir, platform_name)
-                    # Check if this was an async Windows build
-                    if executable_path is None:
-                        # Windows build started in CodeBuild, continue without local binary
-                        console.print("[dim]Windows binaries will be built in CodeBuild[/dim]")
-                    else:
-                        built_executables.append((platform_name, executable_path))
-                except Exception as e:
-                    console.print(
-                        f"[yellow]Warning: Could not build credential process for {platform_name}: {e}[/yellow]"
-                    )
+        # Go cross-compilation: build all selected platforms at once
+        console.print("[cyan]Building Go binaries (cross-compilation)...[/cyan]")
+        try:
+            go_results = self._build_go_binaries(output_dir, platforms_to_build, profile.monitoring_enabled)
+            built_executables = go_results["executables"]
+            built_otel_helpers = go_results["otel_helpers"]
+        except Exception as e:
+            console.print(f"[red]Go build failed: {e}[/red]")
+            return 1
 
-                # Build OTEL helper if monitoring is enabled
-                if profile.monitoring_enabled:
-                    # Skip OTEL helper for Windows if being built in CodeBuild
-                    if platform_name == "windows" and executable_path is None:
-                        console.print("[dim]Windows OTEL helper will be built in CodeBuild[/dim]")
-                    else:
-                        console.print(f"[cyan]Building OTEL helper for {platform_name}...[/cyan]")
-                        try:
-                            otel_helper_path = self._build_otel_helper(output_dir, platform_name)
-                            # Only add to list if build was successful (not None)
-                            if otel_helper_path is not None:
-                                built_otel_helpers.append((platform_name, otel_helper_path))
-                        except Exception as e:
-                            console.print(
-                                f"[yellow]Warning: Could not build OTEL helper for {platform_name}: {e}[/yellow]"
-                            )
-
-        # Check if Windows is building asynchronously via CodeBuild (no local binary yet).
-        # Only treat a missing Windows binary as "deferred to CodeBuild" when CodeBuild is
-        # actually enabled — otherwise a genuine local build failure must surface as an error.
-        has_codebuild_windows = (
-            "windows" in requested_platforms
-            and getattr(profile, "enable_codebuild", False)
-            and not any(p == "windows" for p, _ in built_executables)
-        )
-
-        # Check if any binaries were built OR if Windows is building in CodeBuild
-        if not built_executables and not has_codebuild_windows:
+        # Check if any binaries were built
+        if not built_executables:
             console.print("\n[red]Error: No binaries were successfully built.[/red]")
             console.print("Please check the error messages above.")
             return 1
-
-        # Inform user about CodeBuild status
-        if has_codebuild_windows and not built_executables:
-            console.print("\n[bold cyan]Windows binaries are building in AWS CodeBuild[/bold cyan]")
-            console.print("Local configuration files will be generated now for distribution.")
-            console.print("\nTo check build status:")
-            console.print("  [cyan]poetry run ccwb builds --status latest[/cyan]")
-            console.print("\nOnce complete, retrieve binaries with:")
-            console.print("  [cyan]poetry run ccwb distribute[/cyan]\n")
 
         # Create configuration
         console.print("\n[cyan]Creating configuration...[/cyan]")
@@ -554,11 +274,10 @@ class PackageCommand(Command):
 
         # Create installer
         console.print("[cyan]Creating installer script...[/cyan]")
-        self._create_installer(
-            output_dir, profile, built_executables, built_otel_helpers, has_windows_codebuild=has_codebuild_windows
-        )
+        self._create_installer(output_dir, profile, built_executables, built_otel_helpers)
 
-        # Copy shell wrapper for OTEL helper (Layer 2 caching - avoids PyInstaller startup)
+        # Copy shell wrapper for OTEL helper (Layer 2 caching - the shell wrapper
+        # warms the per-profile cache before the Go otel-helper binary runs)
         if built_otel_helpers:
             import shutil as _shutil
 
@@ -632,87 +351,11 @@ class PackageCommand(Command):
 
         return 0
 
-    def _check_build_status(self, build_id: str, console: Console) -> int:
-        """Check the status of a CodeBuild build."""
-        import json
-        from pathlib import Path
-
-        import boto3
-
-        try:
-            # If no build ID provided, check for latest
-            if not build_id or build_id == "latest":
-                build_info_file = Path.home() / ".claude-code" / "latest-build.json"
-                if not build_info_file.exists():
-                    console.print("[red]No recent builds found. Start a build with 'poetry run ccwb package'[/red]")
-                    return 1
-
-                with open(build_info_file, encoding="utf-8") as f:
-                    build_info = json.load(f)
-                    build_id = build_info["build_id"]
-                    console.print(f"[dim]Checking latest build: {build_id}[/dim]")
-
-            # Get build status from CodeBuild
-            # Load profile to get the correct region
-            config = Config.load()
-            profile_name = self.option("profile")
-            profile = config.get_profile(profile_name)
-            if not profile:
-                console.print("[red]No configuration found. Run 'poetry run ccwb init' first.[/red]")
-                return 1
-
-            codebuild = boto3.client("codebuild", region_name=profile.aws_region)
-            response = codebuild.batch_get_builds(ids=[build_id])
-
-            if not response.get("builds"):
-                console.print(f"[red]Build not found: {build_id}[/red]")
-                return 1
-
-            build = response["builds"][0]
-            status = build["buildStatus"]
-
-            # Display status
-            if status == "IN_PROGRESS":
-                console.print("[yellow]⏳ Build in progress[/yellow]")
-                console.print(f"Phase: {build.get('currentPhase', 'Unknown')}")
-                if "startTime" in build:
-                    from datetime import datetime
-
-                    start_time = build["startTime"]
-                    elapsed = datetime.now(start_time.tzinfo) - start_time
-                    console.print(f"Elapsed: {int(elapsed.total_seconds() / 60)} minutes")
-            elif status == "SUCCEEDED":
-                console.print("[green]✓ Build succeeded![/green]")
-                console.print(f"Duration: {build.get('buildDurationInMinutes', 'Unknown')} minutes")
-                console.print("\n[bold]Windows build artifacts are ready![/bold]")
-                console.print("Next steps:")
-                console.print("  Run: [cyan]poetry run ccwb distribute[/cyan]")
-                console.print("  This will download Windows artifacts from S3 and create your distribution package")
-            else:
-                console.print(f"[red]✗ Build {status.lower()}[/red]")
-                if "phases" in build:
-                    for phase in build["phases"]:
-                        if phase.get("phaseStatus") == "FAILED":
-                            console.print(f"[red]Failed in phase: {phase.get('phaseType')}[/red]")
-
-            # Show console link
-            project_name = build_id.split(":")[0]
-            build_uuid = build_id.split(":")[1]
-            console.print(
-                f"\n[dim]View logs: https://console.aws.amazon.com/codesuite/codebuild/projects/{project_name}/build/{build_uuid}[/dim]"
-            )
-
-            return 0
-
-        except Exception as e:
-            console.print(f"[red]Error checking build status: {e}[/red]")
-            return 1
-
     def _build_go_binaries(self, output_dir: Path, platforms: list, monitoring_enabled: bool) -> dict:
         """Build binaries using Go cross-compilation.
 
         Produces native statically-linked binaries for all platforms from a single machine.
-        No Docker, CodeBuild, or per-platform toolchains needed.
+        No per-platform toolchains needed — Go cross-compiles every target.
 
         Returns dict with 'executables' and 'otel_helpers' lists of (platform, Path) tuples.
         """
@@ -789,1256 +432,6 @@ class PackageCommand(Command):
 
         self.line(f"  <info>Built {len(executables) + len(otel_helpers)} binaries</info>")
         return {"executables": executables, "otel_helpers": otel_helpers}
-
-    def _build_executable(self, output_dir: Path, target_platform: str) -> Path:
-        """Build executable for target platform using appropriate tool."""
-        import platform
-
-        current_system = platform.system().lower()
-        current_machine = platform.machine().lower()
-
-        # Windows builds use Nuitka via CodeBuild
-        if target_platform == "windows":
-            if current_system == "windows":
-                # Try native Windows build with Nuitka first
-                try:
-                    return self._build_native_executable_nuitka(output_dir, "windows")
-                except RuntimeError as e:
-                    # Check if this is a Nuitka availability issue (not a compilation failure)
-                    error_msg = str(e)
-                    nuitka_unavailable = (
-                        "Nuitka not found" in error_msg
-                        or "MinGW" in error_msg
-                        or "FATAL: Only this specific gcc" in error_msg
-                    )
-                    if nuitka_unavailable:
-                        # Nuitka is not properly configured, fall back to CodeBuild
-                        console = Console()
-                        console.print(f"[yellow]Local build unavailable: {error_msg.split(chr(10))[0]}[/yellow]")
-                        console.print("[cyan]Falling back to AWS CodeBuild...[/cyan]")
-                        self._build_windows_via_codebuild(output_dir)
-                        return None  # CodeBuild async build started
-                    else:
-                        # Re-raise other RuntimeErrors (actual build failures)
-                        raise
-            else:
-                # Use CodeBuild for Windows builds on non-Windows platforms
-                # Don't return - just start the build and continue
-                self._build_windows_via_codebuild(output_dir)
-                return None  # No local binary created
-
-        # macOS builds use PyInstaller for cross-architecture support
-        if target_platform == "macos-arm64":
-            return self._build_macos_pyinstaller(output_dir, "arm64")
-        elif target_platform == "macos-intel":
-            return self._build_macos_pyinstaller(output_dir, "x86_64")
-        elif target_platform == "macos-universal":
-            return self._build_macos_pyinstaller(output_dir, "universal2")
-        elif target_platform == "linux-x64":
-            # Build Linux x64 binary via Docker with PyInstaller
-            return self._build_linux_via_docker(output_dir, "x64")
-        elif target_platform == "linux-arm64":
-            # Build Linux ARM64 binary via Docker with PyInstaller
-            return self._build_linux_via_docker(output_dir, "arm64")
-        elif target_platform == "linux":
-            # Native Linux build with PyInstaller
-            return self._build_linux_pyinstaller(output_dir)
-        elif target_platform == "macos":
-            # Default macOS build for current architecture
-            if current_machine == "arm64":
-                return self._build_macos_pyinstaller(output_dir, "arm64")
-            else:
-                return self._build_macos_pyinstaller(output_dir, "x86_64")
-
-        # Fallback - shouldn't reach here
-        raise ValueError(f"Unsupported target platform: {target_platform}")
-
-    def _build_native_executable_nuitka(self, output_dir: Path, target_platform: str) -> Path:
-        """Build executable using native Nuitka compiler (for Windows only)."""
-        import platform
-
-        current_system = platform.system().lower()
-        current_machine = platform.machine().lower()
-
-        # Platform compatibility matrix for Nuitka (no cross-compilation)
-        PLATFORM_COMPATIBILITY = {
-            "macos": {
-                "arm64": ["darwin-arm64"],
-                "intel": ["darwin-x86_64"],
-            },
-            "linux": {
-                "x86_64": ["linux-x86_64"],
-            },
-            "windows": {
-                "x86_64": ["windows-amd64"],
-            },
-        }
-
-        # Determine the specific platform variant
-        if target_platform == "macos":
-            # On macOS, determine if we're building for ARM64 or Intel
-            # Check if user requested a specific variant via environment variable
-            macos_variant = os.environ.get("CCWB_MACOS_VARIANT", "").lower()
-
-            if macos_variant == "intel":
-                # Force Intel build (useful on ARM Macs with Rosetta)
-                platform_variant = "intel"
-                binary_name = "credential-process-macos-intel"
-            elif macos_variant == "arm64":
-                # Force ARM64 build
-                platform_variant = "arm64"
-                binary_name = "credential-process-macos-arm64"
-            elif current_machine == "arm64":
-                # Default to ARM64 on ARM Macs
-                platform_variant = "arm64"
-                binary_name = "credential-process-macos-arm64"
-            else:
-                # Default to Intel on Intel Macs
-                platform_variant = "intel"
-                binary_name = "credential-process-macos-intel"
-        elif target_platform == "linux":
-            platform_variant = "x86_64"
-            binary_name = "credential-process-linux"
-        elif target_platform == "windows":
-            platform_variant = "x86_64"
-            binary_name = "credential-process-windows.exe"
-        else:
-            raise ValueError(f"Unsupported target platform: {target_platform}")
-
-        # Check platform compatibility
-        current_platform_str = f"{current_system}-{current_machine}"
-        compatible_platforms = PLATFORM_COMPATIBILITY.get(target_platform, {}).get(platform_variant, [])
-
-        # Special case: Allow Intel builds on ARM Macs via Rosetta
-        if (
-            target_platform == "macos"
-            and platform_variant == "intel"
-            and current_system == "darwin"
-            and current_machine == "arm64"
-        ):
-            # Check if Rosetta is available
-            result = subprocess.run(["arch", "-x86_64", "true"], capture_output=True)
-            if result.returncode == 0:
-                console = Console()
-                console.print("[yellow]Building Intel binary on ARM Mac using Rosetta 2[/yellow]")
-                # Rosetta is available, allow the build
-                pass
-            else:
-                raise RuntimeError(
-                    "Cannot build Intel binary on ARM Mac without Rosetta 2.\n"
-                    "Install Rosetta: softwareupdate --install-rosetta"
-                )
-        elif current_platform_str not in compatible_platforms:
-            raise RuntimeError(
-                f"Cannot build {target_platform} ({platform_variant}) binary on {current_platform_str}.\n"
-                f"Nuitka requires native builds. Please build on a {target_platform} machine."
-            )
-
-        # Check if Nuitka is available (through Poetry)
-        source_dir = Path(__file__).parent.parent.parent.parent
-        nuitka_check = subprocess.run(
-            ["poetry", "run", "python", "-m", "nuitka", "--version"], capture_output=True, text=True, cwd=source_dir
-        )
-        if nuitka_check.returncode != 0:
-            raise RuntimeError(
-                "Nuitka not found. Please install it:\n"
-                "  poetry add --group dev nuitka ordered-set zstandard\n\n"
-                "Note: Nuitka requires Python 3.10-3.12."
-            )
-
-        # Find the source file
-        src_file = Path(__file__).parent.parent.parent.parent.parent / "source" / "credential_provider" / "__main__.py"
-
-        if not src_file.exists():
-            raise FileNotFoundError(f"Source file not found: {src_file}")
-
-        # Build Nuitka command (use poetry run to ensure correct Python version)
-        # If building Intel binary on ARM Mac, use Rosetta
-        if (
-            target_platform == "macos"
-            and platform_variant == "intel"
-            and current_system == "darwin"
-            and current_machine == "arm64"
-        ):
-            cmd = [
-                "arch",
-                "-x86_64",  # Run under Rosetta
-                "poetry",
-                "run",
-                "nuitka",
-            ]
-        else:
-            cmd = [
-                "poetry",
-                "run",
-                "nuitka",
-            ]
-
-        # Add common Nuitka flags
-        nuitka_flags = [
-            "--standalone",
-            "--onefile",
-            "--assume-yes-for-downloads",
-            f"--output-filename={binary_name}",
-            f"--output-dir={str(output_dir)}",
-        ]
-
-        # Only add --quiet if not in verbose mode
-        verbose = self.option("build-verbose")
-        if not verbose:
-            nuitka_flags.append("--quiet")
-
-        nuitka_flags.extend(
-            [
-                "--remove-output",  # Clean up build artifacts
-                "--python-flag=no_site",  # Don't include site packages
-            ]
-        )
-
-        cmd.extend(nuitka_flags)
-
-        # Add platform-specific flags
-        if target_platform == "macos":
-            cmd.extend(
-                [
-                    "--macos-create-app-bundle",
-                    "--macos-app-name=Claude Code Credential Process",
-                    "--disable-console",  # GUI app on macOS
-                ]
-            )
-        elif target_platform == "linux":
-            cmd.extend(
-                [
-                    "--linux-onefile-icon=NONE",  # No icon for Linux
-                ]
-            )
-
-        # Add the source file
-        cmd.append(str(src_file))
-
-        # Run Nuitka (from source directory where pyproject.toml is located)
-        source_dir = Path(__file__).parent.parent.parent.parent
-        result = subprocess.run(cmd, capture_output=not verbose, text=True, cwd=source_dir)
-        if result.returncode != 0:
-            raise RuntimeError(f"Nuitka build failed: {result.stderr}")
-
-        return output_dir / binary_name
-
-    def _build_macos_pyinstaller(self, output_dir: Path, arch: str) -> Path:
-        """Build macOS executable using PyInstaller with target architecture."""
-        _assert_host_os_can_build_macos()
-        console = Console()
-        verbose = self.option("build-verbose")
-
-        # Determine binary name based on architecture
-        if arch == "arm64":
-            binary_name = "credential-process-macos-arm64"
-        elif arch == "x86_64":
-            binary_name = "credential-process-macos-intel"
-        elif arch == "universal2":
-            binary_name = "credential-process-macos-universal"
-        else:
-            raise ValueError(f"Unsupported macOS architecture: {arch}")
-
-        # Find the source file
-        src_file = Path(__file__).parent.parent.parent.parent.parent / "source" / "credential_provider" / "__main__.py"
-        if not src_file.exists():
-            raise FileNotFoundError(f"Source file not found: {src_file}")
-
-        console.print(f"[yellow]Building macOS {arch} binary with PyInstaller...[/yellow]")
-
-        host_arch = platform.machine().lower()
-        cross_arch = arch != host_arch and arch != "universal2"
-
-        # Determine log level based on verbose flag
-        log_level = "INFO" if verbose else "WARN"
-
-        if cross_arch:
-            # Cross-arch build: need a per-arch venv seeded from a universal2 Python
-            universal2_python = _find_universal2_python()
-            if universal2_python is None:
-                raise RuntimeError(
-                    f"Cross-arch macOS build requires a universal2 Python but none was found.\n\n"
-                    f"Install Python universal2 from python.org:\n"
-                    f"  https://www.python.org/downloads/macos/\n\n"
-                    f"Download the 'macOS 64-bit universal2 installer' for Python 3.12, then re-run.\n\n"
-                    f"To build only the host arch ({host_arch}), omit the cross-arch target."
-                )
-            venv_dir = _ensure_cross_arch_venv(arch, universal2_python, _CREDENTIAL_PROVIDER_RUNTIME_DEPS, console)
-            work_root = Path.home() / ".ccwb" / "build-work"
-            work_root.mkdir(parents=True, exist_ok=True)
-            cmd = [
-                "/usr/bin/arch",
-                f"-{arch}",
-                str(venv_dir / "bin" / "pyinstaller"),
-                "--onefile",
-                "--clean",
-                "--noconfirm",
-                f"--name={binary_name}",
-                f"--distpath={str(output_dir)}",
-                f"--workpath={str(work_root / arch)}",
-                f"--specpath={str(work_root / arch)}",
-                f"--log-level={log_level}",
-                "--hidden-import=keyring.backends.macOS",
-                "--hidden-import=keyring.backends.SecretService",
-                "--hidden-import=keyring.backends.Windows",
-                "--hidden-import=keyring.backends.chainer",
-                "--hidden-import=charset_normalizer",
-                str(src_file),
-            ]
-        else:
-            # Native build: use Poetry environment directly
-            cmd = [
-                "poetry",
-                "run",
-                "pyinstaller",
-                "--onefile",
-                "--clean",
-                "--noconfirm",
-                f"--target-arch={arch}",
-                f"--name={binary_name}",
-                f"--distpath={str(output_dir)}",
-                "--workpath=/tmp/pyinstaller",
-                "--specpath=/tmp/pyinstaller",
-                f"--log-level={log_level}",
-                "--hidden-import=keyring.backends.macOS",
-                "--hidden-import=keyring.backends.SecretService",
-                "--hidden-import=keyring.backends.Windows",
-                "--hidden-import=keyring.backends.chainer",
-                "--hidden-import=certifi",
-                "--collect-data=certifi",
-                "--hidden-import=charset_normalizer",
-                str(src_file),
-            ]
-
-        # Run PyInstaller from source directory
-        source_dir = Path(__file__).parent.parent.parent.parent
-        result = subprocess.run(cmd, capture_output=not verbose, text=True, cwd=source_dir)
-
-        if result.returncode != 0:
-            console.print(f"[red]PyInstaller build failed: {result.stderr}[/red]")
-            raise RuntimeError(f"PyInstaller build failed: {result.stderr}")
-
-        binary_path = output_dir / binary_name
-        if binary_path.exists():
-            binary_path.chmod(0o755)
-            # Code-sign the binary (Developer ID if available, ad-hoc otherwise)
-            sign_id = None
-            try:
-                id_check = subprocess.run(
-                    ["security", "find-identity", "-v", "-p", "codesigning"], capture_output=True, text=True
-                )
-                for line in id_check.stdout.splitlines():
-                    if "Developer ID Application" in line:
-                        sign_id = line.split('"')[1]
-                        break
-            except Exception:
-                pass
-            sign_flag = sign_id if sign_id else "-"
-            subprocess.run(["codesign", "--force", "--sign", sign_flag, str(binary_path)], capture_output=True)
-            console.print(f"[green]✓ macOS {arch} binary built and signed with PyInstaller[/green]")
-            return binary_path
-        else:
-            raise RuntimeError(f"Binary not created: {binary_path}")
-
-    def _build_linux_pyinstaller(self, output_dir: Path) -> Path:
-        """Build Linux executable using PyInstaller."""
-        console = Console()
-        verbose = self.option("build-verbose")
-
-        # Detect architecture and set appropriate binary name
-        import platform
-
-        machine = platform.machine().lower()
-        if machine in ["aarch64", "arm64"]:
-            binary_name = "credential-process-linux-arm64"
-        else:
-            binary_name = "credential-process-linux-x64"
-
-        # Find the source file
-        src_file = Path(__file__).parent.parent.parent.parent.parent / "source" / "credential_provider" / "__main__.py"
-        if not src_file.exists():
-            raise FileNotFoundError(f"Source file not found: {src_file}")
-
-        console.print("[yellow]Building Linux binary with PyInstaller...[/yellow]")
-
-        # Determine log level based on verbose flag
-        log_level = "INFO" if verbose else "WARN"
-
-        # Build PyInstaller command
-        cmd = [
-            "poetry",
-            "run",
-            "pyinstaller",
-            "--onefile",
-            "--clean",
-            "--noconfirm",
-            f"--name={binary_name}",
-            f"--distpath={str(output_dir)}",
-            "--workpath=/tmp/pyinstaller",
-            "--specpath=/tmp/pyinstaller",
-            f"--log-level={log_level}",
-            # Hidden imports for our dependencies
-            "--hidden-import=keyring.backends.SecretService",
-            "--hidden-import=keyring.backends.chainer",
-            "--hidden-import=charset_normalizer",
-            "--hidden-import=six",
-            "--hidden-import=six.moves",
-            "--hidden-import=six.moves._thread",
-            "--hidden-import=six.moves.urllib",
-            "--hidden-import=six.moves.urllib.parse",
-            "--hidden-import=dateutil",
-            str(src_file),
-        ]
-
-        # Run PyInstaller from source directory
-        source_dir = Path(__file__).parent.parent.parent.parent
-        result = subprocess.run(cmd, capture_output=not verbose, text=True, cwd=source_dir)
-
-        if result.returncode != 0:
-            console.print(f"[red]PyInstaller build failed: {result.stderr}[/red]")
-            raise RuntimeError(f"PyInstaller build failed: {result.stderr}")
-
-        binary_path = output_dir / binary_name
-        if binary_path.exists():
-            binary_path.chmod(0o755)
-            console.print("[green]✓ Linux binary built successfully with PyInstaller[/green]")
-            return binary_path
-        else:
-            raise RuntimeError(f"Binary not created: {binary_path}")
-
-    def _build_linux_via_docker(self, output_dir: Path, arch: str = "x64") -> Path:
-        """Build Linux binaries using Docker with PyInstaller."""
-        import shutil
-        import tempfile
-
-        console = Console()
-        verbose = self.option("build-verbose")
-
-        # Determine platform and binary name
-        if arch == "arm64":
-            docker_platform = "linux/arm64"
-            binary_name = "credential-process-linux-arm64"
-        else:
-            docker_platform = "linux/amd64"
-            binary_name = "credential-process-linux-x64"
-
-        # Check if Docker is available and running
-        try:
-            docker_check = subprocess.run(["docker", "--version"], capture_output=True)
-            docker_installed = docker_check.returncode == 0
-        except FileNotFoundError:
-            docker_installed = False
-        if not docker_installed:
-            console.print(f"\n[yellow]⚠️  Docker not found - skipping Linux {arch} build[/yellow]")
-            console.print("[dim]Linux binaries require Docker Desktop to be installed and running.[/dim]")
-            console.print("[dim]Install Docker: https://docs.docker.com/get-docker/[/dim]")
-            console.print(f"[dim]Skipping credential-process-linux-{arch}[/dim]\n")
-            # Return a dummy path that won't be included in the package
-            return None
-
-        # Check if Docker daemon is running
-        daemon_check = subprocess.run(["docker", "info"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if daemon_check.returncode != 0:
-            console.print(f"\n[yellow]⚠️  Docker daemon not running - skipping Linux {arch} build[/yellow]")
-            console.print("[dim]Please start Docker Desktop and try again.[/dim]")
-            console.print(f"[dim]Skipping credential-process-linux-{arch}[/dim]\n")
-            # Return a dummy path that won't be included in the package
-            return None
-
-        # Create a temporary directory for the Docker build
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-
-            # Copy source files to temp directory
-            source_dir = Path(__file__).parent.parent.parent.parent
-            shutil.copytree(source_dir / "credential_provider", temp_path / "credential_provider")
-
-            # Create Dockerfile with PyInstaller
-            dockerfile_content = f"""FROM --platform={docker_platform} ubuntu:22.04
-
-# Set non-interactive to avoid tzdata prompts
-ENV DEBIAN_FRONTEND=noninteractive
-ENV TZ=UTC
-
-# Install Python 3.12 and build dependencies
-RUN apt-get update && apt-get install -y \
-    software-properties-common \
-    build-essential \
-    binutils \
-    curl \
-    && add-apt-repository -y ppa:deadsnakes/ppa \
-    && apt-get update \
-    && apt-get install -y python3.12 python3.12-dev python3.12-venv \
-    && python3.12 -m ensurepip \
-    && python3.12 -m pip install --upgrade pip \
-    && rm -rf /var/lib/apt/lists/*
-
-# Set Python 3.12 as default python3
-RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1
-
-# Install Python packages
-RUN python3 -m pip install --no-cache-dir \
-    pyinstaller==6.3.0 \
-    boto3 \
-    requests \
-    PyJWT \
-    cryptography \
-    keyring \
-    keyrings.alt \
-    questionary \
-    rich \
-    cleo \
-    pydantic \
-    pyyaml \
-    six==1.16.0 \
-    python-dateutil
-
-# Set working directory
-WORKDIR /build
-
-# Copy source code
-COPY credential_provider /build/credential_provider
-
-# Build the binary with PyInstaller
-RUN pyinstaller \
-    --onefile \
-    --clean \
-    --noconfirm \
-    --name {binary_name} \
-    --distpath /output \
-    --workpath /tmp/build \
-    --specpath /tmp \
-    --log-level WARN \
-    --hidden-import keyring.backends.SecretService \
-    --hidden-import keyring.backends.chainer \
-    --hidden-import charset_normalizer \
-    --hidden-import six \
-    --hidden-import six.moves \
-    --hidden-import six.moves._thread \
-    --hidden-import six.moves.urllib \
-    --hidden-import six.moves.urllib.parse \
-    --hidden-import dateutil \
-    credential_provider/__main__.py
-
-# The binary will be in /output/{binary_name}
-"""
-
-            (temp_path / "Dockerfile").write_text(dockerfile_content)
-
-            # Generate unique image tag to avoid reusing cached images
-            import time
-
-            image_tag = f"ccwb-linux-{arch}-builder-{int(time.time())}"
-
-            # Remove any existing image with similar name to ensure fresh build
-            if verbose:
-                console.print("[dim]Cleaning up old Docker images...[/dim]")
-            subprocess.run(
-                ["docker", "rmi", "-f", f"ccwb-linux-{arch}-builder"],
-                capture_output=True,
-            )
-
-            # Build Docker image
-            console.print(f"[yellow]Building Linux {arch} binary via Docker (this may take a few minutes)...[/yellow]")
-            if verbose:
-                console.print("[dim]Docker build output:[/dim]")
-            build_result = subprocess.run(
-                [
-                    "docker",
-                    "buildx",
-                    "build",
-                    "--no-cache",
-                    "--platform",
-                    docker_platform,
-                    "-t",
-                    image_tag,
-                    "--load",
-                    ".",
-                ],
-                cwd=temp_path,
-                capture_output=not verbose,
-                text=True,
-            )
-
-            if build_result.returncode != 0:
-                raise RuntimeError(f"Docker build failed: {build_result.stderr}")
-
-            # Run container and copy binary out
-            import time
-
-            container_name = f"ccwb-extract-{arch}-{int(time.time())}"
-
-            # Create container from the newly built image
-            run_result = subprocess.run(
-                ["docker", "create", "--name", container_name, image_tag],
-                capture_output=True,
-                text=True,
-            )
-
-            if run_result.returncode != 0:
-                raise RuntimeError(f"Failed to create container: {run_result.stderr}")
-
-            try:
-                # Copy binary from container
-                copy_result = subprocess.run(
-                    ["docker", "cp", f"{container_name}:/output/{binary_name}", str(output_dir)],
-                    capture_output=True,
-                    text=True,
-                )
-
-                if copy_result.returncode != 0:
-                    raise RuntimeError(f"Failed to copy binary from container: {copy_result.stderr}")
-
-                # Verify the binary was created
-                binary_path = output_dir / binary_name
-                if not binary_path.exists():
-                    raise RuntimeError(f"Linux {arch} binary was not created successfully")
-
-                # Make it executable
-                binary_path.chmod(0o755)
-
-                console.print(f"[green]✓ Linux {arch} binary built successfully via Docker[/green]")
-                return binary_path
-
-            finally:
-                # Clean up container and image
-                subprocess.run(["docker", "rm", container_name], capture_output=True)
-                subprocess.run(["docker", "rmi", image_tag], capture_output=True)
-
-    def _build_linux_otel_helper_via_docker(self, output_dir: Path, arch: str = "x64") -> Path:
-        """Build Linux OTEL helper binary using Docker with PyInstaller."""
-        import shutil
-        import tempfile
-
-        console = Console()
-        verbose = self.option("build-verbose")
-
-        # Determine platform and binary name
-        if arch == "arm64":
-            docker_platform = "linux/arm64"
-            binary_name = "otel-helper-linux-arm64"
-        else:
-            docker_platform = "linux/amd64"
-            binary_name = "otel-helper-linux-x64"
-
-        # Check if Docker is available and running
-        try:
-            docker_check = subprocess.run(["docker", "--version"], capture_output=True)
-            docker_installed = docker_check.returncode == 0
-        except FileNotFoundError:
-            docker_installed = False
-        if not docker_installed:
-            console.print(f"\n[yellow]⚠️  Docker not found - skipping Linux {arch} OTEL helper build[/yellow]")
-            console.print("[dim]Linux binaries require Docker Desktop to be installed and running.[/dim]")
-            console.print(f"[dim]Skipping otel-helper-linux-{arch}[/dim]\n")
-            # Return a dummy path that won't be included in the package
-            return None
-
-        # Check if Docker daemon is running
-        daemon_check = subprocess.run(["docker", "info"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if daemon_check.returncode != 0:
-            console.print(f"\n[yellow]⚠️  Docker daemon not running - skipping Linux {arch} OTEL helper build[/yellow]")
-            console.print("[dim]Please start Docker Desktop and try again.[/dim]")
-            console.print(f"[dim]Skipping otel-helper-linux-{arch}[/dim]\n")
-            # Return a dummy path that won't be included in the package
-            return None
-
-        # Create a temporary directory for the Docker build
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-
-            # Copy source files to temp directory
-            source_dir = Path(__file__).parent.parent.parent.parent
-            shutil.copytree(source_dir / "otel_helper", temp_path / "otel_helper")
-
-            # Create Dockerfile for OTEL helper with PyInstaller
-            dockerfile_content = f"""FROM --platform={docker_platform} ubuntu:22.04
-
-# Set non-interactive to avoid tzdata prompts
-ENV DEBIAN_FRONTEND=noninteractive
-ENV TZ=UTC
-
-# Install Python 3.12 and build dependencies
-RUN apt-get update && apt-get install -y \
-    software-properties-common \
-    build-essential \
-    binutils \
-    curl \
-    && add-apt-repository -y ppa:deadsnakes/ppa \
-    && apt-get update \
-    && apt-get install -y python3.12 python3.12-dev python3.12-venv \
-    && python3.12 -m ensurepip \
-    && python3.12 -m pip install --upgrade pip \
-    && rm -rf /var/lib/apt/lists/*
-
-# Set Python 3.12 as default python3
-RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1
-
-# Install Python packages
-RUN python3 -m pip install --no-cache-dir \
-    pyinstaller==6.3.0 \
-    PyJWT \
-    cryptography \
-    six
-
-# Set working directory
-WORKDIR /build
-
-# Copy source code
-COPY otel_helper /build/otel_helper
-
-# Build the binary with PyInstaller
-RUN pyinstaller \
-    --onefile \
-    --clean \
-    --noconfirm \
-    --name {binary_name} \
-    --distpath /output \
-    --workpath /tmp/build \
-    --specpath /tmp \
-    --log-level WARN \
-    --hidden-import six \
-    --hidden-import six.moves \
-    otel_helper/__main__.py
-
-# The binary will be in /output/{binary_name}
-"""
-
-            (temp_path / "Dockerfile").write_text(dockerfile_content)
-
-            # Generate unique image tag to avoid reusing cached images
-            import time
-
-            image_tag = f"ccwb-otel-{arch}-builder-{int(time.time())}"
-
-            # Remove any existing image with similar name to ensure fresh build
-            if verbose:
-                console.print("[dim]Cleaning up old Docker images...[/dim]")
-            subprocess.run(
-                ["docker", "rmi", "-f", f"ccwb-otel-{arch}-builder"],
-                capture_output=True,
-            )
-
-            # Build Docker image
-            console.print(f"[yellow]Building Linux {arch} OTEL helper via Docker...[/yellow]")
-            if verbose:
-                console.print("[dim]Docker build output:[/dim]")
-            build_result = subprocess.run(
-                [
-                    "docker",
-                    "buildx",
-                    "build",
-                    "--no-cache",
-                    "--platform",
-                    docker_platform,
-                    "-t",
-                    image_tag,
-                    "--load",
-                    ".",
-                ],
-                cwd=temp_path,
-                capture_output=not verbose,
-                text=True,
-            )
-
-            if build_result.returncode != 0:
-                raise RuntimeError(f"Docker build failed for OTEL helper: {build_result.stderr}")
-
-            # Run container and copy binary out
-            import time
-
-            container_name = f"ccwb-otel-extract-{arch}-{int(time.time())}"
-
-            # Create container from the newly built image
-            run_result = subprocess.run(
-                ["docker", "create", "--name", container_name, image_tag],
-                capture_output=True,
-                text=True,
-            )
-
-            if run_result.returncode != 0:
-                raise RuntimeError(f"Failed to create container: {run_result.stderr}")
-
-            try:
-                # Copy binary from container
-                copy_result = subprocess.run(
-                    ["docker", "cp", f"{container_name}:/output/{binary_name}", str(output_dir)],
-                    capture_output=True,
-                    text=True,
-                )
-
-                if copy_result.returncode != 0:
-                    raise RuntimeError(f"Failed to copy OTEL binary from container: {copy_result.stderr}")
-
-                # Verify the binary was created
-                binary_path = output_dir / binary_name
-                if not binary_path.exists():
-                    raise RuntimeError(f"Linux {arch} OTEL helper binary was not created successfully")
-
-                # Make it executable
-                binary_path.chmod(0o755)
-
-                console.print(f"[green]✓ Linux {arch} OTEL helper built successfully via Docker[/green]")
-                return binary_path
-
-            finally:
-                # Clean up container and image
-                subprocess.run(["docker", "rm", container_name], capture_output=True)
-                subprocess.run(["docker", "rmi", image_tag], capture_output=True)
-
-    def _build_windows_via_codebuild(self, output_dir: Path) -> Path:
-        """Build Windows binaries using AWS CodeBuild."""
-        import json
-
-        import boto3
-        from botocore.exceptions import ClientError
-
-        console = Console()
-
-        # Check for in-progress builds only (not completed ones)
-        try:
-            config = Config.load()
-            profile_name = self.option("profile")
-            profile = config.get_profile(profile_name)
-
-            if profile:
-                project_name = f"{profile.identity_pool_name}-windows-build"
-                codebuild = boto3.client("codebuild", region_name=profile.aws_region)
-
-                # List recent builds
-                response = codebuild.list_builds_for_project(projectName=project_name, sortOrder="DESCENDING")
-
-                if response.get("ids"):
-                    # Check only the most recent builds
-                    build_ids = response["ids"][:3]
-                    builds_response = codebuild.batch_get_builds(ids=build_ids)
-
-                    for build in builds_response.get("builds", []):
-                        if build["buildStatus"] == "IN_PROGRESS":
-                            console.print(
-                                f"[yellow]Windows build already in progress (started "
-                                f"{build['startTime'].strftime('%Y-%m-%d %H:%M')})[/yellow]"
-                            )
-                            console.print("Check status: [cyan]poetry run ccwb builds[/cyan]")
-                            console.print("[dim]Note: Package will be created without Windows binaries[/dim]")
-                            # Don't return early - continue to create package with available binaries
-        except Exception as e:
-            console.print(f"[dim]Could not check for recent builds: {e}[/dim]")
-
-        # Load profile to get CodeBuild configuration
-        config = Config.load()
-        profile_name = self.option("profile")
-        profile = config.get_profile(profile_name)
-
-        if not profile or not profile.enable_codebuild:
-            console.print("[red]CodeBuild is not enabled for this profile.[/red]")
-            console.print("To enable CodeBuild for Windows builds:")
-            console.print("  1. Run: poetry run ccwb init")
-            console.print("  2. Answer 'Yes' when asked about Windows build support")
-            console.print("  3. Run: poetry run ccwb deploy codebuild")
-            raise RuntimeError("CodeBuild not enabled")
-
-        # Get CodeBuild stack outputs
-        stack_name = profile.stack_names.get("codebuild", f"{profile.identity_pool_name}-codebuild")
-        try:
-            stack_outputs = get_stack_outputs(stack_name, profile.aws_region)
-        except Exception:
-            console.print(f"[red]CodeBuild stack not found: {stack_name}[/red]")
-            console.print("Run: poetry run ccwb deploy codebuild")
-            raise RuntimeError("CodeBuild stack not deployed") from None
-
-        bucket_name = stack_outputs.get("BuildBucket")
-        project_name = stack_outputs.get("ProjectName")
-
-        if not bucket_name or not project_name:
-            console.print("[red]CodeBuild stack outputs not found[/red]")
-            raise RuntimeError("Invalid CodeBuild stack")
-
-        with Progress(
-            SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console
-        ) as progress:
-            # Package source code
-            task = progress.add_task("Packaging source code for CodeBuild...", total=None)
-            source_zip = self._package_source_for_codebuild()
-
-            # Upload to S3
-            progress.update(task, description="Uploading source to S3...")
-            s3 = boto3.client("s3", region_name=profile.aws_region)
-            try:
-                s3.upload_file(str(source_zip), bucket_name, "source.zip")
-            except ClientError as e:
-                console.print(f"[red]Failed to upload source: {e}[/red]")
-                raise
-
-            # Start build
-            progress.update(task, description="Starting CodeBuild project...")
-            codebuild = boto3.client("codebuild", region_name=profile.aws_region)
-            try:
-                response = codebuild.start_build(projectName=project_name)
-                build_id = response["build"]["id"]
-            except ClientError as e:
-                console.print(f"[red]Failed to start build: {e}[/red]")
-                raise
-
-            # Monitor build
-            progress.update(task, description="Building Windows binaries (20+ minutes)...")
-            console.print(f"[dim]Build ID: {build_id}[/dim]")
-
-            # Store build ID for later retrieval
-            from pathlib import Path
-
-            build_info_file = Path.home() / ".claude-code" / "latest-build.json"
-            build_info_file.parent.mkdir(exist_ok=True)
-            with open(build_info_file, "w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "build_id": build_id,
-                        "started_at": datetime.now().isoformat(),
-                        "project": project_name,
-                        "bucket": bucket_name,
-                    },
-                    f,
-                )
-
-            # Clean up source zip
-            source_zip.unlink()
-            progress.update(task, completed=True)
-
-        # Don't wait - return build info immediately
-        console.print("\n[bold yellow]Windows build started![/bold yellow]")
-        console.print(f"[dim]Build ID: {build_id}[/dim]")
-        console.print("Build will take approximately 20+ minutes to complete.")
-
-        console.print("\n[bold]Monitor build progress:[/bold]")
-        console.print("  [cyan]poetry run ccwb builds[/cyan]")
-        console.print("  This shows the current status and elapsed time")
-
-        console.print("\n[bold]Next steps:[/bold]")
-        console.print("  1. Wait for build to complete (you can continue working)")
-        console.print("  2. Run [cyan]poetry run ccwb builds[/cyan] to check completion status")
-        console.print("  3. Once complete, run [cyan]poetry run ccwb distribute[/cyan]")
-        console.print("     This will download Windows binaries and create your distribution package")
-
-        # Get profile to show distribution-specific info
-        config = Config.load()
-        profile_obj = config.get_profile(self.option("profile"))
-
-        if profile_obj and profile_obj.enable_distribution:
-            console.print("\n[dim]Note: Package will be uploaded to S3 with presigned URL or landing page[/dim]")
-        else:
-            console.print("\n[dim]Note: Package will be saved locally in the dist/ folder[/dim]")
-
-        console.print("\n[dim]View logs in AWS Console:[/dim]")
-        # Properly encode the build ID (contains colon) and include region
-        from urllib.parse import quote
-
-        encoded_build_id = quote(build_id, safe="")
-        aws_region = profile_obj.aws_region if profile_obj else "us-east-1"
-        console.print(
-            f"  [dim]https://{aws_region}.console.aws.amazon.com/codesuite/codebuild/projects/{project_name}/build/{encoded_build_id}[/dim]"
-        )
-
-        # Return None since we don't have a local binary path
-        return None
-
-    def _package_source_for_codebuild(self) -> Path:
-        """Package source code for CodeBuild."""
-        import tempfile
-        import zipfile
-
-        # Create a temporary zip file
-        temp_dir = Path(tempfile.mkdtemp())
-        source_zip = temp_dir / "source.zip"
-
-        # Get the source directory (parent of package.py)
-        source_dir = Path(__file__).parents[3]  # Go up to source/ directory
-
-        with zipfile.ZipFile(source_zip, "w", zipfile.ZIP_DEFLATED) as zf:
-            # Add all Python files from source directory
-            for py_file in source_dir.rglob("*.py"):
-                # Use forward slashes in zip (POSIX format) for CodeBuild compatibility
-                arcname = py_file.relative_to(source_dir.parent).as_posix()
-                zf.write(py_file, arcname)
-
-            # Add pyproject.toml for dependencies
-            pyproject_file = source_dir / "pyproject.toml"
-            if pyproject_file.exists():
-                zf.write(pyproject_file, "pyproject.toml")
-
-        return source_zip
-
-    def _build_otel_helper(self, output_dir: Path, target_platform: str) -> Path:
-        """Build executable for OTEL helper script."""
-        import platform as platform_mod
-
-        # Windows builds
-        if target_platform == "windows":
-            if platform_mod.system().lower() == "windows":
-                # Native Windows build with Nuitka
-                return self._build_native_otel_helper(output_dir, "windows")
-            # Check if the Windows binary already exists (built via CodeBuild)
-            windows_binary = output_dir / "otel-helper-windows.exe"
-            if windows_binary.exists():
-                return windows_binary
-            else:
-                raise RuntimeError("Windows otel-helper should have been built with credential-process")
-
-        # macOS builds use PyInstaller
-        if target_platform == "macos-arm64":
-            return self._build_otel_helper_pyinstaller(output_dir, "macos", "arm64")
-        elif target_platform == "macos-intel":
-            return self._build_otel_helper_pyinstaller(output_dir, "macos", "x86_64")
-        elif target_platform == "macos-universal":
-            return self._build_otel_helper_pyinstaller(output_dir, "macos", "universal2")
-        elif target_platform == "macos":
-            import platform
-
-            current_machine = platform.machine().lower()
-            if current_machine == "arm64":
-                return self._build_otel_helper_pyinstaller(output_dir, "macos", "arm64")
-            else:
-                return self._build_otel_helper_pyinstaller(output_dir, "macos", "x86_64")
-
-        # Linux builds use PyInstaller via Docker
-        elif target_platform == "linux-x64":
-            return self._build_linux_otel_helper_via_docker(output_dir, "x64")
-        elif target_platform == "linux-arm64":
-            return self._build_linux_otel_helper_via_docker(output_dir, "arm64")
-        elif target_platform == "linux":
-            return self._build_otel_helper_pyinstaller(output_dir, "linux", None)
-
-        # Fallback
-        raise ValueError(f"Unsupported target platform for OTEL helper: {target_platform}")
-
-    def _build_otel_helper_pyinstaller(self, output_dir: Path, platform_name: str, arch: str | None) -> Path:
-        """Build OTEL helper using PyInstaller."""
-        import platform as platform_module
-
-        if platform_name == "macos":
-            _assert_host_os_can_build_macos()
-
-        console = Console()
-        verbose = self.option("build-verbose")
-
-        # Determine binary name
-        if platform_name == "macos":
-            if arch == "arm64":
-                binary_name = "otel-helper-macos-arm64"
-            elif arch == "x86_64":
-                binary_name = "otel-helper-macos-intel"
-            elif arch == "universal2":
-                binary_name = "otel-helper-macos-universal"
-            else:
-                binary_name = "otel-helper-macos"
-        elif platform_name == "linux":
-            # Detect architecture and set appropriate binary name
-            machine = platform_module.machine().lower()
-            if machine in ["aarch64", "arm64"]:
-                binary_name = "otel-helper-linux-arm64"
-            else:
-                binary_name = "otel-helper-linux-x64"
-        else:
-            raise ValueError(f"Unsupported platform for OTEL helper: {platform_name}")
-
-        # Find the source file
-        src_file = Path(__file__).parent.parent.parent.parent / "otel_helper" / "__main__.py"
-        if not src_file.exists():
-            raise FileNotFoundError(f"OTEL helper source not found: {src_file}")
-
-        console.print(f"[yellow]Building OTEL helper for {platform_name} {arch or ''} with PyInstaller...[/yellow]")
-
-        # Determine log level based on verbose flag
-        log_level = "INFO" if verbose else "WARN"
-
-        host_arch = platform_module.machine().lower()
-        cross_arch = platform_name == "macos" and arch is not None and arch != host_arch and arch != "universal2"
-
-        # Build PyInstaller command
-        if cross_arch:
-            # Cross-arch build: need a per-arch venv seeded from a universal2 Python
-            universal2_python = _find_universal2_python()
-            if universal2_python is None:
-                console.print(
-                    f"[yellow]Warning: Skipping {binary_name} — cross-arch build requires universal2 Python (not found)[/yellow]"
-                )
-                return output_dir / binary_name
-            venv_dir = _ensure_cross_arch_venv(arch, universal2_python, _OTEL_HELPER_RUNTIME_DEPS, console)
-            work_root = Path.home() / ".ccwb" / "build-work"
-            work_root.mkdir(parents=True, exist_ok=True)
-            cmd = [
-                "/usr/bin/arch",
-                f"-{arch}",
-                str(venv_dir / "bin" / "pyinstaller"),
-                "--onefile",
-                "--clean",
-                "--noconfirm",
-                f"--name={binary_name}",
-                f"--distpath={str(output_dir)}",
-                f"--workpath={str(work_root / arch)}",
-                f"--specpath={str(work_root / arch)}",
-                f"--log-level={log_level}",
-                str(src_file),
-            ]
-        else:
-            cmd = [
-                "poetry",
-                "run",
-                "pyinstaller",
-                "--onefile",
-                "--clean",
-                "--noconfirm",
-                f"--name={binary_name}",
-                f"--distpath={str(output_dir)}",
-                "--workpath=/tmp/pyinstaller",
-                "--specpath=/tmp/pyinstaller",
-                f"--log-level={log_level}",
-                str(src_file),
-            ]
-
-        # Add target architecture for macOS (only for native Poetry build)
-        if not cross_arch and platform_name == "macos" and arch:
-            cmd.insert(5, f"--target-arch={arch}")
-
-        # Run PyInstaller from source directory
-        source_dir = Path(__file__).parent.parent.parent.parent
-        result = subprocess.run(cmd, capture_output=not verbose, text=True, cwd=source_dir)
-
-        if result.returncode != 0:
-            console.print(f"[red]PyInstaller build failed for OTEL helper: {result.stderr}[/red]")
-            raise RuntimeError(f"PyInstaller build failed: {result.stderr}")
-
-        binary_path = output_dir / binary_name
-        if binary_path.exists():
-            binary_path.chmod(0o755)
-            # Code-sign (Developer ID if available, ad-hoc otherwise)
-            sign_id = None
-            try:
-                id_check = subprocess.run(
-                    ["security", "find-identity", "-v", "-p", "codesigning"], capture_output=True, text=True
-                )
-                for line in id_check.stdout.splitlines():
-                    if "Developer ID Application" in line:
-                        sign_id = line.split('"')[1]
-                        break
-            except Exception:
-                pass
-            sign_flag = sign_id if sign_id else "-"
-            subprocess.run(["codesign", "--force", "--sign", sign_flag, str(binary_path)], capture_output=True)
-            console.print("[green]✓ OTEL helper built and signed with PyInstaller[/green]")
-            return binary_path
-        else:
-            raise RuntimeError(f"OTEL helper binary not created: {binary_path}")
-
-    def _build_native_otel_helper(self, output_dir: Path, target_platform: str) -> Path:
-        """Build OTEL helper using native Nuitka compiler."""
-        import platform
-
-        current_system = platform.system().lower()
-        current_machine = platform.machine().lower()
-
-        # Determine the binary name based on platform and architecture
-        if target_platform == "macos":
-            # Check if user requested a specific variant via environment variable
-            macos_variant = os.environ.get("CCWB_MACOS_VARIANT", "").lower()
-
-            if macos_variant == "intel":
-                platform_variant = "intel"
-                binary_name = "otel-helper-macos-intel"
-            elif macos_variant == "arm64":
-                platform_variant = "arm64"
-                binary_name = "otel-helper-macos-arm64"
-            elif current_machine == "arm64":
-                platform_variant = "arm64"
-                binary_name = "otel-helper-macos-arm64"
-            else:
-                platform_variant = "intel"
-                binary_name = "otel-helper-macos-intel"
-        elif target_platform == "linux":
-            platform_variant = "x86_64"
-            binary_name = "otel-helper-linux"
-        elif target_platform == "windows":
-            platform_variant = "x86_64"
-            binary_name = "otel-helper-windows.exe"
-        else:
-            raise ValueError(f"Unsupported target platform: {target_platform}")
-
-        # Check platform compatibility (same as credential-process)
-        if target_platform == "macos" and current_system != "darwin":
-            raise RuntimeError(f"Cannot build macOS binary on {current_system}. Nuitka requires native builds.")
-        elif target_platform == "linux" and current_system != "linux":
-            raise RuntimeError(f"Cannot build Linux binary on {current_system}. Nuitka requires native builds.")
-        elif target_platform == "windows" and current_system != "windows":
-            raise RuntimeError(f"Cannot build Windows binary on {current_system}. Nuitka requires native builds.")
-
-        # Find the source file
-        src_file = Path(__file__).parent.parent.parent.parent / "otel_helper" / "__main__.py"
-
-        if not src_file.exists():
-            raise FileNotFoundError(f"OTEL helper script not found: {src_file}")
-
-        # Build Nuitka command (use poetry run to ensure correct Python version)
-        # If building Intel binary on ARM Mac, use Rosetta
-        if (
-            target_platform == "macos"
-            and platform_variant == "intel"
-            and current_system == "darwin"
-            and current_machine == "arm64"
-        ):
-            cmd = [
-                "arch",
-                "-x86_64",  # Run under Rosetta
-                "poetry",
-                "run",
-                "nuitka",
-            ]
-        else:
-            cmd = [
-                "poetry",
-                "run",
-                "nuitka",
-            ]
-
-        # Add common Nuitka flags
-        cmd.extend(
-            [
-                "--standalone",
-                "--onefile",
-                "--assume-yes-for-downloads",
-                f"--output-filename={binary_name}",
-                f"--output-dir={str(output_dir)}",
-                "--quiet",
-                "--remove-output",
-                "--python-flag=no_site",
-            ]
-        )
-
-        # Add platform-specific flags
-        if target_platform == "macos":
-            cmd.extend(
-                [
-                    "--macos-create-app-bundle",
-                    "--macos-app-name=Claude Code OTEL Helper",
-                    "--disable-console",
-                ]
-            )
-        elif target_platform == "linux":
-            cmd.extend(
-                [
-                    "--linux-onefile-icon=NONE",
-                ]
-            )
-
-        # Add the source file
-        cmd.append(str(src_file))
-
-        # Run Nuitka (from source directory where pyproject.toml is located)
-        source_dir = Path(__file__).parent.parent.parent.parent
-        result = subprocess.run(cmd, capture_output=True, text=True, cwd=source_dir)
-        if result.returncode != 0:
-            raise RuntimeError(f"Nuitka build failed for OTEL helper: {result.stderr}")
-
-        return output_dir / binary_name
 
     def _regenerate_installers(self, profile, profile_name: str, console: Console) -> int:
         """Regenerate installer scripts using existing binaries from the latest dist folder."""
@@ -2338,20 +731,17 @@ RUN pyinstaller \
             elif hostname_lower.startswith("cognito-idp.") and ".amazonaws.com" in hostname_lower:
                 return "cognito"
             else:
-                return "auto"  # Let credential_provider auto-detect from domain at runtime
+                return "auto"  # Let credential-process auto-detect from domain at runtime
         except Exception:
             return "auto"  # Let credential_provider auto-detect from domain at runtime
 
-    def _create_installer(
-        self, output_dir: Path, profile, built_executables, built_otel_helpers=None, has_windows_codebuild=False
-    ) -> Path:
+    def _create_installer(self, output_dir: Path, profile, built_executables, built_otel_helpers=None) -> Path:
         """Create simple installer script.
 
-        When the bundle was built via --go, both install.sh and
-        ccwb-install.ps1 may be copied from an external source. The inline
-        templates below are the standard installer generation path for builds
-        (--go, PyInstaller, CodeBuild) that don't copy installer scripts;
-        we skip them if external scripts are already in place.
+        The bundle may already ship external install.sh and ccwb-install.ps1
+        scripts (copied alongside the Go-built binaries). The inline templates
+        below are the standard installer generation path; we skip them if
+        external scripts are already in place.
         """
         installer_path = output_dir / "install.sh"
         external_ps1 = output_dir / "ccwb-install.ps1"
@@ -2361,7 +751,6 @@ RUN pyinstaller \
 
         # Determine which binaries were built
         platforms_built = [platform for platform, _ in built_executables]
-        [platform for platform, _ in built_otel_helpers] if built_otel_helpers else []
 
         installer_content = f"""#!/bin/bash
 # Claude Code Authentication Installer
@@ -2854,8 +1243,8 @@ fi
             f.write(run_content)
         run_script.chmod(0o755)
 
-        # Create Windows installer if Windows binaries were built locally OR are being built in CodeBuild
-        if "windows" in platforms_built or has_windows_codebuild:
+        # Create Windows installer when Windows binaries are present
+        if "windows" in platforms_built:
             self._create_windows_installer(output_dir, profile)
 
         return installer_path

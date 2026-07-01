@@ -1,19 +1,9 @@
 # ABOUTME: Tests for utility helper wiring into CLI commands
-# ABOUTME: Verifies get_codebuild_region and clear_cached_credentials are properly used
+# ABOUTME: Verifies clear_cached_credentials is properly used
 
 """Tests verifying utility helpers are wired into commands."""
 
 from pathlib import Path
-
-
-class TestGetCodebuildRegionWiring:
-    """Verify get_codebuild_region is used in CodeBuild commands."""
-
-    def test_builds_command_uses_helper(self):
-        """builds.py uses get_codebuild_region instead of raw profile.aws_region for codebuild client."""
-        source = (Path(__file__).resolve().parents[3] / "claude_code_with_bedrock" / "cli" / "commands" / "builds.py").read_text(encoding="utf-8")
-        assert "from claude_code_with_bedrock.cli.utils.helpers import get_codebuild_region" in source
-        assert "get_codebuild_region(profile)" in source
 
 
 class TestClearCachedCredentialsWiring:

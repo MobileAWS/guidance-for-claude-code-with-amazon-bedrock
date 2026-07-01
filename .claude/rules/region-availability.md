@@ -2,16 +2,17 @@
 
 ## Rule
 - ELB account IDs differ by region
-- CodeBuild Windows not in all regions
 - Bedrock models vary by region
 - Never hardcode us-east-1 without fallback
+
+> Note: Windows binaries are cross-compiled with Go (no CodeBuild), so the old
+> "CodeBuild Windows container not in all regions" constraint no longer applies.
 
 ## Why
 AWS services and features have different availability across regions. Hardcoding region-specific values breaks deployments in other regions.
 
 ## Implementation
 - Use region-specific ELB access log account IDs
-- Check CodeBuild Windows container availability before deployment
 - Use `AllowedBedrockRegions` parameter for model availability
 - Always provide configurable region fallbacks
 

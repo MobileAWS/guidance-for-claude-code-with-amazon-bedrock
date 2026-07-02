@@ -4,15 +4,17 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
-	"ccwb-go/internal/browser"
 	"ccwb-go/internal/config"
 	"ccwb-go/internal/federation"
 	"ccwb-go/internal/jwt"
-	"ccwb-go/internal/nexus"
 	"ccwb-go/internal/oidc"
 	"ccwb-go/internal/otel"
 	"ccwb-go/internal/portlock"
@@ -38,6 +40,7 @@ func main() {
 
 	profileFlag := flag.String("profile", defaultProfile, "Configuration profile to use")
 	shortProfile := flag.String("p", "", "Configuration profile to use (short)")
+	orgFlag := flag.String("org", "", "Select org for multi-org users (e.g. --org skematic)")
 	versionFlag := flag.Bool("version", false, "Show version")
 	shortVersion := flag.Bool("v", false, "Show version (short)")
 	getMonitoring := flag.Bool("get-monitoring-token", false, "Get cached monitoring token")
@@ -105,6 +108,7 @@ func main() {
 
 	app := &credentialApp{
 		profile:      profile,
+		orgFlag:      *orgFlag,
 		cfg:          cfg,
 		providerType: providerType,
 		redirectPort: redirectPort,
@@ -152,6 +156,7 @@ func main() {
 
 type credentialApp struct {
 	profile      string
+	orgFlag      string
 	cfg          *config.ProfileConfig
 	providerType string
 	redirectPort int
@@ -362,6 +367,14 @@ func (a *credentialApp) getTag(key string) int {
 }
 
 func (a *credentialApp) run() int {
+	// Save org selection if explicitly passed
+	if a.orgFlag != "" {
+		saveActiveOrg(a.profile, a.orgFlag)
+	}
+
+	// Sync MCP servers from Nexus (quick, with timeout)
+	syncMcpServers()
+
 	// Check cache first
 	if cached := a.getCachedCredentials(); cached != nil {
 		// Periodic quota re-check
@@ -401,9 +414,14 @@ func (a *credentialApp) run() int {
 
 	// Try silent refresh using cached id_token before opening browser
 	if creds := a.trySilentRefresh(); creds != nil {
-		if token, _ := storage.GetMonitoringToken(a.profile, a.cfg.CredentialStorage); token != "" {
-			if a.checkQuotaAndEnforce(token) {
-				return 1
+		if a.cfg.QuotaAPIEndpoint != "" {
+			token, _ := storage.GetMonitoringToken(a.profile, a.cfg.CredentialStorage)
+			if token != "" {
+				qr := quota.Check(a.cfg.QuotaAPIEndpoint, token, a.cfg.QuotaCheckTimeout, a.cfg.QuotaFailMode)
+				if !qr.Allowed {
+					printQuotaBlocked(qr)
+					return 1
+				}
 			}
 		}
 		outputJSON(creds)
@@ -414,26 +432,35 @@ func (a *credentialApp) run() int {
 	// This enables Cowork 3P (Claude Desktop) to refresh silently even after
 	// the id_token expires, since Claude Desktop cannot open a browser popup.
 	if creds := a.tryRefreshToken(); creds != nil {
-		if token, _ := storage.GetMonitoringToken(a.profile, a.cfg.CredentialStorage); token != "" {
-			if a.checkQuotaAndEnforce(token) {
-				return 1
+		if a.cfg.QuotaAPIEndpoint != "" {
+			token, _ := storage.GetMonitoringToken(a.profile, a.cfg.CredentialStorage)
+			if token != "" {
+				qr := quota.Check(a.cfg.QuotaAPIEndpoint, token, a.cfg.QuotaCheckTimeout, a.cfg.QuotaFailMode)
+				if !qr.Allowed {
+					printQuotaBlocked(qr)
+					return 1
+				}
 			}
 		}
 		outputJSON(creds)
 		return 0
 	}
 
-	// Authenticate. Nexus deployments use the portless device-code flow; everyone
-	// else uses the browser OIDC redirect flow.
-	authResult, err := a.authenticateForRun()
+	// Authenticate with OIDC provider (browser popup)
+	debugPrint("Authenticating with %s for profile '%s'...", a.providerType, a.profile)
+	authResult, err := a.authenticate()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return 1
 	}
 
-	// Quota check before issuing credentials (also enforces the admin model list)
-	if a.checkQuotaAndEnforce(authResult.IDToken) {
-		return 1
+	// Quota check before issuing credentials
+	if a.cfg.QuotaAPIEndpoint != "" {
+		qr := quota.Check(a.cfg.QuotaAPIEndpoint, authResult.IDToken, a.cfg.QuotaCheckTimeout, a.cfg.QuotaFailMode)
+		if !qr.Allowed {
+			printQuotaBlocked(qr)
+			return 1
+		}
 	}
 
 	// Get AWS credentials
@@ -458,51 +485,53 @@ func (a *credentialApp) run() int {
 	_ = storage.SaveMonitoringToken(a.profile, a.cfg.CredentialStorage,
 		authResult.IDToken, map[string]interface{}(authResult.TokenClaims))
 
-	// Report platform to the Nexus hub (best-effort, never blocks issuance).
-	// Only for Nexus deployments — non-Nexus profiles must not POST to the hub.
-	if a.useDeviceFlow() {
-		_ = nexus.ReportPlatform(a.cfg.DeviceAuthEndpoint, authResult.TokenClaims.GetString("email"), authResult.IDToken)
-	}
-
 	// Persist refresh_token for silent renewal (Cowork 3P support)
 	_ = storage.SaveRefreshToken(a.profile, a.cfg.CredentialStorage, authResult.RefreshToken)
 
+	// Org selection for multi-org users
+	if groups, ok := authResult.TokenClaims["cognito:groups"]; ok {
+		if groupList, ok := groups.([]interface{}); ok {
+			var orgs []string
+			for _, g := range groupList {
+				if s, ok := g.(string); ok && len(s) > 4 && s[:4] == "org-" && !strings.HasSuffix(s, "-admins") {
+					orgs = append(orgs, s[4:])
+				}
+			}
+			if len(orgs) > 0 {
+				selectedOrg := ""
+				if a.orgFlag != "" {
+					selectedOrg = a.orgFlag
+				} else if len(orgs) == 1 {
+					selectedOrg = orgs[0]
+				} else {
+					// Multiple orgs — check saved preference or prompt
+					savedOrg := readActiveOrg(a.profile)
+					if savedOrg != "" {
+						selectedOrg = savedOrg
+					} else {
+						fmt.Fprintf(os.Stderr, "\nYou belong to multiple organizations:\n")
+						for i, org := range orgs {
+							fmt.Fprintf(os.Stderr, "  [%d] %s\n", i+1, org)
+						}
+						fmt.Fprintf(os.Stderr, "Select org (1-%d): ", len(orgs))
+						var choice int
+						fmt.Scanln(&choice)
+						if choice >= 1 && choice <= len(orgs) {
+							selectedOrg = orgs[choice-1]
+						} else {
+							selectedOrg = orgs[0]
+						}
+					}
+				}
+				if selectedOrg != "" {
+					saveActiveOrg(a.profile, selectedOrg)
+				}
+			}
+		}
+	}
+
 	outputJSON(awsCreds)
 	return 0
-}
-
-// useDeviceFlow reports whether this profile authenticates via the Nexus
-// portless device-code flow. Nexus deployments are detected by a configured
-// device_auth_endpoint or quota_api_endpoint (mirrors the Python dispatch).
-func (a *credentialApp) useDeviceFlow() bool {
-	return a.cfg.DeviceAuthEndpoint != "" || a.cfg.QuotaAPIEndpoint != ""
-}
-
-// authenticateForRun selects the auth mechanism for the primary credential flow:
-// the Nexus device-code flow when configured, otherwise browser OIDC. The
-// monitoring-token and tag-diagnostic paths intentionally always use browser
-// OIDC, matching the Python credential_provider.
-func (a *credentialApp) authenticateForRun() (*oidc.AuthResult, error) {
-	if a.useDeviceFlow() {
-		debugPrint("Authenticating via Nexus device-code flow for profile '%s'...", a.profile)
-		return a.authenticateDeviceFlow()
-	}
-	debugPrint("Authenticating with %s for profile '%s'...", a.providerType, a.profile)
-	return a.authenticate()
-}
-
-// authenticateDeviceFlow runs the Nexus device-code flow and decodes the
-// returned id_token into claims. This flow issues no refresh_token.
-func (a *credentialApp) authenticateDeviceFlow() (*oidc.AuthResult, error) {
-	res, err := nexus.DeviceFlow(a.cfg.DeviceAuthEndpoint, browser.OpenURL, debugPrint)
-	if err != nil {
-		return nil, err
-	}
-	claims, err := jwt.DecodePayload(res.IDToken)
-	if err != nil {
-		return nil, fmt.Errorf("decoding device-flow id_token: %w", err)
-	}
-	return &oidc.AuthResult{IDToken: res.IDToken, TokenClaims: claims}, nil
 }
 
 func (a *credentialApp) authenticate() (*oidc.AuthResult, error) {
@@ -703,26 +732,6 @@ func (a *credentialApp) tryRefreshToken() *federation.AWSCredentials {
 	return creds
 }
 
-// checkQuotaAndEnforce runs a quota check (when a quota endpoint and token are
-// available) and, on the allowed path, enforces the admin-restricted model list
-// against ~/.claude/settings.json. Returns true when access is blocked (the
-// block message is printed; the caller should exit 1).
-func (a *credentialApp) checkQuotaAndEnforce(idToken string) (blocked bool) {
-	if a.cfg.QuotaAPIEndpoint == "" || idToken == "" {
-		return false
-	}
-	qr := quota.Check(a.cfg.QuotaAPIEndpoint, idToken, a.cfg.QuotaCheckTimeout, a.cfg.QuotaFailMode)
-	if !qr.Allowed {
-		printQuotaBlocked(qr)
-		return true
-	}
-	// Quota allowed: enforce admin model restrictions (Nexus).
-	if err := config.EnforceEnabledModels(qr.EnabledModels); err != nil {
-		debugPrint("Could not enforce model restriction: %v", err)
-	}
-	return false
-}
-
 func (a *credentialApp) shouldRecheckQuota() bool {
 	if a.cfg.QuotaAPIEndpoint == "" {
 		return false
@@ -732,8 +741,18 @@ func (a *credentialApp) shouldRecheckQuota() bool {
 }
 
 func (a *credentialApp) performQuotaRecheck() {
-	if token, _ := storage.GetMonitoringToken(a.profile, a.cfg.CredentialStorage); token != "" {
-		a.checkQuotaAndEnforce(token)
+	token, _ := storage.GetMonitoringToken(a.profile, a.cfg.CredentialStorage)
+	if token == "" {
+		return
+	}
+	claims, err := jwt.DecodePayload(token)
+	if err != nil {
+		return
+	}
+	qr := quota.Check(a.cfg.QuotaAPIEndpoint, token, a.cfg.QuotaCheckTimeout, a.cfg.QuotaFailMode)
+	_ = claims // suppress unused
+	if !qr.Allowed {
+		printQuotaBlocked(qr)
 	}
 }
 
@@ -750,4 +769,80 @@ func printQuotaBlocked(qr *quota.Result) {
 func outputJSON(v interface{}) {
 	data, _ := json.Marshal(v)
 	fmt.Println(string(data))
+}
+
+func readActiveOrg(profile string) string {
+	home, _ := os.UserHomeDir()
+	data, err := os.ReadFile(filepath.Join(home, ".claude-code-session", profile+"-active-org"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+func saveActiveOrg(profile, org string) {
+	home, _ := os.UserHomeDir()
+	dir := filepath.Join(home, ".claude-code-session")
+	os.MkdirAll(dir, 0700)
+	os.WriteFile(filepath.Join(dir, profile+"-active-org"), []byte(org), 0600)
+}
+
+func syncMcpServers() {
+	// Fetch MCP config from S3 and merge into ~/.claude/settings.json
+	// Non-blocking, best effort — failures are silent
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	settingsPath := filepath.Join(home, ".claude", "settings.json")
+
+	// Check if we synced recently (skip if < 5 min ago)
+	cachePath := filepath.Join(home, ".claude-code-session", "mcp-sync-ts")
+	if data, err := os.ReadFile(cachePath); err == nil {
+		if ts, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64); err == nil {
+			if time.Now().Unix()-ts < 300 {
+				return // Synced less than 5 min ago
+			}
+		}
+	}
+
+	// Fetch MCPs from S3
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get("https://claude-code-auth-distribution-916587687563.s3.amazonaws.com/cowork/claude-code-mcps.json")
+	if err != nil || resp.StatusCode != 200 {
+		return
+	}
+	defer resp.Body.Close()
+	mcpData, err := io.ReadAll(resp.Body)
+	if err != nil || len(mcpData) < 3 {
+		return
+	}
+
+	// Parse MCPs
+	var mcps map[string]interface{}
+	if err := json.Unmarshal(mcpData, &mcps); err != nil {
+		return
+	}
+
+	// Read current settings
+	settingsData, err := os.ReadFile(settingsPath)
+	if err != nil {
+		return
+	}
+	var settings map[string]interface{}
+	if err := json.Unmarshal(settingsData, &settings); err != nil {
+		return
+	}
+
+	// Merge MCPs
+	settings["mcpServers"] = mcps
+	newData, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return
+	}
+	os.WriteFile(settingsPath, newData, 0600)
+
+	// Update sync timestamp
+	os.MkdirAll(filepath.Dir(cachePath), 0700)
+	os.WriteFile(cachePath, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0600)
 }

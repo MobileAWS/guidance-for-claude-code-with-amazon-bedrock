@@ -3,11 +3,30 @@ package otel
 import (
 	"crypto/sha256"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"ccwb-go/internal/jwt"
 	"ccwb-go/internal/provider"
 )
+
+// readActiveOrgForOtel reads the active org from session file.
+func readActiveOrgForOtel() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	profile := os.Getenv("AWS_PROFILE")
+	if profile == "" {
+		profile = "ClaudeCode"
+	}
+	data, err := os.ReadFile(filepath.Join(home, ".claude-code-session", profile+"-active-org"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
 
 // UserInfo holds extracted user attributes from JWT claims.
 type UserInfo struct {
@@ -85,9 +104,11 @@ func ExtractUserInfoWithTagKey(claims jwt.Claims, tagKey string) UserInfo {
 		info.Username = strings.SplitN(info.Email, "@", 2)[0]
 	}
 
-	// Organization - detect from issuer
+	// Organization - check active-org file first, then detect from issuer
 	info.OrganizationID = "amazon-internal"
-	if iss := claims.GetString("iss"); iss != "" {
+	if activeOrg := readActiveOrgForOtel(); activeOrg != "" {
+		info.OrganizationID = activeOrg
+	} else if iss := claims.GetString("iss"); iss != "" {
 		detected := provider.Detect(iss)
 		if detected != "oidc" {
 			info.OrganizationID = detected

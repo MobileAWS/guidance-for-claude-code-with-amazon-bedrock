@@ -112,6 +112,9 @@ class Profile:
 
     # Claude Cowork 3P MDM configuration
     cowork_3p_enabled: bool = True  # Generate CoWork 3P MDM configs during packaging
+    cowork_3p_extra_keys: dict = field(default_factory=dict)  # Custom MDM keys merged into CoWork 3P output
+    cowork_credential_mode: str = "helper"  # "helper" (inferenceCredentialHelper) or "profile" (inferenceBedrockProfile)
+    cowork_credential_helper_ttl_sec: int = 3500  # inferenceCredentialHelperTtlSec (refresh before 1h STS expiry)
 
     # Legacy field support
     @property

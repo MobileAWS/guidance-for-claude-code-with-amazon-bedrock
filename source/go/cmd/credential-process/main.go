@@ -15,6 +15,7 @@ import (
 	"ccwb-go/internal/config"
 	"ccwb-go/internal/federation"
 	"ccwb-go/internal/jwt"
+	"ccwb-go/internal/nexus"
 	"ccwb-go/internal/oidc"
 	"ccwb-go/internal/otel"
 	"ccwb-go/internal/portlock"
@@ -374,6 +375,7 @@ func (a *credentialApp) run() int {
 
 	// Sync MCP servers from Nexus (quick, with timeout)
 	syncMcpServers()
+	syncCodexConfig(a.cfg, a.profile, readActiveOrg(a.profile))
 
 	// Check cache first
 	if cached := a.getCachedCredentials(); cached != nil {
@@ -785,6 +787,131 @@ func saveActiveOrg(profile, org string) {
 	dir := filepath.Join(home, ".claude-code-session")
 	os.MkdirAll(dir, 0700)
 	os.WriteFile(filepath.Join(dir, profile+"-active-org"), []byte(org), 0600)
+}
+
+func syncCodexConfig(cfg *config.ProfileConfig, profile string, activeOrg string) {
+	// Best-effort, all failures are silent.
+	if activeOrg == "" {
+		return
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+
+	// Rate-limit: skip if synced less than 5 minutes ago.
+	cachePath := filepath.Join(home, ".claude-code-session", "codex-sync-ts")
+	if data, err := os.ReadFile(cachePath); err == nil {
+		if ts, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64); err == nil {
+			if time.Now().Unix()-ts < 300 {
+				return // Synced less than 5 min ago
+			}
+		}
+	}
+
+	// Get the cached monitoring token.
+	token, err := storage.GetMonitoringToken(profile, cfg.CredentialStorage)
+	if err != nil || token == "" {
+		return
+	}
+
+	// Build the API URL.
+	base := nexus.ResolveBase(cfg.QuotaAPIEndpoint)
+	url := fmt.Sprintf("%s/api/orgs/%s/codex-config", base, activeOrg)
+
+	// Make authenticated GET request.
+	client := &http.Client{Timeout: 3 * time.Second}
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := client.Do(req)
+	if err != nil || resp.StatusCode != 200 {
+		return
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return
+	}
+
+	// Parse response.
+	var result struct {
+		CodexEnabled bool   `json:"codex_enabled"`
+		CodexAPIKey  string `json:"codex_api_key"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return
+	}
+
+	// If codex is not enabled, do nothing.
+	if !result.CodexEnabled {
+		return
+	}
+
+	// Write ~/.codex/config.toml
+	codexDir := filepath.Join(home, ".codex")
+	if err := os.MkdirAll(codexDir, 0700); err != nil {
+		return
+	}
+	codexConfig := `model_provider = "amazon-bedrock"
+`
+	if err := os.WriteFile(filepath.Join(codexDir, "config.toml"), []byte(codexConfig), 0600); err != nil {
+		return
+	}
+
+	// Detect shell profile to update.
+	profileFile := ""
+	for _, candidate := range []string{".zshrc", ".bash_profile", ".bashrc"} {
+		p := filepath.Join(home, candidate)
+		if _, err := os.Stat(p); err == nil {
+			profileFile = p
+			break
+		}
+	}
+	if profileFile == "" {
+		profileFile = filepath.Join(home, ".profile")
+	}
+
+	const marker = "# AllCode Nexus Codex"
+	newLine := fmt.Sprintf("export AWS_BEARER_TOKEN_BEDROCK=%q %s", result.CodexAPIKey, marker)
+
+	// Read existing profile contents.
+	existingBytes, err := os.ReadFile(profileFile)
+	var lines []string
+	if err == nil {
+		lines = strings.Split(string(existingBytes), "\n")
+	}
+
+	// Replace existing marked line or append.
+	found := false
+	for i, line := range lines {
+		if strings.Contains(line, marker) {
+			lines[i] = newLine
+			found = true
+			break
+		}
+	}
+	if !found {
+		// Remove trailing empty line before appending so we don't double-space.
+		if len(lines) > 0 && lines[len(lines)-1] == "" {
+			lines = lines[:len(lines)-1]
+		}
+		lines = append(lines, newLine, "")
+	}
+
+	updated := strings.Join(lines, "\n")
+	if err := os.WriteFile(profileFile, []byte(updated), 0600); err != nil {
+		return
+	}
+
+	// Update sync timestamp.
+	os.MkdirAll(filepath.Dir(cachePath), 0700)
+	os.WriteFile(cachePath, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0600)
 }
 
 func syncMcpServers() {

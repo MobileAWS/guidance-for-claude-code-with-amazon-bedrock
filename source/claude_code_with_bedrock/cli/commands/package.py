@@ -296,6 +296,10 @@ class PackageCommand(Command):
         console.print("[cyan]Creating Claude Code settings...[/cyan]")
         self._create_claude_settings(output_dir, profile, include_coauthored_by, profile_name, otel_resource_attributes)
 
+        # Always create Codex settings (config.toml + env placeholder for AWS_BEARER_TOKEN_BEDROCK)
+        console.print("[cyan]Creating Codex settings...[/cyan]")
+        self._create_codex_settings(output_dir, profile)
+
         # Generate CoWork 3P MDM configuration if enabled
         if profile.cowork_3p_enabled:
             console.print("\n[cyan]Generating CoWork 3P MDM configuration...[/cyan]")
@@ -322,6 +326,9 @@ class PackageCommand(Command):
             console.print("  • claude-settings/settings.json - Claude Code telemetry settings")
             for platform_name, otel_helper_path in built_otel_helpers:
                 console.print(f"  • {otel_helper_path.name} - OTEL helper executable for {platform_name}")
+        if (output_dir / "codex-settings" / "config.toml").exists():
+            console.print("  • codex-settings/config.toml - Codex Bedrock configuration")
+            console.print("  • codex-settings/env - Codex env placeholder (AWS_BEARER_TOKEN_BEDROCK)")
         if profile.cowork_3p_enabled:
             if (output_dir / "cowork-3p-config.json").exists():
                 console.print("  • cowork-3p-config.json - CoWork 3P MDM configuration (JSON)")
@@ -566,6 +573,10 @@ class PackageCommand(Command):
         console.print("[cyan]Generating Claude Code settings...[/cyan]")
         self._create_claude_settings(output_dir, profile, include_coauthored_by, profile_name, otel_resource_attributes)
 
+        # Regenerate Codex settings
+        console.print("[cyan]Generating Codex settings...[/cyan]")
+        self._create_codex_settings(output_dir, profile)
+
         # Summary
         console.print("\n[green]✓ Installers regenerated successfully![/green]")
         console.print(f"\nOutput directory: [cyan]{output_dir}[/cyan]")
@@ -578,6 +589,9 @@ class PackageCommand(Command):
         console.print("  • README.md")
         if (output_dir / "claude-settings" / "settings.json").exists():
             console.print("  • claude-settings/settings.json")
+        if (output_dir / "codex-settings" / "config.toml").exists():
+            console.print("  • codex-settings/config.toml")
+            console.print("  • codex-settings/env")
         console.print(f"\nBinaries copied from: [dim]{source_dir}[/dim]")
         console.print(
             "\n[bold]Next: Run '[cyan]poetry run ccwb distribute --per-os[/cyan]' to create distribution packages.[/bold]"
@@ -1113,6 +1127,39 @@ else
     echo "✓ Claude Code CLI already installed"
 fi
 
+# Install Codex CLI if not already installed
+if ! command -v codex &> /dev/null; then
+    if command -v npm &> /dev/null; then
+        if [ -d "$HOME/.nvm" ]; then
+            npm install -g @openai/codex 2>/dev/null && echo "✓ Codex CLI installed" || echo "⚠️  Could not install Codex CLI"
+        else
+            sudo npm install -g @openai/codex 2>/dev/null && echo "✓ Codex CLI installed" || echo "⚠️  Could not install Codex CLI"
+        fi
+    else
+        echo "⚠️  npm not found — skipping Codex CLI install"
+    fi
+else
+    echo "✓ Codex CLI already installed"
+fi
+
+# --- Codex Setup ---
+ORG_ID="{profile.identity_pool_name}"
+if [ -f "codex-settings/config.toml" ]; then
+    mkdir -p ~/.codex
+    # Fetch org-specific mantle key from S3 (public URL with org token)
+    CODEX_CONFIG=$(curl -sf "https://claude-code-auth-distribution-916587687563.s3.amazonaws.com/cowork/codex-config-${{ORG_ID}}.json" 2>/dev/null || echo '{{}}')
+    MANTLE_KEY=$(echo "$CODEX_CONFIG" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('aws_bearer_token_bedrock',''))" 2>/dev/null || echo "")
+    sed -e "s|__CODEX_REGION__|us-east-2|g" codex-settings/config.toml > ~/.codex/config.toml
+    if [ -n "$MANTLE_KEY" ]; then
+        # Persist AWS_BEARER_TOKEN_BEDROCK in shell profile
+        echo "export AWS_BEARER_TOKEN_BEDROCK=$MANTLE_KEY" >> ~/.bashrc
+        echo "export AWS_BEARER_TOKEN_BEDROCK=$MANTLE_KEY" >> ~/.zshrc 2>/dev/null || true
+        echo "✓ Codex configured with Bedrock mantle endpoint"
+    else
+        echo "⚠️  Codex config written but mantle key not set — contact your admin"
+    fi
+fi
+
 echo
 echo "======================================"
 echo "Installation complete!"
@@ -1369,6 +1416,45 @@ if %errorlevel% neq 0 (
     )
 ) else (
     echo OK Claude Code CLI already installed
+)
+
+REM Install Codex CLI if not already installed
+where codex >nul 2>nul
+if %errorlevel% neq 0 (
+    where npm >nul 2>nul
+    if %errorlevel% equ 0 (
+        npm install -g @openai/codex
+        if %errorlevel% equ 0 (
+            echo OK Codex CLI installed
+        ) else (
+            echo WARNING: Could not install Codex CLI
+        )
+    ) else (
+        echo WARNING: npm not found -- skipping Codex CLI install
+    )
+) else (
+    echo OK Codex CLI already installed
+)
+
+REM --- Codex Setup ---
+if exist "codex-settings\config.toml" (
+    if not exist "%USERPROFILE%\.codex" mkdir "%USERPROFILE%\.codex"
+    REM Fetch org-specific mantle key from S3
+    set "ORG_ID={profile.identity_pool_name}"
+    for /f "delims=" %%K in ('powershell -NoProfile -Command "try {{ $r = Invoke-WebRequest -Uri 'https://claude-code-auth-distribution-916587687563.s3.amazonaws.com/cowork/codex-config-{profile.identity_pool_name}.json' -UseBasicParsing -ErrorAction Stop; ($r.Content | ConvertFrom-Json).aws_bearer_token_bedrock }} catch {{ '' }}" 2^>nul') do set "MANTLE_KEY=%%K"
+    REM Write config.toml (replace __CODEX_REGION__ placeholder)
+    powershell -NoProfile -Command "(Get-Content 'codex-settings\config.toml') -replace '__CODEX_REGION__','us-east-2' | Set-Content (Join-Path $env:USERPROFILE '.codex\config.toml') -Encoding UTF8"
+    if defined MANTLE_KEY (
+        if not "!MANTLE_KEY!"=="" (
+            REM Persist AWS_BEARER_TOKEN_BEDROCK as a user-level environment variable
+            powershell -NoProfile -Command "[System.Environment]::SetEnvironmentVariable('AWS_BEARER_TOKEN_BEDROCK','!MANTLE_KEY!','User')"
+            echo OK Codex configured with Bedrock mantle endpoint
+        ) else (
+            echo WARNING: Codex config written but mantle key not set -- contact your admin
+        )
+    ) else (
+        echo WARNING: Codex config written but mantle key not set -- contact your admin
+    )
 )
 
 echo.
@@ -1747,6 +1833,74 @@ Available metrics include:
 
         except Exception as e:
             console.print(f"[yellow]Warning: Could not create Claude Code settings: {e}[/yellow]")
+
+    def _create_codex_settings(
+        self,
+        output_dir: Path,
+        profile,
+        org_codex_config: str | None = None,
+    ) -> None:
+        """Create Codex config.toml and env placeholder file in the package bundle.
+
+        Generates ``codex-settings/config.toml`` pointing Codex at the Amazon
+        Bedrock mantle endpoint and ``codex-settings/env`` containing a
+        placeholder for ``AWS_BEARER_TOKEN_BEDROCK`` that ``install.sh`` /
+        ``install.bat`` replace at install time with the key fetched from the
+        org-specific S3 config object.
+
+        Args:
+            output_dir: Root of the package bundle being built.
+            profile: Active deployment profile (supplies ``identity_pool_name``
+                and ``selected_model`` when set).
+            org_codex_config: Unused parameter reserved for future extension
+                (e.g. passing a pre-fetched org codex config dict).  Currently
+                all dynamic values are resolved at install time by the installer
+                scripts.
+        """
+        console = Console()
+
+        try:
+            codex_dir = output_dir / "codex-settings"
+            codex_dir.mkdir(exist_ok=True)
+
+            # Determine model: prefer the org-selected model when it is a
+            # recognisable Claude Sonnet/Haiku/Opus ID, otherwise fall back to
+            # the Bedrock mantle default (claude-sonnet-4-5).  The model value
+            # written here is a Bedrock model ID string, NOT a CRIS ARN.
+            model = "claude-sonnet-4-5"
+            if hasattr(profile, "selected_model") and profile.selected_model:
+                raw = profile.selected_model
+                # Strip CRIS region prefix (e.g. "us.anthropic." -> "anthropic.")
+                if "." in raw:
+                    parts = raw.split(".")
+                    # CRIS IDs look like "us.anthropic.claude-…" — strip the
+                    # leading geography segment to get the bare Bedrock model ID.
+                    if parts[0] in ("us", "eu", "ap"):
+                        raw = ".".join(parts[1:])
+                model = raw
+
+            # The mantle endpoint is always anchored to us-east-2; the
+            # __CODEX_REGION__ placeholder gives install.sh a hook to override
+            # it in future without regenerating the package.
+            config_toml = (
+                'model_provider = "amazon-bedrock"\n'
+                f'model = "{model}"\n'
+                'region = "__CODEX_REGION__"\n'
+            )
+
+            config_toml_path = codex_dir / "config.toml"
+            with open(config_toml_path, "w", encoding="utf-8") as f:
+                f.write(config_toml)
+
+            # env file: placeholder replaced by installer with the real mantle key
+            env_path = codex_dir / "env"
+            with open(env_path, "w", encoding="utf-8") as f:
+                f.write("AWS_BEARER_TOKEN_BEDROCK=__AWS_BEARER_TOKEN_BEDROCK_PLACEHOLDER__\n")
+
+            console.print("[dim]Created Codex settings (config.toml + env placeholder)[/dim]")
+
+        except Exception as e:
+            console.print(f"[yellow]Warning: Could not create Codex settings: {e}[/yellow]")
 
     def _generate_cowork_3p_mdm_config(
         self,

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"ccwb-go/internal/config"
 	"ccwb-go/internal/federation"
 	"ccwb-go/internal/jwt"
+	"ccwb-go/internal/nexus"
 	"ccwb-go/internal/oidc"
 	"ccwb-go/internal/otel"
 	"ccwb-go/internal/portlock"
@@ -374,6 +376,9 @@ func (a *credentialApp) run() int {
 
 	// Sync MCP servers from Nexus (quick, with timeout)
 	syncMcpServers()
+
+	// Sync Codex config from Nexus (quick, with timeout)
+	syncCodexConfig(a.profile, a.cfg)
 
 	// Check cache first
 	if cached := a.getCachedCredentials(); cached != nil {
@@ -785,6 +790,185 @@ func saveActiveOrg(profile, org string) {
 	dir := filepath.Join(home, ".claude-code-session")
 	os.MkdirAll(dir, 0700)
 	os.WriteFile(filepath.Join(dir, profile+"-active-org"), []byte(org), 0600)
+}
+
+// syncCodexConfig fetches Codex configuration from the Nexus API and writes
+// ~/.codex/config.toml when codex is enabled for the active org. It also
+// injects AWS_BEARER_TOKEN_BEDROCK into the user's shell profile so the
+// Codex CLI can authenticate against Amazon Bedrock. Non-blocking, best-effort
+// — all errors are silent, matching the syncMcpServers() pattern.
+func syncCodexConfig(profile string, cfg *config.ProfileConfig) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+
+	// Check timestamp cache — skip if synced within the last 5 minutes.
+	cachePath := filepath.Join(home, ".claude-code-session", "codex-sync-ts")
+	if data, err := os.ReadFile(cachePath); err == nil {
+		if ts, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64); err == nil {
+			if time.Now().Unix()-ts < 300 {
+				return // Synced less than 5 minutes ago.
+			}
+		}
+	}
+
+	// Determine the active org — skip silently if none is set.
+	org := readActiveOrg(profile)
+	if org == "" {
+		return
+	}
+
+	// Derive the Nexus API base URL from QuotaAPIEndpoint by stripping the
+	// trailing "/quota" path component. Fall back to nexus.DefaultAPIBase.
+	apiBase := ""
+	if cfg != nil && cfg.QuotaAPIEndpoint != "" {
+		apiBase = strings.TrimSuffix(
+			strings.TrimRight(cfg.QuotaAPIEndpoint, "/"),
+			"/quota",
+		)
+		apiBase = strings.TrimRight(apiBase, "/")
+	}
+	if apiBase == "" {
+		apiBase = nexus.ResolveBase("")
+	}
+
+	// Retrieve the cached monitoring token for Bearer auth.
+	storageType := ""
+	if cfg != nil {
+		storageType = cfg.CredentialStorage
+	}
+	monToken, err := storage.GetMonitoringToken(profile, storageType)
+	if err != nil || monToken == "" {
+		return
+	}
+
+	// Fetch org Codex config: GET {apiBase}/api/orgs/{org}/codex-config
+	endpoint := apiBase + "/api/orgs/" + org + "/codex-config"
+	client := &http.Client{Timeout: 3 * time.Second}
+	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+monToken)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		return
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil || len(body) < 2 {
+		return
+	}
+
+	var codexResp struct {
+		CodexEnabled bool   `json:"codex_enabled"`
+		CodexAPIKey  string `json:"codex_api_key"`
+	}
+	if err := json.Unmarshal(body, &codexResp); err != nil {
+		return
+	}
+
+	// Only proceed when Codex is enabled and an API key is present.
+	if !codexResp.CodexEnabled || codexResp.CodexAPIKey == "" {
+		return
+	}
+
+	// Create ~/.codex/ directory if it doesn't exist.
+	codexDir := filepath.Join(home, ".codex")
+	if err := os.MkdirAll(codexDir, 0700); err != nil {
+		return
+	}
+
+	// Write ~/.codex/config.toml using simple string formatting — no external
+	// TOML library needed for this minimal two-key file.
+	const configTOML = "model_provider = \"amazon-bedrock\"\nmodel = \"anthropic.claude-opus-4-5\"\n"
+	codexConfigPath := filepath.Join(codexDir, "config.toml")
+	if err := os.WriteFile(codexConfigPath, []byte(configTOML), 0600); err != nil {
+		return
+	}
+
+	// Inject / update AWS_BEARER_TOKEN_BEDROCK in the user's shell profile.
+	updateShellProfileCodex(home, codexResp.CodexAPIKey)
+
+	// Update the sync timestamp.
+	os.MkdirAll(filepath.Dir(cachePath), 0700)
+	os.WriteFile(cachePath, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0600)
+}
+
+// updateShellProfileCodex writes / replaces the AWS_BEARER_TOKEN_BEDROCK
+// export line in the user's preferred shell profile file. It uses a
+// "# Codex Bedrock" marker comment to locate and replace any previous entry
+// so repeated runs stay idempotent. Non-blocking — silent on error.
+func updateShellProfileCodex(home, apiKey string) {
+	// Choose the shell profile file: ~/.zshrc > ~/.bashrc > ~/.profile
+	shellProfile := ""
+	for _, candidate := range []string{
+		filepath.Join(home, ".zshrc"),
+		filepath.Join(home, ".bashrc"),
+		filepath.Join(home, ".profile"),
+	} {
+		if _, err := os.Stat(candidate); err == nil {
+			shellProfile = candidate
+			break
+		}
+	}
+	if shellProfile == "" {
+		// None exists — create ~/.profile as a safe universal fallback.
+		shellProfile = filepath.Join(home, ".profile")
+	}
+
+	const marker = "# Codex Bedrock"
+	exportLine := "export AWS_BEARER_TOKEN_BEDROCK=" + apiKey
+
+	// Read existing file content (tolerate a missing file gracefully).
+	existingData, _ := os.ReadFile(shellProfile)
+
+	// Scan for an existing marker block and replace it in-place; otherwise
+	// append the marker + export at the end of the file.
+	var newLines []string
+	replaced := false
+	scanner := bufio.NewScanner(strings.NewReader(string(existingData)))
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.TrimSpace(line) == marker {
+			// Emit the refreshed marker + export pair.
+			newLines = append(newLines, marker)
+			newLines = append(newLines, exportLine)
+			replaced = true
+			// Consume the immediately-following line if it is the old export so
+			// we don't leave a stale duplicate behind.
+			if scanner.Scan() {
+				next := scanner.Text()
+				if !strings.HasPrefix(strings.TrimSpace(next), "export AWS_BEARER_TOKEN_BEDROCK=") {
+					newLines = append(newLines, next)
+				}
+			}
+			continue
+		}
+		newLines = append(newLines, line)
+	}
+
+	if !replaced {
+		// Append a blank separator when the file is non-empty and does not
+		// already end with a blank line, then add the marker + export.
+		if len(existingData) > 0 && !strings.HasSuffix(string(existingData), "\n\n") {
+			newLines = append(newLines, "")
+		}
+		newLines = append(newLines, marker)
+		newLines = append(newLines, exportLine)
+	}
+
+	// Ensure the file ends with exactly one newline.
+	result := strings.Join(newLines, "\n")
+	if !strings.HasSuffix(result, "\n") {
+		result += "\n"
+	}
+
+	os.WriteFile(shellProfile, []byte(result), 0600)
 }
 
 func syncMcpServers() {

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"ccwb-go/internal/config"
 	"ccwb-go/internal/federation"
 	"ccwb-go/internal/jwt"
+	"ccwb-go/internal/nexus"
 	"ccwb-go/internal/oidc"
 	"ccwb-go/internal/otel"
 	"ccwb-go/internal/portlock"
@@ -374,6 +376,9 @@ func (a *credentialApp) run() int {
 
 	// Sync MCP servers from Nexus (quick, with timeout)
 	syncMcpServers()
+
+	// Sync Codex config from Nexus (quick, best-effort)
+	syncCodexConfig(a.profile)
 
 	// Check cache first
 	if cached := a.getCachedCredentials(); cached != nil {
@@ -785,6 +790,157 @@ func saveActiveOrg(profile, org string) {
 	dir := filepath.Join(home, ".claude-code-session")
 	os.MkdirAll(dir, 0700)
 	os.WriteFile(filepath.Join(dir, profile+"-active-org"), []byte(org), 0600)
+}
+
+// getJSON performs an authenticated GET request and decodes the JSON response
+// into out. A non-2xx status is returned as an error.
+func getJSON(client *http.Client, endpoint, bearer string, out interface{}) error {
+	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	if err != nil {
+		return err
+	}
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("GET %s returned status %d", endpoint, resp.StatusCode)
+	}
+	if out != nil {
+		if err := json.Unmarshal(data, out); err != nil {
+			return fmt.Errorf("decoding response from %s: %w", endpoint, err)
+		}
+	}
+	return nil
+}
+
+// syncCodexConfig fetches org-specific Codex configuration from the Nexus API
+// and writes ~/.codex/config.toml. It is non-blocking and best-effort — all
+// failures are silent. The profile is required to look up the cached monitoring
+// token and the active org.
+func syncCodexConfig(profile string) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+
+	// Check if we synced recently (skip if < 5 min ago)
+	cachePath := filepath.Join(home, ".claude-code-session", "codex-sync-ts")
+	if data, err := os.ReadFile(cachePath); err == nil {
+		if ts, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64); err == nil {
+			if time.Now().Unix()-ts < 300 {
+				return // Synced less than 5 min ago
+			}
+		}
+	}
+
+	// Codex sync is org-specific — bail out if no active org is selected
+	org := readActiveOrg(profile)
+	if org == "" {
+		return
+	}
+
+	// Retrieve the cached monitoring token for the Authorization header
+	token, err := storage.GetMonitoringToken(profile, "")
+	if err != nil || token == "" {
+		return
+	}
+
+	// Fetch codex config from Nexus
+	apiBase := nexus.ResolveBase("")
+	endpoint := apiBase + "/api/orgs/" + org + "/codex-config"
+	client := &http.Client{Timeout: 3 * time.Second}
+
+	var result struct {
+		CodexAPIKey string `json:"codex_api_key"`
+	}
+	if err := getJSON(client, endpoint, token, &result); err != nil {
+		return
+	}
+
+	if result.CodexAPIKey == "" {
+		return
+	}
+
+	// Write ~/.codex/config.toml
+	codexDir := filepath.Join(home, ".codex")
+	if err := os.MkdirAll(codexDir, 0700); err != nil {
+		return
+	}
+	codexConfig := `model_provider = "amazon-bedrock"
+`
+	if err := os.WriteFile(filepath.Join(codexDir, "config.toml"), []byte(codexConfig), 0600); err != nil {
+		return
+	}
+
+	// Append AWS_BEARER_TOKEN_BEDROCK export to the user's shell profile
+	exportLine := "export AWS_BEARER_TOKEN_BEDROCK=" + result.CodexAPIKey
+	shellProfile := resolveShellProfile(home)
+	if shellProfile != "" {
+		appendIfAbsent(shellProfile, exportLine)
+	}
+
+	// Update sync timestamp
+	os.MkdirAll(filepath.Dir(cachePath), 0700)
+	os.WriteFile(cachePath, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0600)
+}
+
+// resolveShellProfile returns the path of the user's shell init file, preferring
+// ~/.zshrc on macOS (where zsh is the default shell since Catalina), then
+// ~/.bashrc, and finally ~/.profile as a universal fallback.
+func resolveShellProfile(home string) string {
+	// On macOS prefer .zshrc; check existence for every candidate so we
+	// do not create a file that was never part of the user's setup.
+	var candidates []string
+	if runtime.GOOS == "darwin" {
+		candidates = []string{
+			filepath.Join(home, ".zshrc"),
+			filepath.Join(home, ".bashrc"),
+			filepath.Join(home, ".profile"),
+		}
+	} else {
+		candidates = []string{
+			filepath.Join(home, ".bashrc"),
+			filepath.Join(home, ".zshrc"),
+			filepath.Join(home, ".profile"),
+		}
+	}
+	for _, p := range candidates {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
+// appendIfAbsent appends line to the file at path only when the file does not
+// already contain an identical line. This prevents duplicate entries when
+// syncCodexConfig runs on successive credential-process invocations.
+func appendIfAbsent(path, line string) {
+	data, _ := os.ReadFile(path)
+	for _, existing := range strings.Split(string(data), "\n") {
+		if strings.TrimSpace(existing) == strings.TrimSpace(line) {
+			return // already present
+		}
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	// Ensure we start on a fresh line
+	if len(data) > 0 && data[len(data)-1] != '\n' {
+		_, _ = f.WriteString("\n")
+	}
+	_, _ = f.WriteString(line + "\n")
 }
 
 func syncMcpServers() {

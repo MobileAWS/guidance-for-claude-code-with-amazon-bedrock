@@ -296,6 +296,10 @@ class PackageCommand(Command):
         console.print("[cyan]Creating Claude Code settings...[/cyan]")
         self._create_claude_settings(output_dir, profile, include_coauthored_by, profile_name, otel_resource_attributes)
 
+        # Write codex-config.json if org_config supplies codex settings
+        org_config = getattr(profile, "org_config", None) or {}
+        self._write_codex_config(output_dir, org_config)
+
         # Generate CoWork 3P MDM configuration if enabled
         if profile.cowork_3p_enabled:
             console.print("\n[cyan]Generating CoWork 3P MDM configuration...[/cyan]")
@@ -318,6 +322,8 @@ class PackageCommand(Command):
             console.print("  • install.bat - Installation script for Windows")
             console.print("  • ccwb-install.ps1 - PowerShell installer (called by install.bat)")
         console.print("  • README.md - Installation instructions")
+        if (output_dir / "codex-config.json").exists():
+            console.print("  • codex-config.json - Codex integration configuration")
         if profile.monitoring_enabled and (output_dir / "claude-settings" / "settings.json").exists():
             console.print("  • claude-settings/settings.json - Claude Code telemetry settings")
             for platform_name, otel_helper_path in built_otel_helpers:
@@ -566,6 +572,10 @@ class PackageCommand(Command):
         console.print("[cyan]Generating Claude Code settings...[/cyan]")
         self._create_claude_settings(output_dir, profile, include_coauthored_by, profile_name, otel_resource_attributes)
 
+        # Write codex-config.json if org_config supplies codex settings
+        org_config = getattr(profile, "org_config", None) or {}
+        self._write_codex_config(output_dir, org_config)
+
         # Summary
         console.print("\n[green]✓ Installers regenerated successfully![/green]")
         console.print(f"\nOutput directory: [cyan]{output_dir}[/cyan]")
@@ -576,6 +586,8 @@ class PackageCommand(Command):
             console.print("  • install.bat")
             console.print("  • ccwb-install.ps1")
         console.print("  • README.md")
+        if (output_dir / "codex-config.json").exists():
+            console.print("  • codex-config.json")
         if (output_dir / "claude-settings" / "settings.json").exists():
             console.print("  • claude-settings/settings.json")
         console.print(f"\nBinaries copied from: [dim]{source_dir}[/dim]")
@@ -1170,6 +1182,31 @@ else
 fi
 rm -f /tmp/claude-code-launcher
 
+# Optional: Codex (OpenAI Codex CLI) configuration
+if [ -f "codex-config.json" ]; then
+    echo
+    echo "Configuring Codex..."
+    CODEX_ENABLED=$(python3 -c "import json; d=json.load(open('codex-config.json')); print(str(d.get('codex_enabled', False)).lower())" 2>/dev/null || echo "false")
+    CODEX_API_KEY=$(python3 -c "import json; d=json.load(open('codex-config.json')); print(d.get('codex_api_key', ''))" 2>/dev/null || echo "")
+    if [ "$CODEX_ENABLED" = "true" ] && [ -n "$CODEX_API_KEY" ]; then
+        mkdir -p ~/.codex
+        echo 'model_provider = "amazon-bedrock"' > ~/.codex/config.toml
+        echo "  ✓ Created ~/.codex/config.toml"
+        # Set AWS_BEARER_TOKEN_BEDROCK in shell profile
+        SHELL_PROFILE=""
+        if [ -f ~/.zshrc ]; then SHELL_PROFILE=~/.zshrc
+        elif [ -f ~/.bash_profile ]; then SHELL_PROFILE=~/.bash_profile
+        elif [ -f ~/.bashrc ]; then SHELL_PROFILE=~/.bashrc
+        else SHELL_PROFILE=~/.profile; fi
+        # Remove previous entry if any
+        sed -i.bak '/# AllCode Nexus Codex/d' "$SHELL_PROFILE" 2>/dev/null
+        sed -i.bak '/AWS_BEARER_TOKEN_BEDROCK/d' "$SHELL_PROFILE" 2>/dev/null
+        rm -f "${{SHELL_PROFILE}}.bak"
+        echo "export AWS_BEARER_TOKEN_BEDROCK=\"$CODEX_API_KEY\" # AllCode Nexus Codex" >> "$SHELL_PROFILE"
+        echo "  ✓ Set AWS_BEARER_TOKEN_BEDROCK in $SHELL_PROFILE"
+    fi
+fi
+
 echo
 echo "======================================"
 echo "✓ Installation complete!"
@@ -1346,6 +1383,20 @@ if %errorlevel% neq 0 (
     echo ERROR: Failed to configure AWS profiles
     pause
     exit /b 1
+)
+
+IF EXIST "codex-config.json" (
+    echo.
+    echo Configuring Codex...
+    FOR /F %%i IN ('powershell -NoProfile -Command "(Get-Content codex-config.json | ConvertFrom-Json).codex_enabled"') DO SET CODEX_ENABLED=%%i
+    FOR /F %%i IN ('powershell -NoProfile -Command "(Get-Content codex-config.json | ConvertFrom-Json).codex_api_key"') DO SET CODEX_API_KEY=%%i
+    IF /I "%CODEX_ENABLED%"=="True" IF NOT "%CODEX_API_KEY%"=="" (
+        IF NOT EXIST "%USERPROFILE%\.codex" mkdir "%USERPROFILE%\.codex"
+        echo model_provider = "amazon-bedrock" > "%USERPROFILE%\.codex\config.toml"
+        echo   OK Created %USERPROFILE%\.codex\config.toml
+        powershell -NoProfile -Command "[System.Environment]::SetEnvironmentVariable('AWS_BEARER_TOKEN_BEDROCK', '%CODEX_API_KEY%', 'User')"
+        echo   OK Set AWS_BEARER_TOKEN_BEDROCK in user environment
+    )
 )
 
 echo.
@@ -1747,6 +1798,35 @@ Available metrics include:
 
         except Exception as e:
             console.print(f"[yellow]Warning: Could not create Claude Code settings: {e}[/yellow]")
+
+    def _write_codex_config(self, output_dir: Path, org_config: dict) -> None:
+        """Write codex-config.json to the output directory when Codex integration is enabled.
+
+        The file is consumed at install time by both install.sh and install.bat.
+        It is only written when *both* of the following conditions hold:
+
+          - ``org_config['codex_enabled']`` is truthy
+          - ``org_config['codex_api_key']`` is a non-empty string
+
+        Args:
+            output_dir:  Destination directory (the timestamped package folder).
+            org_config:  Mapping that may contain ``codex_enabled`` and ``codex_api_key``.
+                         Typically sourced from ``profile.org_config`` or the Nexus API response.
+        """
+        codex_enabled = bool(org_config.get("codex_enabled", False))
+        codex_api_key = str(org_config.get("codex_api_key", "") or "").strip()
+
+        if not (codex_enabled and codex_api_key):
+            return
+
+        codex_config = {
+            "codex_enabled": True,
+            "codex_api_key": codex_api_key,
+        }
+        codex_config_path = output_dir / "codex-config.json"
+        with open(codex_config_path, "w", encoding="utf-8") as fh:
+            json.dump(codex_config, fh, indent=2)
+        self.line("  <info>Created codex-config.json (Codex integration enabled)</info>")
 
     def _generate_cowork_3p_mdm_config(
         self,

@@ -752,6 +752,15 @@ class PackageCommand(Command):
         # Determine which binaries were built
         platforms_built = [platform for platform, _ in built_executables]
 
+        # Codex integration template variables
+        codex_enabled = getattr(profile, "codex_enabled", False)
+        codex_org_id = getattr(profile, "codex_org_id", None) or ""
+        codex_config_url = (
+            f"https://claude-code-auth-distribution-916587687563.s3.amazonaws.com/cowork/{codex_org_id}/codex-config.json"
+            if codex_org_id
+            else ""
+        )
+
         installer_content = f"""#!/bin/bash
 # Claude Code Authentication Installer
 # Organization: {profile.provider_domain}
@@ -1113,6 +1122,75 @@ else
     echo "✓ Claude Code CLI already installed"
 fi
 
+# ======================================
+# Codex Setup (Amazon Bedrock)
+# ======================================
+CODEX_ENABLED="{str(codex_enabled).lower()}"
+CODEX_CONFIG_URL="{codex_config_url}"
+
+if [ "$CODEX_ENABLED" = "true" ] && [ -n "$CODEX_CONFIG_URL" ]; then
+    echo
+    echo "Setting up Codex (Amazon Bedrock integration)..."
+
+    # Fetch org Codex config from S3
+    CODEX_CONFIG_JSON=""
+    if command -v curl &> /dev/null; then
+        CODEX_CONFIG_JSON=$(curl -sf "$CODEX_CONFIG_URL" 2>/dev/null || echo "")
+    elif command -v wget &> /dev/null; then
+        CODEX_CONFIG_JSON=$(wget -qO- "$CODEX_CONFIG_URL" 2>/dev/null || echo "")
+    fi
+
+    if [ -z "$CODEX_CONFIG_JSON" ]; then
+        echo "⚠️  Could not fetch Codex config from S3 — skipping Codex setup."
+    else
+        # Extract fields using Python (already validated above)
+        CODEX_ORG_ENABLED=$($PYTHON -c "import json,sys; d=json.loads(sys.stdin.read()); print(str(d.get('codex_enabled', False)).lower())" <<< "$CODEX_CONFIG_JSON" 2>/dev/null || echo "false")
+        MANTLE_API_KEY=$($PYTHON -c "import json,sys; d=json.loads(sys.stdin.read()); print(d.get('mantle_api_key', ''))" <<< "$CODEX_CONFIG_JSON" 2>/dev/null || echo "")
+
+        if [ "$CODEX_ORG_ENABLED" = "true" ] && [ -n "$MANTLE_API_KEY" ]; then
+            # Create ~/.codex directory
+            mkdir -p ~/.codex
+
+            # Write ~/.codex/config.toml
+            cat > ~/.codex/config.toml << 'CODEX_TOML_EOF'
+model_provider = "amazon-bedrock"
+region = "us-east-2"
+CODEX_TOML_EOF
+            echo "✓ Written ~/.codex/config.toml"
+
+            # Persist AWS_BEARER_TOKEN_BEDROCK in shell profile
+            BEARER_LINE="export AWS_BEARER_TOKEN_BEDROCK=\"$MANTLE_API_KEY\""
+
+            # Determine the active shell profile file(s) to update
+            SHELL_PROFILES=()
+            if [ -f ~/.zshrc ]; then
+                SHELL_PROFILES+=(~/.zshrc)
+            fi
+            if [ -f ~/.bashrc ]; then
+                SHELL_PROFILES+=(~/.bashrc)
+            fi
+            # Fall back: create ~/.zshrc if no profile exists
+            if [ ${{#SHELL_PROFILES[@]}} -eq 0 ]; then
+                SHELL_PROFILES+=(~/.zshrc)
+            fi
+
+            for SHELL_PROFILE in "${{SHELL_PROFILES[@]}}"; do
+                # Remove any previous AWS_BEARER_TOKEN_BEDROCK export line
+                sed -i.bak '/^export AWS_BEARER_TOKEN_BEDROCK=/d' "$SHELL_PROFILE" 2>/dev/null || true
+                rm -f "${{SHELL_PROFILE}}.bak"
+                # Append the new value
+                echo "$BEARER_LINE" >> "$SHELL_PROFILE"
+                echo "✓ Set AWS_BEARER_TOKEN_BEDROCK in $SHELL_PROFILE"
+            done
+
+            echo "✓ Codex configured for Amazon Bedrock"
+            echo "  Reload your shell or run: source ~/.zshrc  (or source ~/.bashrc)"
+        else
+            echo "ℹ  Codex not enabled for this organisation — skipping Codex setup."
+        fi
+    fi
+fi
+
 echo
 echo "======================================"
 echo "Installation complete!"
@@ -1252,6 +1330,18 @@ fi
     def _create_windows_installer(self, output_dir: Path, profile) -> Path:
         """Create Windows batch installer script."""
 
+        # Codex integration template variables
+        codex_enabled = getattr(profile, "codex_enabled", False)
+        codex_org_id = getattr(profile, "codex_org_id", None) or ""
+        codex_config_url = (
+            f"https://claude-code-auth-distribution-916587687563.s3.amazonaws.com/cowork/{codex_org_id}/codex-config.json"
+            if codex_org_id
+            else ""
+        )
+        # Render as BAT/PS1-compatible literals
+        bat_codex_enabled = "1" if codex_enabled else "0"
+        bat_codex_url = codex_config_url
+
         installer_content = f"""@echo off
 SETLOCAL ENABLEDELAYEDEXPANSION
 cd /d "%~dp0"
@@ -1371,6 +1461,44 @@ if %errorlevel% neq 0 (
     echo OK Claude Code CLI already installed
 )
 
+REM ======================================
+REM Codex Setup (Amazon Bedrock)
+REM ======================================
+set CODEX_ENABLED={bat_codex_enabled}
+set CODEX_CONFIG_URL={bat_codex_url}
+
+if "%CODEX_ENABLED%"=="1" (
+    if not "%CODEX_CONFIG_URL%"=="" (
+        echo.
+        echo Setting up Codex (Amazon Bedrock integration)...
+
+        REM Fetch org Codex config from S3 via PowerShell
+        for /f "delims=" %%R in ('powershell -NoProfile -Command "try {{ $r = Invoke-RestMethod -Uri '%CODEX_CONFIG_URL%' -UseBasicParsing -ErrorAction Stop; $r | ConvertTo-Json -Compress }} catch {{ '' }}" 2^>nul') do set CODEX_JSON=%%R
+
+        if "%CODEX_JSON%"=="" (
+            echo WARNING: Could not fetch Codex config from S3 -- skipping Codex setup.
+        ) else (
+            REM Extract codex_enabled and mantle_api_key from JSON
+            for /f "delims=" %%E in ('powershell -NoProfile -Command "($env:CODEX_JSON | ConvertFrom-Json).codex_enabled" 2^>nul') do set CODEX_ORG_ENABLED=%%E
+            for /f "delims=" %%K in ('powershell -NoProfile -Command "($env:CODEX_JSON | ConvertFrom-Json).mantle_api_key" 2^>nul') do set MANTLE_API_KEY=%%K
+
+            REM Use PowerShell to avoid CMD variable-expansion issues with the JSON values
+            powershell -NoProfile -Command ^
+                "$json = $env:CODEX_JSON | ConvertFrom-Json; " ^
+                "if ($json.codex_enabled -and $json.mantle_api_key) {{ " ^
+                "  $codexDir = Join-Path $env:USERPROFILE '.codex'; " ^
+                "  if (-not (Test-Path $codexDir)) {{ New-Item -ItemType Directory -Path $codexDir | Out-Null }}; " ^
+                "  $toml = \"model_provider = `"amazon-bedrock`"`r`nregion = `"us-east-2`"\"; " ^
+                "  Set-Content -Path (Join-Path $codexDir 'config.toml') -Value $toml -Encoding UTF8; " ^
+                "  Write-Host '  OK Written %USERPROFILE%\\.codex\\config.toml'; " ^
+                "  [Environment]::SetEnvironmentVariable('AWS_BEARER_TOKEN_BEDROCK', $json.mantle_api_key, 'User'); " ^
+                "  Write-Host '  OK Set AWS_BEARER_TOKEN_BEDROCK as user environment variable'; " ^
+                "  Write-Host '  INFO Restart your terminal or sign out/in for the variable to take effect' " ^
+                "}} else {{ Write-Host '  INFO Codex not enabled for this organisation -- skipping Codex setup.' }}"
+        )
+    )
+)
+
 echo.
 echo ======================================
 echo Installation complete!
@@ -1400,8 +1528,205 @@ pause
         with open(installer_path, "w", encoding="utf-8") as f:
             f.write(installer_content)
 
+        # Generate companion ccwb-install.ps1 (pure PowerShell; called by install.bat
+        # and also usable directly from a PowerShell prompt).
+        self._create_powershell_installer(output_dir, profile, codex_enabled, codex_config_url)
+
         # Note: chmod not needed on Windows batch files
         return installer_path
+
+    def _create_powershell_installer(self, output_dir: Path, profile, codex_enabled: bool, codex_config_url: str) -> Path:
+        """Create a companion ccwb-install.ps1 PowerShell installer.
+
+        This script mirrors install.bat but uses idiomatic PowerShell.  It is
+        called by install.bat automatically and can also be run directly from a
+        PowerShell prompt for a richer experience.
+        """
+        ps1_codex_enabled = "$true" if codex_enabled else "$false"
+
+        ps1_content = f"""# ccwb-install.ps1 — Claude Code with Bedrock installer (Windows / PowerShell)
+# Organisation : {profile.provider_domain}
+# Generated    : {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+#
+# Usage: .\\ccwb-install.ps1
+
+[CmdletBinding()]
+param()
+
+$ErrorActionPreference = 'Stop'
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+Set-Location $ScriptDir
+
+Write-Host '======================================'
+Write-Host 'Claude Code Authentication Installer'
+Write-Host '======================================'
+Write-Host
+Write-Host 'Organisation: {profile.provider_domain}'
+Write-Host
+
+# ---------------------------------------------------------------------------
+# Prerequisites
+# ---------------------------------------------------------------------------
+Write-Host 'Checking prerequisites...'
+if (-not (Get-Command aws -ErrorAction SilentlyContinue)) {{
+    Write-Host '  INFO AWS CLI not found -- not required. Credential-process handles auth.'
+}} else {{
+    Write-Host '  OK   AWS CLI found (optional)'
+}}
+
+if (-not (Test-Path 'config.json')) {{
+    Write-Error 'config.json not found. Run from inside the extracted package folder.'
+    exit 1
+}}
+
+# ---------------------------------------------------------------------------
+# Install credential-process binary
+# ---------------------------------------------------------------------------
+Write-Host
+Write-Host 'Installing authentication tools...'
+$toolsDir = Join-Path $env:USERPROFILE 'claude-code-with-bedrock'
+if (-not (Test-Path $toolsDir)) {{ New-Item -ItemType Directory -Path $toolsDir | Out-Null }}
+
+if (-not (Test-Path 'credential-process-windows.exe')) {{
+    Write-Error 'credential-process-windows.exe not found in package folder.'
+    exit 1
+}}
+Copy-Item 'credential-process-windows.exe' (Join-Path $toolsDir 'credential-process.exe') -Force
+Write-Host '  OK   credential-process.exe installed'
+
+if (Test-Path 'otel-helper-windows.exe') {{
+    Copy-Item 'otel-helper-windows.exe' (Join-Path $toolsDir 'otel-helper.exe') -Force
+    Write-Host '  OK   otel-helper.exe installed'
+}}
+
+Copy-Item 'config.json' $toolsDir -Force
+Write-Host '  OK   config.json copied'
+
+# ---------------------------------------------------------------------------
+# Claude Code settings
+# ---------------------------------------------------------------------------
+if (Test-Path 'claude-settings\\settings.json') {{
+    $claudeDir = Join-Path $env:USERPROFILE '.claude'
+    if (-not (Test-Path $claudeDir)) {{ New-Item -ItemType Directory -Path $claudeDir | Out-Null }}
+
+    $skipSettings = $false
+    if (Test-Path (Join-Path $claudeDir 'settings.json')) {{
+        $answer = Read-Host 'Existing Claude Code settings found. Overwrite? (y/N)'
+        if ($answer -ne 'y' -and $answer -ne 'Y') {{ $skipSettings = $true }}
+    }}
+
+    if (-not $skipSettings) {{
+        $otelPath  = (Join-Path $toolsDir 'otel-helper.exe')  -replace '\\\\', '/'
+        $credPath  = (Join-Path $toolsDir 'credential-process.exe') -replace '\\\\', '/'
+        (Get-Content 'claude-settings\\settings.json') `
+            -replace '__OTEL_HELPER_PATH__',       $otelPath `
+            -replace '__CREDENTIAL_PROCESS_PATH__', $credPath `
+            | Set-Content (Join-Path $claudeDir 'settings.json')
+        Write-Host '  OK   Claude Code settings written'
+    }}
+}}
+
+# ---------------------------------------------------------------------------
+# AWS profile configuration
+# ---------------------------------------------------------------------------
+Write-Host
+Write-Host 'Configuring AWS profiles...'
+
+$awsDir = Join-Path $env:USERPROFILE '.aws'
+if (-not (Test-Path $awsDir)) {{ New-Item -ItemType Directory -Path $awsDir | Out-Null }}
+
+$nl          = [char]13 + [char]10
+$cfg         = Get-Content 'config.json' | ConvertFrom-Json
+$awsConfig   = Join-Path $awsDir 'config'
+$credProcess = Join-Path $toolsDir 'credential-process.exe'
+$existing    = if (Test-Path $awsConfig) {{ Get-Content $awsConfig -Raw }} else {{ '' }}
+
+foreach ($p in $cfg.PSObject.Properties.Name) {{
+    $region  = $cfg.$p.aws_region
+    if (-not $region) {{ $region = '{profile.aws_region}' }}
+    $pattern = '(?ms)^\\[profile ' + [regex]::Escape($p) + '\\].*?(?=^\\[|\\Z)'
+    $existing = [regex]::Replace($existing, $pattern, '')
+    $stanza   = '[profile ' + $p + ']' + $nl + 'credential_process = ' + $credProcess + ' --profile ' + $p + $nl + 'region = ' + $region + $nl
+    $existing = $existing.TrimEnd() + $nl + $nl + $stanza
+    Write-Host ('  OK   Configured AWS profile: ' + $p)
+}}
+Set-Content -Path $awsConfig -Value $existing.TrimStart() -NoNewline -Encoding ASCII
+
+# ---------------------------------------------------------------------------
+# Claude Code CLI
+# ---------------------------------------------------------------------------
+Write-Host
+if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {{
+    Write-Host 'Installing Claude Code CLI...'
+    if (Get-Command npm -ErrorAction SilentlyContinue) {{
+        npm install -g '@anthropic-ai/claude-code'
+        Write-Host '  OK   Claude Code CLI installed'
+    }} else {{
+        Write-Host '  WARN npm not found. Install Node.js from https://nodejs.org then run:'
+        Write-Host '       npm install -g @anthropic-ai/claude-code'
+    }}
+}} else {{
+    Write-Host '  OK   Claude Code CLI already installed'
+}}
+
+# ---------------------------------------------------------------------------
+# Codex setup (Amazon Bedrock)
+# ---------------------------------------------------------------------------
+$codexEnabled   = {ps1_codex_enabled}
+$codexConfigUrl = '{codex_config_url}'
+
+if ($codexEnabled -and $codexConfigUrl -ne '') {{
+    Write-Host
+    Write-Host 'Setting up Codex (Amazon Bedrock integration)...'
+
+    try {{
+        $codexJson = Invoke-RestMethod -Uri $codexConfigUrl -UseBasicParsing -ErrorAction Stop
+    }} catch {{
+        Write-Host '  WARN Could not fetch Codex config from S3 -- skipping Codex setup.'
+        $codexJson = $null
+    }}
+
+    if ($codexJson -and $codexJson.codex_enabled -and $codexJson.mantle_api_key) {{
+        # Create ~/.codex directory
+        $codexDir = Join-Path $env:USERPROFILE '.codex'
+        if (-not (Test-Path $codexDir)) {{ New-Item -ItemType Directory -Path $codexDir | Out-Null }}
+
+        # Write ~/.codex/config.toml
+        $toml = "model_provider = `"amazon-bedrock`"`r`nregion = `"us-east-2`""
+        Set-Content -Path (Join-Path $codexDir 'config.toml') -Value $toml -Encoding UTF8
+        Write-Host '  OK   Written $env:USERPROFILE\\.codex\\config.toml'
+
+        # Set AWS_BEARER_TOKEN_BEDROCK as a persistent user-scoped environment variable
+        [Environment]::SetEnvironmentVariable('AWS_BEARER_TOKEN_BEDROCK', $codexJson.mantle_api_key, 'User')
+        Write-Host '  OK   Set AWS_BEARER_TOKEN_BEDROCK (user environment variable)'
+        Write-Host '  INFO Restart your terminal or re-open PowerShell for the variable to take effect.'
+    }} elseif ($codexJson) {{
+        Write-Host '  INFO Codex not enabled for this organisation -- skipping Codex setup.'
+    }}
+}}
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+Write-Host
+Write-Host '======================================'
+Write-Host 'Installation complete!'
+Write-Host '======================================'
+Write-Host
+Write-Host 'Available profiles:'
+foreach ($p in $cfg.PSObject.Properties.Name) {{ Write-Host ('  - ' + $p) }}
+Write-Host
+Write-Host 'To use Claude Code:'
+Write-Host '  $env:AWS_PROFILE = "<profile-name>"'
+Write-Host '  aws sts get-caller-identity'
+Write-Host
+Write-Host 'Note: Authentication will automatically open your browser when needed.'
+"""
+
+        ps1_path = output_dir / "ccwb-install.ps1"
+        with open(ps1_path, "w", encoding="utf-8", newline="\r\n") as f:
+            f.write(ps1_content)
+        return ps1_path
 
     def _create_documentation(self, output_dir: Path, profile, timestamp: str):
         """Create user documentation."""
@@ -1566,6 +1891,78 @@ Available metrics include:
             readme_content += analytics_section
 
         readme_content += "\n"
+
+        # Add Codex section if enabled
+        codex_enabled = getattr(profile, "codex_enabled", False)
+        codex_org_id = getattr(profile, "codex_org_id", None) or ""
+        if codex_enabled and codex_org_id:
+            codex_config_url = (
+                f"https://claude-code-auth-distribution-916587687563.s3.amazonaws.com"
+                f"/cowork/{codex_org_id}/codex-config.json"
+            )
+            codex_section = f"""
+## Codex (OpenAI CLI) — Amazon Bedrock Integration
+
+This package also configures **OpenAI Codex CLI** to use **Amazon Bedrock** as its
+model provider, so you get the same enterprise-grade authentication for both
+Claude Code and Codex in a single install.
+
+### What the installer does
+
+| Step | macOS / Linux | Windows |
+|------|---------------|---------|
+| Writes config | `~/.codex/config.toml` | `%USERPROFILE%\\.codex\\config.toml` |
+| Sets env var | Appends `export AWS_BEARER_TOKEN_BEDROCK=…` to `~/.zshrc` / `~/.bashrc` | `[Environment]::SetEnvironmentVariable` (user scope) |
+
+The generated `~/.codex/config.toml` contains:
+```toml
+model_provider = "amazon-bedrock"
+region = "us-east-2"
+```
+
+### What `AWS_BEARER_TOKEN_BEDROCK` is
+
+`AWS_BEARER_TOKEN_BEDROCK` is a **Mantle API key** issued by your organisation's
+Nexus portal. Codex presents this key as a bearer token when calling the Amazon
+Bedrock endpoint, replacing the usual `OPENAI_API_KEY` flow:
+
+```
+Codex CLI  →  AWS_BEARER_TOKEN_BEDROCK  →  Amazon Bedrock (Bedrock provider)
+```
+
+The key is fetched at install time from your org's configuration at:
+```
+{codex_config_url}
+```
+
+If the org-level `codex_enabled` flag is `false` or the key cannot be retrieved,
+the Codex setup block is silently skipped — Claude Code setup is unaffected.
+
+### Using Codex after installation
+
+```bash
+# macOS / Linux — reload shell profile first if you just ran the installer
+source ~/.zshrc   # or source ~/.bashrc
+
+# Verify the variable is set
+echo $AWS_BEARER_TOKEN_BEDROCK
+
+# Run Codex (it auto-reads ~/.codex/config.toml and AWS_BEARER_TOKEN_BEDROCK)
+codex "Explain this function"
+```
+
+```powershell
+# Windows — open a new PowerShell window after installation, then:
+$env:AWS_BEARER_TOKEN_BEDROCK   # should show your Mantle key
+codex "Explain this function"
+```
+
+> **Note:** Codex CLI is not installed by this package. Install it separately:
+> ```bash
+> npm install -g @openai/codex
+> ```
+"""
+            readme_content += codex_section
 
         with open(output_dir / "README.md", "w", encoding="utf-8") as f:
             f.write(readme_content)

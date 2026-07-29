@@ -112,6 +112,12 @@ class Profile:
 
     # Claude Cowork 3P MDM configuration
     cowork_3p_enabled: bool = True  # Generate CoWork 3P MDM configs during packaging
+
+    # Codex (OpenAI CLI) — Amazon Bedrock integration
+    # When enabled, install.sh / install.bat write ~/.codex/config.toml and export
+    # AWS_BEARER_TOKEN_BEDROCK=<mantle_api_key> so Codex can reach Bedrock.
+    codex_enabled: bool = False  # Write ~/.codex/config.toml and set AWS_BEARER_TOKEN_BEDROCK
+    codex_org_id: str | None = None  # Nexus org ID used to fetch codex-config.json from S3
     cowork_3p_extra_keys: dict = field(default_factory=dict)  # Custom MDM keys merged into CoWork 3P output
     cowork_credential_mode: str = "helper"  # "helper" (inferenceCredentialHelper) or "profile" (inferenceBedrockProfile)
     cowork_credential_helper_ttl_sec: int = 3500  # inferenceCredentialHelperTtlSec (refresh before 1h STS expiry)

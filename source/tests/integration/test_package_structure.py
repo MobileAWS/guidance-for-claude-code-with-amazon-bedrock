@@ -476,3 +476,233 @@ class TestInstallerScripts:
             content = bat_path.read_text(encoding="utf-8")
             assert "credential-process" in content
             assert r"\.claude" in content or ".claude" in content
+
+
+class TestCodexInstaller:
+    """Validate Codex setup blocks in install.sh and install.bat / ccwb-install.ps1."""
+
+    @pytest.fixture
+    def codex_profile(self, base_profile):
+        """Profile with Codex enabled."""
+        base_profile.codex_enabled = True
+        base_profile.codex_org_id = "acme"
+        return base_profile
+
+    def test_install_sh_contains_codex_block_when_enabled(self, codex_profile):
+        """install.sh must include the Codex setup block when codex_enabled=True."""
+        command = PackageCommand()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            installer_path = command._create_installer(
+                output_dir,
+                codex_profile,
+                [("macos-arm64", Path("credential-process-macos-arm64"))],
+                [],
+            )
+
+            content = installer_path.read_text(encoding="utf-8")
+
+            # Codex section header
+            assert "Codex Setup (Amazon Bedrock)" in content
+            # S3 URL for fetching codex-config.json
+            assert "codex-config.json" in content
+            assert "acme" in content  # org id embedded in URL
+            # ~/.codex directory creation
+            assert "~/.codex" in content
+            # config.toml content
+            assert 'model_provider = "amazon-bedrock"' in content
+            assert 'region = "us-east-2"' in content
+            # env var export
+            assert "AWS_BEARER_TOKEN_BEDROCK" in content
+            # shell profile patching (.zshrc / .bashrc)
+            assert ".zshrc" in content or ".bashrc" in content
+
+    def test_install_sh_no_codex_block_when_disabled(self, base_profile):
+        """install.sh must NOT include the Codex setup block when codex_enabled=False."""
+        base_profile.codex_enabled = False
+        base_profile.codex_org_id = None
+        command = PackageCommand()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            installer_path = command._create_installer(
+                output_dir,
+                base_profile,
+                [("macos-arm64", Path("credential-process-macos-arm64"))],
+                [],
+            )
+
+            content = installer_path.read_text(encoding="utf-8")
+
+            # CODEX_ENABLED guard must be set to 'false' (not 'true')
+            assert 'CODEX_ENABLED="false"' in content
+            assert 'CODEX_ENABLED="true"' not in content
+
+    def test_install_sh_codex_uses_correct_s3_url(self, codex_profile):
+        """The Codex S3 URL in install.sh must match the expected pattern."""
+        command = PackageCommand()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            installer_path = command._create_installer(
+                output_dir,
+                codex_profile,
+                [("macos-arm64", Path("credential-process-macos-arm64"))],
+                [],
+            )
+
+            content = installer_path.read_text(encoding="utf-8")
+
+            expected_url = (
+                "https://claude-code-auth-distribution-916587687563.s3.amazonaws.com"
+                "/cowork/acme/codex-config.json"
+            )
+            assert expected_url in content
+
+    def test_install_bat_contains_codex_block_when_enabled(self, codex_profile):
+        """install.bat must include the Codex setup block when codex_enabled=True."""
+        command = PackageCommand()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            command._create_installer(
+                output_dir,
+                codex_profile,
+                [
+                    ("macos-arm64", Path("credential-process-macos-arm64")),
+                    ("windows", Path("credential-process-windows.exe")),
+                ],
+                [],
+            )
+
+            bat_path = output_dir / "install.bat"
+            assert bat_path.exists(), "install.bat not generated"
+            content = bat_path.read_text(encoding="utf-8")
+
+            assert "Codex Setup (Amazon Bedrock)" in content
+            assert "CODEX_ENABLED=1" in content
+            assert "codex-config.json" in content
+            assert ".codex" in content
+            assert "config.toml" in content
+            assert "AWS_BEARER_TOKEN_BEDROCK" in content
+            assert "SetEnvironmentVariable" in content
+
+    def test_ccwb_install_ps1_generated_for_windows(self, codex_profile):
+        """ccwb-install.ps1 must be generated when Windows binaries are present."""
+        command = PackageCommand()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            command._create_installer(
+                output_dir,
+                codex_profile,
+                [
+                    ("macos-arm64", Path("credential-process-macos-arm64")),
+                    ("windows", Path("credential-process-windows.exe")),
+                ],
+                [],
+            )
+
+            ps1_path = output_dir / "ccwb-install.ps1"
+            assert ps1_path.exists(), "ccwb-install.ps1 not generated"
+
+            content = ps1_path.read_text(encoding="utf-8")
+
+            # Codex section
+            assert "$codexEnabled" in content or "codexEnabled" in content.lower()
+            assert "$true" in content  # codex_enabled maps to $true
+            assert "AWS_BEARER_TOKEN_BEDROCK" in content
+            assert "SetEnvironmentVariable" in content
+            assert ".codex" in content
+            assert "config.toml" in content
+            assert "amazon-bedrock" in content
+            # URL
+            assert "codex-config.json" in content
+
+    def test_ccwb_install_ps1_codex_disabled_when_not_enabled(self, base_profile):
+        """ccwb-install.ps1 must set $codexEnabled=$false when codex_enabled is False."""
+        base_profile.codex_enabled = False
+        command = PackageCommand()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            command._create_installer(
+                output_dir,
+                base_profile,
+                [
+                    ("macos-arm64", Path("credential-process-macos-arm64")),
+                    ("windows", Path("credential-process-windows.exe")),
+                ],
+                [],
+            )
+
+            ps1_path = output_dir / "ccwb-install.ps1"
+            assert ps1_path.exists()
+            content = ps1_path.read_text(encoding="utf-8")
+
+            assert "$false" in content
+
+    def test_readme_contains_codex_section_when_enabled(self, codex_profile):
+        """README.md must contain a Codex section when codex_enabled=True."""
+        command = PackageCommand()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            command._create_documentation(output_dir, codex_profile, "2025-01-01-120000")
+
+            readme_path = output_dir / "README.md"
+            assert readme_path.exists()
+            content = readme_path.read_text(encoding="utf-8")
+
+            assert "Codex" in content
+            assert "Amazon Bedrock" in content
+            assert "AWS_BEARER_TOKEN_BEDROCK" in content
+            assert "config.toml" in content
+            assert "mantle_api_key" in content.lower() or "Mantle" in content
+
+    def test_readme_no_codex_section_when_disabled(self, base_profile):
+        """README.md must NOT contain a Codex section when codex_enabled=False."""
+        base_profile.codex_enabled = False
+        command = PackageCommand()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            command._create_documentation(output_dir, base_profile, "2025-01-01-120000")
+
+            readme_path = output_dir / "README.md"
+            content = readme_path.read_text(encoding="utf-8")
+
+            assert "AWS_BEARER_TOKEN_BEDROCK" not in content
+
+    def test_config_profile_has_codex_fields(self):
+        """Profile dataclass must expose codex_enabled and codex_org_id."""
+        from claude_code_with_bedrock.config import Profile
+
+        p = Profile(
+            name="Test",
+            provider_domain="test.okta.com",
+            client_id="abc",
+            credential_storage="keyring",
+            aws_region="us-east-1",
+            identity_pool_name="TestPool",
+            codex_enabled=True,
+            codex_org_id="my-org",
+        )
+        assert p.codex_enabled is True
+        assert p.codex_org_id == "my-org"
+
+    def test_config_profile_codex_defaults_false(self):
+        """codex_enabled must default to False for new profiles."""
+        from claude_code_with_bedrock.config import Profile
+
+        p = Profile(
+            name="Test",
+            provider_domain="test.okta.com",
+            client_id="abc",
+            credential_storage="keyring",
+            aws_region="us-east-1",
+            identity_pool_name="TestPool",
+        )
+        assert p.codex_enabled is False
+        assert p.codex_org_id is None

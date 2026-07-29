@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -15,6 +17,7 @@ import (
 	"ccwb-go/internal/config"
 	"ccwb-go/internal/federation"
 	"ccwb-go/internal/jwt"
+	"ccwb-go/internal/nexus"
 	"ccwb-go/internal/oidc"
 	"ccwb-go/internal/otel"
 	"ccwb-go/internal/portlock"
@@ -374,6 +377,9 @@ func (a *credentialApp) run() int {
 
 	// Sync MCP servers from Nexus (quick, with timeout)
 	syncMcpServers()
+
+	// Sync Codex config from Nexus (best-effort, non-blocking)
+	syncCodexConfig(a.profile)
 
 	// Check cache first
 	if cached := a.getCachedCredentials(); cached != nil {
@@ -785,6 +791,151 @@ func saveActiveOrg(profile, org string) {
 	dir := filepath.Join(home, ".claude-code-session")
 	os.MkdirAll(dir, 0700)
 	os.WriteFile(filepath.Join(dir, profile+"-active-org"), []byte(org), 0600)
+}
+
+// syncCodexConfig fetches the Codex configuration from the Nexus API
+// (GET /api/orgs/{org}/codex-config) and, when codex is enabled, writes
+// ~/.codex/config.toml and updates AWS_BEARER_TOKEN_BEDROCK in the user's
+// shell profile. It is rate-limited to once per 5 minutes via a timestamp
+// cache file and is entirely best-effort — all failures are silent.
+func syncCodexConfig(profile string) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+
+	// Rate-limit: skip if synced less than 5 minutes ago.
+	cachePath := filepath.Join(home, ".claude-code-session", "codex-sync-ts")
+	if data, err := os.ReadFile(cachePath); err == nil {
+		if ts, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64); err == nil {
+			if time.Now().Unix()-ts < 300 {
+				return // synced less than 5 min ago
+			}
+		}
+	}
+
+	// Resolve active org — skip if none is configured.
+	org := readActiveOrg(profile)
+	if org == "" {
+		return
+	}
+
+	// Build the API URL.
+	endpoint := nexus.DefaultAPIBase + "/api/orgs/" + org + "/codex-config"
+
+	// Fetch with a short timeout.
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(endpoint)
+	if err != nil || resp.StatusCode != 200 {
+		return
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil || len(body) < 2 {
+		return
+	}
+
+	// Parse the response payload.
+	var payload struct {
+		CodexEnabled bool   `json:"codex_enabled"`
+		CodexAPIKey  string `json:"codex_api_key"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return
+	}
+
+	// Only proceed when Codex is enabled and an API key is present.
+	if !payload.CodexEnabled || payload.CodexAPIKey == "" {
+		return
+	}
+
+	// Ensure ~/.codex/ exists.
+	codexDir := filepath.Join(home, ".codex")
+	if err := os.MkdirAll(codexDir, 0700); err != nil {
+		return
+	}
+
+	// Write ~/.codex/config.toml.
+	const configTOML = `model_provider = "amazon-bedrock"
+`
+	configPath := filepath.Join(codexDir, "config.toml")
+	if err := os.WriteFile(configPath, []byte(configTOML), 0600); err != nil {
+		return
+	}
+
+	// Update AWS_BEARER_TOKEN_BEDROCK in the user's shell profile.
+	updateShellProfileBedrockToken(home, payload.CodexAPIKey)
+
+	// Record the sync timestamp.
+	os.MkdirAll(filepath.Dir(cachePath), 0700)
+	os.WriteFile(cachePath, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0600)
+}
+
+// updateShellProfileBedrockToken sets (or idempotently replaces) the
+// AWS_BEARER_TOKEN_BEDROCK export line in ~/.zshrc (macOS / Linux zsh) or
+// ~/.bashrc (Linux bash). On Windows the function is a no-op — the caller
+// should use the system environment manager instead.
+func updateShellProfileBedrockToken(home, apiKey string) {
+	if runtime.GOOS == "windows" {
+		// Skip on Windows — environment variables should be managed via
+		// System Properties or a separate PowerShell helper.
+		return
+	}
+
+	// Pick the right shell profile file: prefer ~/.zshrc on macOS (default
+	// shell since Catalina), fall back to ~/.bashrc on Linux.
+	var profileFile string
+	switch runtime.GOOS {
+	case "darwin":
+		profileFile = filepath.Join(home, ".zshrc")
+	default: // linux and everything else
+		profileFile = filepath.Join(home, ".bashrc")
+	}
+
+	const exportPrefix = "export AWS_BEARER_TOKEN_BEDROCK="
+	newLine := exportPrefix + apiKey
+
+	// Read the existing file (an absent file is treated as empty).
+	existingData, _ := os.ReadFile(profileFile)
+	lines := []string{}
+	if len(existingData) > 0 {
+		scanner := bufio.NewScanner(strings.NewReader(string(existingData)))
+		for scanner.Scan() {
+			lines = append(lines, scanner.Text())
+		}
+	}
+
+	// Look for an existing AWS_BEARER_TOKEN_BEDROCK line and replace it
+	// in-place; otherwise append.
+	found := false
+	for i, line := range lines {
+		// Match both bare and exported forms:
+		//   AWS_BEARER_TOKEN_BEDROCK=...
+		//   export AWS_BEARER_TOKEN_BEDROCK=...
+		trimmed := strings.TrimPrefix(line, "export ")
+		if strings.HasPrefix(trimmed, "AWS_BEARER_TOKEN_BEDROCK=") {
+			lines[i] = newLine
+			found = true
+			break
+		}
+	}
+	if !found {
+		lines = append(lines, newLine)
+	}
+
+	// Reconstruct the file content, preserving a trailing newline.
+	var sb strings.Builder
+	for _, l := range lines {
+		sb.WriteString(l)
+		sb.WriteByte('\n')
+	}
+
+	// Write back atomically via a temp file + rename.
+	tmpPath := profileFile + ".codex-tmp"
+	if err := os.WriteFile(tmpPath, []byte(sb.String()), 0600); err != nil {
+		return
+	}
+	os.Rename(tmpPath, profileFile)
 }
 
 func syncMcpServers() {

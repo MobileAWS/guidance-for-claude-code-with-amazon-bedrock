@@ -372,8 +372,12 @@ func (a *credentialApp) run() int {
 		saveActiveOrg(a.profile, a.orgFlag)
 	}
 
-	// Sync MCP servers from Nexus (quick, with timeout)
+	// Resolve active org for per-org S3 paths
+	activeOrg := readActiveOrg(a.profile)
+
+	// Sync MCP servers and Codex config from S3 (quick, with timeout, best-effort)
 	syncMcpServers()
+	syncCodexConfig(activeOrg)
 
 	// Check cache first
 	if cached := a.getCachedCredentials(); cached != nil {
@@ -787,6 +791,27 @@ func saveActiveOrg(profile, org string) {
 	os.WriteFile(filepath.Join(dir, profile+"-active-org"), []byte(org), 0600)
 }
 
+// isSyncFresh returns true when the timestamp file at tsPath was written less
+// than ttlSeconds seconds ago. A missing or malformed file is treated as stale.
+func isSyncFresh(tsPath string, ttlSeconds int64) bool {
+	data, err := os.ReadFile(tsPath)
+	if err != nil {
+		return false
+	}
+	ts, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil {
+		return false
+	}
+	return time.Now().Unix()-ts < ttlSeconds
+}
+
+// writeSyncTimestamp atomically records the current Unix timestamp to tsPath,
+// creating parent directories as needed.
+func writeSyncTimestamp(tsPath string) {
+	_ = os.MkdirAll(filepath.Dir(tsPath), 0700)
+	_ = os.WriteFile(tsPath, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0600)
+}
+
 func syncMcpServers() {
 	// Fetch MCP config from S3 and merge into ~/.claude/settings.json
 	// Non-blocking, best effort — failures are silent
@@ -798,12 +823,8 @@ func syncMcpServers() {
 
 	// Check if we synced recently (skip if < 5 min ago)
 	cachePath := filepath.Join(home, ".claude-code-session", "mcp-sync-ts")
-	if data, err := os.ReadFile(cachePath); err == nil {
-		if ts, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64); err == nil {
-			if time.Now().Unix()-ts < 300 {
-				return // Synced less than 5 min ago
-			}
-		}
+	if isSyncFresh(cachePath, 300) {
+		return
 	}
 
 	// Fetch MCPs from S3
@@ -843,6 +864,124 @@ func syncMcpServers() {
 	os.WriteFile(settingsPath, newData, 0600)
 
 	// Update sync timestamp
-	os.MkdirAll(filepath.Dir(cachePath), 0700)
-	os.WriteFile(cachePath, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0600)
+	writeSyncTimestamp(cachePath)
+}
+
+// codexConfigResponse is the JSON schema for the per-org codex-config.json
+// served from S3. Only the fields we actually use are declared here; unknown
+// fields are silently ignored via json.Unmarshal.
+type codexConfigResponse struct {
+	CodexEnabled  *bool  `json:"codex_enabled"`  // nil means "not set" (treat as enabled)
+	ModelProvider string `json:"model_provider"` // e.g. "bedrock"
+	Region        string `json:"region"`         // e.g. "us-east-1"
+}
+
+// syncCodexConfig fetches the per-org Codex configuration from S3 and writes
+// ~/.codex/config.toml. It is best-effort and completely silent on failure so
+// that a transient network hiccup never blocks credential issuance.
+//
+// The bearer token (AWS_BEARER_TOKEN_BEDROCK) is intentionally NOT written
+// here — it lives only in the shell profile set at install time. The TOML
+// file produced here is secret-free and safe to regenerate on every sync.
+func syncCodexConfig(orgID string) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	const s3Base = "https://claude-code-auth-distribution-916587687563.s3.amazonaws.com"
+	syncCodexConfigWithURL(home, s3Base+"/", orgID)
+}
+
+// syncCodexConfigWithURL is the testable core of syncCodexConfig. It accepts
+// explicit home and baseURL arguments so unit tests can redirect HTTP traffic
+// to an httptest.Server and keep file I/O inside a temp directory.
+//
+// baseURL must end with a trailing slash; the S3 path is appended directly:
+//
+//	<baseURL>cowork/<orgID>/codex-config.json   (when orgID is non-empty)
+//	<baseURL>cowork/codex-config.json           (fallback)
+func syncCodexConfigWithURL(home, baseURL, orgID string) {
+	// Skip if synced within the last 5 minutes
+	tsPath := filepath.Join(home, ".claude-code-session", "codex-sync-ts")
+	if isSyncFresh(tsPath, 300) {
+		return
+	}
+
+	// Build S3 URL: per-org path when we know the org, fallback otherwise
+	var fetchURL string
+	if orgID != "" {
+		fetchURL = baseURL + "cowork/" + orgID + "/codex-config.json"
+	} else {
+		fetchURL = baseURL + "cowork/codex-config.json"
+	}
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(fetchURL)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+
+	// 404 means no config for this org — skip silently
+	if resp.StatusCode == http.StatusNotFound {
+		return
+	}
+	if resp.StatusCode != http.StatusOK {
+		return
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil || len(body) < 2 {
+		return
+	}
+
+	var cfg codexConfigResponse
+	if err := json.Unmarshal(body, &cfg); err != nil {
+		return
+	}
+
+	// Respect explicit opt-out
+	if cfg.CodexEnabled != nil && !*cfg.CodexEnabled {
+		return
+	}
+
+	// Must have at least a model_provider to be useful
+	if cfg.ModelProvider == "" {
+		return
+	}
+
+	// Build config.toml content.
+	// We write only non-secret fields. AWS_BEARER_TOKEN_BEDROCK is written
+	// by the installer into the shell profile and must not be included here.
+	var sb strings.Builder
+	sb.WriteString("# Codex configuration — managed by credential-process sync, do not edit manually.\n")
+	sb.WriteString("# Re-generated on each authentication; secrets are stored in your shell profile.\n\n")
+	sb.WriteString("[model]\n")
+	sb.WriteString("provider = " + tomlQuote(cfg.ModelProvider) + "\n")
+	if cfg.Region != "" {
+		sb.WriteString("region = " + tomlQuote(cfg.Region) + "\n")
+	}
+
+	// Ensure ~/.codex/ exists
+	codexDir := filepath.Join(home, ".codex")
+	if err := os.MkdirAll(codexDir, 0700); err != nil {
+		return
+	}
+
+	configPath := filepath.Join(codexDir, "config.toml")
+	if err := os.WriteFile(configPath, []byte(sb.String()), 0600); err != nil {
+		return
+	}
+
+	// Record successful sync
+	writeSyncTimestamp(tsPath)
+}
+
+// tomlQuote wraps s in TOML basic-string quotes, escaping backslashes and
+// double-quotes. Values we receive from S3 are simple ASCII identifiers
+// (provider names, region strings) so this covers all realistic cases.
+func tomlQuote(s string) string {
+	s = strings.ReplaceAll(s, "\\", "\\\\")
+	s = strings.ReplaceAll(s, `"`, `\"`)
+	return `"` + s + `"`
 }

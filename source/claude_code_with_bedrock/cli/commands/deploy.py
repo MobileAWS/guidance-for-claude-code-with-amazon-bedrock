@@ -26,6 +26,24 @@ from claude_code_with_bedrock.cli.utils.cf_exceptions import (
 from claude_code_with_bedrock.cli.utils.cloudformation import CloudFormationManager
 from claude_code_with_bedrock.config import Config
 
+# Azure tenant ID GUID pattern — matches UUIDs in various URL formats:
+#   login.microsoftonline.com/{tenant-id}/v2.0
+#   https://login.microsoftonline.com/{tenant-id}
+#   {tenant-id} (bare GUID)
+_AZURE_GUID_PATTERN = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+
+
+def _extract_azure_tenant_id(domain: str) -> str:
+    """Extract Azure AD tenant GUID from provider domain or URL.
+
+    Supports: full URLs, domain/tenant/v2.0, or bare GUIDs.
+    Returns the bare GUID, or the original input if no GUID found.
+    """
+    match = _AZURE_GUID_PATTERN.search(domain)
+    return match.group(0) if match else domain
+
 
 class DeployCommand(Command):
     name = "deploy"
@@ -119,11 +137,13 @@ class DeployCommand(Command):
                     console.print("[yellow]Monitoring is not enabled in your configuration.[/yellow]")
                     return 1
             elif stack_arg == "cowork-dashboard":
-                if profile.monitoring_enabled:
-                    stacks_to_deploy.append(("cowork-dashboard", "CoWork CloudWatch Dashboard"))
-                else:
+                if not profile.monitoring_enabled:
                     console.print("[yellow]Monitoring is not enabled in your configuration.[/yellow]")
                     return 1
+                if getattr(profile, "monitoring_mode", "central") == "sidecar":
+                    console.print("[yellow]CoWork dashboard requires central monitoring mode (Cowork cannot export telemetry in sidecar mode).[/yellow]")
+                    return 1
+                stacks_to_deploy.append(("cowork-dashboard", "CoWork CloudWatch Dashboard"))
             elif stack_arg == "analytics":
                 if profile.monitoring_enabled:
                     stacks_to_deploy.append(("analytics", "Analytics Pipeline (Kinesis Firehose + Athena)"))
@@ -131,6 +151,15 @@ class DeployCommand(Command):
                     console.print("[yellow]Analytics requires monitoring to be enabled in your configuration.[/yellow]")
                     return 1
             elif stack_arg == "quota":
+                if not getattr(profile, "sso_enabled", True):
+                    console.print(
+                        "[yellow]Quota monitoring requires SSO authentication "
+                        "(per-user JWT tokens) and cannot be deployed when SSO is disabled.[/yellow]"
+                    )
+                    console.print(
+                        "[dim]See issue #454. Re-run 'ccwb init' with SSO enabled to use quota monitoring.[/dim]"
+                    )
+                    return 1
                 if profile.monitoring_enabled:
                     if getattr(profile, "quota_monitoring_enabled", False):
                         stacks_to_deploy.append(("quota", "Quota Monitoring (Per-User Token Limits)"))
@@ -149,35 +178,45 @@ class DeployCommand(Command):
                     console.print("[yellow]Distribution features not enabled in profile.[/yellow]")
                     console.print("Run 'poetry run ccwb init' and enable distribution features.")
                     return 1
-            elif stack_arg == "codebuild":
-                if profile.enable_codebuild:
-                    stacks_to_deploy.append(("codebuild", "CodeBuild for Windows binary builds"))
-                else:
-                    console.print("[yellow]CodeBuild is not enabled in your configuration.[/yellow]")
-                    return 1
             else:
                 console.print(f"[red]Unknown stack: {stack_arg}[/red]")
                 console.print(
-                    "Valid stacks: auth, distribution, networking, monitoring, dashboard, cowork-dashboard, analytics, quota, codebuild\n"
+                    "Valid stacks: auth, distribution, networking, monitoring, dashboard, cowork-dashboard, analytics, quota\n"
                 )
                 console.print("[dim]Tip: Use 'ccwb deploy' without arguments to deploy all enabled stacks.[/dim]")
                 console.print("[dim]Use 'ccwb deploy quota' for quota-specific updates or late enablement.[/dim]")
                 return 1
         else:
-            # Deploy all configured stacks in dependency order
-            # Only deploy auth stack if SSO is enabled (default: True for backward compatibility)
+            # Deploy all configured stacks in dependency order.
+            #
+            # Ordering constraints:
+            # - auth always comes first (produces the IAM role + OIDC provider
+            #   every other stack may reference). Skipped when sso_enabled=False
+            #   (anonymous mode).
+            # - networking must precede any stack that needs VPC/subnet
+            #   outputs: monitoring (OTel ECS ALB) and landing-page
+            #   distribution (distribution ALB).
+            # - distribution comes after networking to satisfy the
+            #   landing-page variant; the presigned-s3 variant doesn't need
+            #   networking but scheduling it here is harmless.
+            # - dashboard / analytics / quota all follow monitoring.
             if getattr(profile, "sso_enabled", True):
                 stacks_to_deploy.append(("auth", "Authentication Stack (Cognito + IAM)"))
 
-            # Deploy distribution after networking if it's landing-page type
-            if profile.enable_distribution:
-                stacks_to_deploy.append(("distribution", "Distribution infrastructure (S3 + IAM)"))
-
-            # Deploy remaining monitoring stacks
-            if profile.monitoring_enabled:
+            # Networking first so any downstream stack can read its outputs.
+            need_networking = profile.monitoring_enabled or profile.enable_distribution
+            if need_networking:
                 vpc_config = profile.monitoring_config or {}
                 if vpc_config.get("create_vpc", True):
                     stacks_to_deploy.append(("networking", "VPC Networking for OTEL Collector"))
+
+            # Distribution (landing-page reads networking outputs; presigned-s3
+            # doesn't, but the scheduling order is a no-op either way).
+            if profile.enable_distribution:
+                stacks_to_deploy.append(("distribution", "Distribution infrastructure (S3 + IAM)"))
+
+            # Monitoring and its dependents.
+            if profile.monitoring_enabled:
                 stacks_to_deploy.append(("s3bucket", "S3 Bucket"))
                 stacks_to_deploy.append(("monitoring", "OpenTelemetry Collector"))
                 stacks_to_deploy.append(("dashboard", "CloudWatch Dashboard"))
@@ -186,11 +225,21 @@ class DeployCommand(Command):
                 if getattr(profile, "analytics_enabled", True):
                     stacks_to_deploy.append(("analytics", "Analytics Pipeline (Kinesis Firehose + Athena)"))
                 # Check if quota monitoring is enabled
+                # Quota enforcement requires SSO — the API Gateway JWT authorizer
+                # has no valid issuer URL otherwise. Skip with a warning rather
+                # than letting CloudFormation fail mid-deploy (issue #454).
                 if getattr(profile, "quota_monitoring_enabled", False):
-                    stacks_to_deploy.append(("quota", "Quota Monitoring (Per-User Token Limits)"))
-            # Check if CodeBuild is enabled
-            if getattr(profile, "enable_codebuild", False):
-                stacks_to_deploy.append(("codebuild", "CodeBuild for Windows binary builds"))
+                    if getattr(profile, "sso_enabled", True):
+                        stacks_to_deploy.append(("quota", "Quota Monitoring (Per-User Token Limits)"))
+                    else:
+                        console.print(
+                            "[yellow]⚠ Skipping quota monitoring stack: quota enforcement requires "
+                            "SSO authentication (per-user JWT tokens) but SSO is disabled in this profile.[/yellow]"
+                        )
+                        console.print(
+                            "[dim]Re-run 'ccwb init' with SSO enabled to deploy quota monitoring. "
+                            "See issue #454.[/dim]"
+                        )
 
         # Initialize CloudFormation manager
         cf_manager = CloudFormationManager(region=profile.aws_region)
@@ -230,7 +279,8 @@ class DeployCommand(Command):
 
             if should_delete:
                 console.print("\n[bold]Cleaning up orphaned stacks...[/bold]\n")
-                for stack_type, stack_name, _status in orphaned_stacks:
+                # Delete in reverse deployment order (dependents first)
+                for stack_type, stack_name, _status in reversed(orphaned_stacks):
                     try:
                         console.print(f"[yellow]Deleting {stack_type} stack: {stack_name}...[/yellow]")
                         cf_manager.delete_stack(stack_name)
@@ -360,6 +410,8 @@ class DeployCommand(Command):
                     "auth0": "bedrock-auth-auth0.yaml",
                     "azure": "bedrock-auth-azure.yaml",
                     "cognito": "bedrock-auth-cognito-pool.yaml",
+                    "google": "bedrock-auth-google.yaml",
+                    "generic": "bedrock-auth-generic.yaml",
                 }
 
                 template_file = template_map.get(provider_type, "bedrock-auth-okta.yaml")
@@ -392,23 +444,8 @@ class DeployCommand(Command):
                         ]
                     )
                 elif provider_type == "azure":
-                    # Azure uses tenant ID (GUID) instead of full domain
-                    # Support multiple input formats:
-                    # - login.microsoftonline.com/{tenant-id}/v2.0
-                    # - login.microsoftonline.com/{tenant-id}
-                    # - {tenant-id} (just the GUID)
-                    # - https://login.microsoftonline.com/{tenant-id}/v2.0
-
-                    # Extract GUID using regex pattern matching
-                    guid_pattern = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
-                    match = re.search(guid_pattern, profile.provider_domain)
-
-                    if match:
-                        tenant_id = match.group(0)
-                    else:
-                        # If no GUID found, use the provider_domain as-is
-                        # (in case user provided just the GUID but in unexpected format)
-                        tenant_id = profile.provider_domain
+                    # Azure uses tenant ID (GUID) — extract from provider_domain URL
+                    tenant_id = _extract_azure_tenant_id(profile.provider_domain)
 
                     params.extend(
                         [
@@ -429,6 +466,27 @@ class DeployCommand(Command):
                             f"CognitoUserPoolId={profile.cognito_user_pool_id}",
                             f"CognitoUserPoolClientId={profile.client_id}",
                             f"CognitoUserPoolDomain={cognito_domain}",
+                        ]
+                    )
+                elif provider_type == "google":
+                    params.extend(
+                        [
+                            f"GoogleDomain={profile.provider_domain}",
+                            f"GoogleClientId={profile.client_id}",
+                        ]
+                    )
+                elif provider_type == "generic":
+                    if not (profile.oidc_issuer_url and profile.oidc_thumbprint):
+                        console.print(
+                            "[red]Generic OIDC provider requires oidc_issuer_url and oidc_thumbprint."
+                            " Re-run `ccwb init` to configure them.[/red]"
+                        )
+                        return 1
+                    params.extend(
+                        [
+                            f"OidcIssuerUrl={profile.oidc_issuer_url}",
+                            f"OidcClientId={profile.client_id}",
+                            f"OidcThumbprintList={profile.oidc_thumbprint}",
                         ]
                     )
 
@@ -509,7 +567,7 @@ class DeployCommand(Command):
                         # Extract tenant ID from domain or use full domain
                         params.extend(
                             [
-                                f"AzureTenantId={profile.distribution_idp_domain}",
+                                f"AzureTenantId={_extract_azure_tenant_id(profile.distribution_idp_domain or '')}",
                                 f"AzureClientId={profile.distribution_idp_client_id}",
                                 f"AzureClientSecretArn={profile.distribution_idp_client_secret_arn}",
                             ]
@@ -594,7 +652,7 @@ class DeployCommand(Command):
 
             elif stack_type == "s3bucket":
                 template = project_root / "deployment" / "infrastructure" / "s3bucket.yaml"
-                stack_name = profile.stack_names.get("networking", f"{profile.identity_pool_name}-s3bucket")
+                stack_name = profile.stack_names.get("s3", f"{profile.identity_pool_name}-s3bucket")
                 params = []
                 return deploy_with_cf(template, stack_name, params, task_description="Deploying S3 Bucket...")
             elif stack_type == "monitoring":
@@ -667,77 +725,37 @@ class DeployCommand(Command):
                             params.append(f"OidcJwksEndpoint={oidc_jwks}")
                             params.append(f"OidcClientId={profile.client_id}")
 
+                # Pass analytics flag to control dual-export (OTLP + EMF)
+                analytics_enabled = "true" if getattr(profile, "analytics_enabled", True) else "false"
+                params.append(f"EnableAnalytics={analytics_enabled}")
+
                 console.print(f"[dim]Using parameters: {params}[/dim]")
-                return deploy_with_cf(
+                result = deploy_with_cf(
                     template, stack_name, params, task_description="Deploying monitoring collector..."
                 )
+
+                # Save OTel collector endpoint to profile immediately after deploy
+                if result == 0:
+                    monitoring_outputs = get_stack_outputs(stack_name, profile.aws_region)
+                    if monitoring_outputs:
+                        endpoint = monitoring_outputs.get("CollectorEndpoint")
+                        if endpoint and endpoint != "N/A":
+                            profile.otel_collector_endpoint = endpoint
+                            try:
+                                Config.load().save_profile(profile)
+                                console.print(f"[dim]Saved OTel endpoint to profile: {endpoint}[/dim]")
+                            except Exception:
+                                pass
+
+                return result
 
             elif stack_type == "dashboard":
                 template = project_root / "deployment" / "infrastructure" / "claude-code-dashboard.yaml"
                 stack_name = profile.stack_names.get("dashboard", f"{profile.identity_pool_name}-dashboard")
-
-                # Get S3 bucket from networking stack for packaging
-                s3_stack_name = profile.stack_names.get("s3", f"{profile.identity_pool_name}-s3bucket")
-                s3_outputs = get_stack_outputs(s3_stack_name, profile.aws_region)
-
-                if not s3_outputs or not s3_outputs.get("CfnArtifactsBucket"):
-                    console.print("[red]Error: S3 bucket for packaging not found[/red]")
-                    console.print(
-                        "[yellow]The networking stack must be deployed first with the artifacts bucket.[/yellow]"
-                    )
-                    console.print("Run: [cyan]ccwb deploy networking[/cyan]")
-                    return 1
-
-                s3_bucket = s3_outputs["CfnArtifactsBucket"]
-
-                # Package the template using AWS CLI (simple and reliable!)
-                task = progress.add_task("Packaging dashboard Lambda functions...", total=None)
-
-                try:
-                    # Create temp file for packaged template
-                    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
-                        packaged_template_path = f.name
-
-                    # Run AWS CLI package command
-                    cmd = [
-                        "aws",
-                        "cloudformation",
-                        "package",
-                        "--template-file",
-                        str(template),
-                        "--s3-bucket",
-                        s3_bucket,
-                        "--s3-prefix",
-                        "claude-code/dashboard",
-                        "--output-template-file",
-                        packaged_template_path,
-                        "--region",
-                        profile.aws_region,
-                    ]
-
-                    result = subprocess.run(cmd, capture_output=True, text=True)
-
-                    if result.returncode != 0:
-                        console.print(f"[red]Failed to package template: {result.stderr}[/red]")
-                        return 1
-
-                    progress.update(
-                        task, description="Dashboard Lambda functions packaged successfully", completed=True
-                    )
-
-                    # Deploy the packaged template with MetricsRegion parameter
-                    params = [f"MetricsRegion={profile.aws_region}"]
-                    return deploy_with_cf(
-                        packaged_template_path, stack_name, params, task_description="Deploying monitoring dashboard..."
-                    )
-
-                finally:
-                    # Clean up temp file
-                    if "packaged_template_path" in locals():
-                        try:
-                            os.unlink(packaged_template_path)
-                        except Exception:
-                            pass
+                params = [f"MetricsRegion={profile.aws_region}"]
+                return deploy_with_cf(
+                    template, stack_name, params, task_description="Deploying monitoring dashboard..."
+                )
 
             elif stack_type == "cowork-dashboard":
                 template = project_root / "deployment" / "infrastructure" / "cowork-dashboard.yaml"
@@ -745,7 +763,6 @@ class DeployCommand(Command):
                     "cowork-dashboard", f"{profile.identity_pool_name}-cowork-dashboard"
                 )
                 params = [
-                    f"MetricsLogGroup={profile.metrics_log_group}",
                     f"MetricsRegion={profile.aws_region}",
                 ]
                 return deploy_with_cf(
@@ -767,18 +784,6 @@ class DeployCommand(Command):
                 template = project_root / "deployment" / "infrastructure" / "quota-monitoring.yaml"
                 stack_name = profile.stack_names.get("quota", f"{profile.identity_pool_name}-quota")
 
-                # Get MetricsTable ARN from dashboard stack outputs
-                dashboard_stack_name = profile.stack_names.get("dashboard", f"{profile.identity_pool_name}-dashboard")
-                dashboard_outputs = get_stack_outputs(dashboard_stack_name, profile.aws_region)
-
-                if not dashboard_outputs or not dashboard_outputs.get("MetricsTableArn"):
-                    console.print(
-                        f"[red]Could not get MetricsTable ARN from dashboard stack {dashboard_stack_name}[/red]"
-                    )
-                    console.print("[yellow]The dashboard stack must be deployed first.[/yellow]")
-                    console.print("Run: [cyan]ccwb deploy dashboard[/cyan]")
-                    return 1
-
                 # Get S3 bucket from s3bucket stack for packaging
                 s3_stack = profile.stack_names.get("s3", f"{profile.identity_pool_name}-s3bucket")
                 s3_outputs = get_stack_outputs(s3_stack, profile.aws_region)
@@ -799,40 +804,18 @@ class DeployCommand(Command):
                 warning_80 = getattr(profile, "warning_threshold_80", int(monthly_limit * 0.8))
                 warning_90 = getattr(profile, "warning_threshold_90", int(monthly_limit * 0.9))
 
-                metrics_aggregator_role = dashboard_outputs.get(
-                    "MetricsAggregatorRoleName", "claude-code-auth-dashboard-MetricsAggregatorRole-*"
-                )
-
-                # Get OIDC configuration for JWT authentication
-                if profile.provider_type == "cognito":
-                    # Cognito issuer uses cognito-idp endpoint, not the hosted UI domain
-                    pool_id = getattr(profile, "cognito_user_pool_id", "")
-                    if pool_id:
-                        pool_region = pool_id.split("_")[0] if "_" in pool_id else profile.aws_region
-                        oidc_issuer_url = f"https://cognito-idp.{pool_region}.amazonaws.com/{pool_id}"
-                    else:
-                        raise ValueError(
-                            "Cognito User Pool ID is required for quota monitoring JWT authentication. "
-                            "Please set cognito_user_pool_id in your profile configuration."
-                        )
-                else:
-                    oidc_issuer_url = profile.provider_domain
-                    # Ensure issuer URL has https:// prefix
-                    if oidc_issuer_url and not oidc_issuer_url.startswith(("http://", "https://")):
-                        oidc_issuer_url = f"https://{oidc_issuer_url}"
-                # Auth0 tokens include trailing slash in iss claim, so authorizer must match
-                if profile.provider_type == "auth0" and oidc_issuer_url and not oidc_issuer_url.endswith("/"):
-                    oidc_issuer_url = f"{oidc_issuer_url}/"
-                oidc_client_id = profile.client_id
+                # Get OIDC configuration for JWT authentication (only when SSO is enabled)
+                oidc_issuer_url, oidc_client_id = self._resolve_oidc_config(profile)
 
                 # Pass explicitly so the profile is the source of truth; the CF template
                 # default is 'false' to match the opt-in intent of this field.
                 enable_finegrained_quotas = profile.enable_finegrained_quotas
 
+                # Sidecar bypass detection: opt-in detective control (default off).
+                enable_bypass_detection = getattr(profile, "enable_bypass_detection", False)
+
                 params = [
                     f"MonthlyTokenLimit={monthly_limit}",
-                    f"MetricsTableArn={dashboard_outputs['MetricsTableArn']}",
-                    f"MetricsAggregatorRoleName={metrics_aggregator_role}",
                     f"WarningThreshold80={warning_80}",
                     f"WarningThreshold90={warning_90}",
                     f"DailyTokenLimit={daily_limit or 0}",
@@ -841,6 +824,7 @@ class DeployCommand(Command):
                     f"OidcIssuerUrl={oidc_issuer_url}",
                     f"OidcClientId={oidc_client_id}",
                     f"EnableFinegrainedQuotas={str(enable_finegrained_quotas).lower()}",
+                    f"EnableBypassDetection={str(enable_bypass_detection).lower()}",
                 ]
 
                 # Package the template using AWS CLI
@@ -883,9 +867,9 @@ class DeployCommand(Command):
                         packaged_template_path, stack_name, params, task_description="Deploying quota monitoring..."
                     )
 
-                    # Update metrics aggregator Lambda environment if successful
+                    # Seed default quota policy on successful deploy
                     if result == 0:
-                        self._update_metrics_aggregator_env(profile, stack_name, console)
+                        self._create_default_quota_policy(profile, stack_name, console)
 
                     return result
 
@@ -896,14 +880,6 @@ class DeployCommand(Command):
                             os.unlink(packaged_template_path)
                         except Exception:
                             pass
-
-            elif stack_type == "codebuild":
-                template = project_root / "deployment" / "infrastructure" / "codebuild-windows.yaml"
-                stack_name = profile.stack_names.get("codebuild", f"{profile.identity_pool_name}-codebuild")
-                params = [f"ProjectNamePrefix={profile.identity_pool_name}"]
-                return deploy_with_cf(
-                    template, stack_name, params, task_description="Deploying CodeBuild for Windows builds..."
-                )
 
             else:
                 console.print(f"[red]Unknown stack type: {stack_type}[/red]")
@@ -961,6 +937,8 @@ class DeployCommand(Command):
                     "auth0": "bedrock-auth-auth0.yaml",
                     "azure": "bedrock-auth-azure.yaml",
                     "cognito": "bedrock-auth-cognito-pool.yaml",
+                    "google": "bedrock-auth-google.yaml",
+                    "generic": "bedrock-auth-generic.yaml",
                 }
                 template_file = template_map.get(provider_type, "bedrock-auth-okta.yaml")
                 template = project_root / "deployment" / "infrastructure" / template_file
@@ -970,9 +948,7 @@ class DeployCommand(Command):
                 elif provider_type == "auth0":
                     params.extend([f"Auth0Domain={profile.provider_domain}", f"Auth0ClientId={profile.client_id}"])
                 elif provider_type == "azure":
-                    guid_pattern = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
-                    match = re.search(guid_pattern, profile.provider_domain)
-                    tenant_id = match.group(0) if match else profile.provider_domain
+                    tenant_id = _extract_azure_tenant_id(profile.provider_domain)
                     params.extend([f"AzureTenantId={tenant_id}", f"AzureClientId={profile.client_id}"])
                 elif provider_type == "cognito":
                     cognito_domain = (
@@ -1005,7 +981,7 @@ class DeployCommand(Command):
 
         elif stack_type == "s3bucket":
             template = project_root / "deployment" / "infrastructure" / "s3bucket.yaml"
-            stack_name = profile.stack_names.get("networking", f"{profile.identity_pool_name}-s3bucket")
+            stack_name = profile.stack_names.get("s3", f"{profile.identity_pool_name}-s3bucket")
             print_deploy_cmd(template, stack_name, [])
 
         elif stack_type == "monitoring":
@@ -1043,7 +1019,6 @@ class DeployCommand(Command):
             template = project_root / "deployment" / "infrastructure" / "cowork-dashboard.yaml"
             stack_name = profile.stack_names.get("cowork-dashboard", f"{profile.identity_pool_name}-cowork-dashboard")
             params = [
-                f"MetricsLogGroup={profile.metrics_log_group}",
                 f"MetricsRegion={region}",
             ]
             print_deploy_cmd(template, stack_name, params)
@@ -1078,8 +1053,6 @@ class DeployCommand(Command):
             daily_limit = getattr(profile, "daily_token_limit", None)
             params = [
                 f"MonthlyTokenLimit={monthly_limit}",
-                f"MetricsTableArn=<MetricsTableArn from {dashboard_stack}>",
-                f"MetricsAggregatorRoleName=<MetricsAggregatorRoleName from {dashboard_stack}>",
                 f"WarningThreshold80={getattr(profile, 'warning_threshold_80', int(monthly_limit * 0.8))}",
                 f"WarningThreshold90={getattr(profile, 'warning_threshold_90', int(monthly_limit * 0.9))}",
                 f"DailyTokenLimit={daily_limit or 0}",
@@ -1088,14 +1061,9 @@ class DeployCommand(Command):
                 f"OidcIssuerUrl={profile.provider_domain}",
                 f"OidcClientId={profile.client_id}",
                 f"EnableFinegrainedQuotas={str(profile.enable_finegrained_quotas).lower()}",
+                f"EnableBypassDetection={str(getattr(profile, 'enable_bypass_detection', False)).lower()}",
             ]
             print_deploy_cmd("/tmp/quota-monitoring-packaged.yaml", stack_name, params)
-
-        elif stack_type == "codebuild":
-            template = project_root / "deployment" / "infrastructure" / "codebuild-windows.yaml"
-            stack_name = profile.stack_names.get("codebuild", f"{profile.identity_pool_name}-codebuild")
-            params = [f"ProjectNamePrefix={profile.identity_pool_name}"]
-            print_deploy_cmd(template, stack_name, params)
 
         elif stack_type == "distribution":
             stack_name = profile.stack_names.get("distribution", f"{profile.identity_pool_name}-distribution")
@@ -1162,6 +1130,12 @@ class DeployCommand(Command):
                 endpoint = monitoring_outputs.get("CollectorEndpoint", "N/A")
                 console.print(f"• OTLP Endpoint: [cyan]{endpoint}[/cyan]")
 
+                # Save endpoint to profile so ccwb package doesn't need to read CF outputs
+                if endpoint and endpoint != "N/A":
+                    profile.otel_collector_endpoint = endpoint
+                    config.save_profile(profile)
+                    console.print("[dim]  Saved to profile for package generation[/dim]")
+
             dashboard_stack = profile.stack_names.get("dashboard", f"{profile.identity_pool_name}-dashboard")
             dashboard_outputs = get_stack_outputs(dashboard_stack, profile.aws_region)
 
@@ -1203,51 +1177,45 @@ class DeployCommand(Command):
                         profile.user_quota_metrics_table = quota_outputs["QuotaTableName"]
                     config.save_profile(profile)
 
-    def _update_metrics_aggregator_env(self, profile, quota_stack_name: str, console: Console) -> None:
-        """Update metrics aggregator Lambda environment variable to include quota table."""
+    def _create_default_quota_policy(self, profile, quota_stack_name: str, console: Console) -> None:
+        """Auto-create default quota policy in DynamoDB after quota stack deployment."""
         try:
-            import boto3
+            from claude_code_with_bedrock.models import EnforcementMode, PolicyType
+            from claude_code_with_bedrock.quota_policies import PolicyAlreadyExistsError, QuotaPolicyManager
 
-            # Get the quota table name from the quota stack outputs
+            # Get the policies table name from stack outputs
             quota_outputs = get_stack_outputs(quota_stack_name, profile.aws_region)
-            if not quota_outputs or not quota_outputs.get("QuotaTableName"):
-                console.print("[yellow]Warning: Could not get quota table name from stack outputs[/yellow]")
+            if not quota_outputs or not quota_outputs.get("PoliciesTableName"):
+                console.print("[yellow]Warning: Could not get policies table name from stack outputs[/yellow]")
                 return
 
-            quota_table_name = quota_outputs["QuotaTableName"]
+            table_name = quota_outputs["PoliciesTableName"]
+            manager = QuotaPolicyManager(table_name, profile.aws_region)
 
-            # Get the metrics aggregator function name
-            metrics_aggregator_name = "ClaudeCode-MetricsAggregator"
+            monthly_limit = getattr(profile, "monthly_token_limit", 225000000)
+            daily_limit = getattr(profile, "daily_token_limit", None)
+            monthly_enforcement = getattr(profile, "monthly_enforcement_mode", "block")
 
-            console.print(f"[dim]Updating {metrics_aggregator_name} environment variables...[/dim]")
-
-            # Update the Lambda function environment variables
-            lambda_client = boto3.client("lambda", region_name=profile.aws_region)
+            enforcement_mode = EnforcementMode.BLOCK if monthly_enforcement == "block" else EnforcementMode.ALERT
 
             try:
-                lambda_client.update_function_configuration(
-                    FunctionName=metrics_aggregator_name,
-                    Environment={
-                        "Variables": {
-                            "METRICS_LOG_GROUP": profile.metrics_log_group,
-                            "METRICS_REGION": profile.aws_region,
-                            "METRICS_TABLE": "ClaudeCodeMetrics",
-                            "QUOTA_TABLE": quota_table_name,
-                        }
-                    },
-                )
-                console.print("[green]✓ Updated metrics aggregator to enable quota tracking[/green]")
-            except Exception as e:
-                console.print(
-                    f"[yellow]Warning: Failed to update metrics aggregator environment variables: {str(e)}[/yellow]"
+                manager.create_policy(
+                    policy_type=PolicyType.DEFAULT,
+                    identifier="default",
+                    monthly_token_limit=monthly_limit,
+                    daily_token_limit=daily_limit,
+                    enforcement_mode=enforcement_mode,
                 )
                 console.print(
-                    f"[dim]You may need to manually add QUOTA_TABLE={quota_table_name} "
-                    f"to the metrics aggregator Lambda[/dim]"
+                    f"[green]Created default quota policy "
+                    f"(monthly: {monthly_limit:,} tokens, enforcement: {monthly_enforcement})[/green]"
                 )
+            except PolicyAlreadyExistsError:
+                console.print("[dim]Default quota policy already exists (skipping)[/dim]")
 
         except Exception as e:
-            console.print(f"[yellow]Warning: Error updating metrics aggregator: {str(e)}[/yellow]")
+            console.print(f"[yellow]Warning: Could not create default quota policy: {str(e)}[/yellow]")
+            console.print("[dim]Run 'ccwb quota set-default' manually to configure quota limits[/dim]")
 
     def _check_orphaned_stacks(self, stacks_to_deploy, profile, cf_manager, console: Console) -> list:
         """Check for stacks that exist but are disabled in config.
@@ -1262,9 +1230,9 @@ class DeployCommand(Command):
             "networking": "VPC Networking",
             "monitoring": "OpenTelemetry Collector",
             "dashboard": "CloudWatch Dashboard",
+            "cowork-dashboard": "CoWork CloudWatch Dashboard",
             "analytics": "Analytics Pipeline",
             "quota": "Quota Monitoring",
-            "codebuild": "CodeBuild",
         }
 
         # Stack types that are being deployed
@@ -1300,6 +1268,10 @@ class DeployCommand(Command):
                 try:
                     iam_client.create_service_linked_role(AWSServiceName="ecs.amazonaws.com")
                     console.print("[green]✓ ECS service linked role created[/green]")
+                    # Wait for IAM propagation before proceeding with ECS cluster creation
+                    import time
+                    console.print("[dim]Waiting for IAM role propagation...[/dim]")
+                    time.sleep(10)
                 except iam_client.exceptions.InvalidInputException as e:
                     # Role might already exist (race condition)
                     if "has been taken in this account" in str(e):
@@ -1311,3 +1283,32 @@ class DeployCommand(Command):
             console.print(f"[yellow]Warning: Could not verify ECS service linked role: {str(e)}[/yellow]")
             console.print("[dim]If deployment fails, manually create the role with:[/dim]")
             console.print("[dim]aws iam create-service-linked-role --aws-service-name ecs.amazonaws.com[/dim]")
+
+    def _resolve_oidc_config(self, profile) -> tuple:
+        """Resolve OIDC issuer URL and client ID for quota JWT authentication.
+
+        Returns ("", "") when SSO is disabled — the CF template's HasJwtAuth
+        condition will disable the JWT authorizer and use an open route instead.
+        """
+        if not getattr(profile, "sso_enabled", True):
+            return "", ""
+
+        if profile.provider_type == "cognito":
+            pool_id = getattr(profile, "cognito_user_pool_id", "")
+            if not pool_id:
+                raise ValueError(
+                    "Cognito User Pool ID is required for quota monitoring JWT authentication. "
+                    "Please set cognito_user_pool_id in your profile configuration."
+                )
+            pool_region = pool_id.split("_")[0] if "_" in pool_id else profile.aws_region
+            issuer_url = f"https://cognito-idp.{pool_region}.amazonaws.com/{pool_id}"
+        else:
+            issuer_url = profile.provider_domain
+            if issuer_url and not issuer_url.startswith(("http://", "https://")):
+                issuer_url = f"https://{issuer_url}"
+
+        # Auth0 tokens include trailing slash in iss claim, so authorizer must match
+        if profile.provider_type == "auth0" and issuer_url and not issuer_url.endswith("/"):
+            issuer_url += "/"
+
+        return issuer_url, profile.client_id

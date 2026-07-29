@@ -50,7 +50,9 @@ This guide covers the **AWS infrastructure** side of the deployment. It assumes 
 | **Okta** | [Okta Setup Guide](assets/docs/providers/okta-setup.md) |
 | **Microsoft Entra ID (Azure AD)** | [Microsoft Entra ID Setup Guide](assets/docs/providers/microsoft-entra-id-setup.md) |
 | **Auth0** | [Auth0 Setup Guide](assets/docs/providers/auth0-setup.md) |
+| **Google** | [Google Setup Guide](assets/docs/providers/google-oidc-setup.md) |
 | **AWS Cognito User Pool** | [Cognito User Pool Setup Guide](assets/docs/providers/cognito-user-pool-setup.md) |
+| **PingFederate, Keycloak, ForgeRock, or other generic OIDC** | [Generic OIDC Setup Guide](assets/docs/providers/generic-oidc-setup.md) |
 
 Each guide walks through creating the application, setting the redirect URI to `http://localhost:8400/callback`, enabling PKCE, and noting the two values you will need here: your **provider domain** and **client ID**.
 
@@ -103,7 +105,18 @@ poetry run ccwb init
 
 The wizard runs through three numbered steps plus optional features. Every question is explained below — read this section before running the wizard so you know exactly what to enter.
 
-> **Before you run `ccwb init`:** The wizard calls AWS APIs to validate account id ( using your **administrator** credentials — not developer credentials). Make sure your terminal has a valid AWS session before you start. See [How ccwb init reads your AWS credentials](#how-ccwb-init-reads-your-aws-credentials) below.
+> **Before you run `ccwb init`:** The wizard calls AWS APIs to validate account id (using your **administrator** credentials — not developer credentials). Make sure your terminal has a valid AWS session before you start. See [How ccwb init reads your AWS credentials](#how-ccwb-init-reads-your-aws-credentials) below.
+
+The wizard collects:
+
+- OIDC provider configuration (domain, client ID)
+- AWS region selection for infrastructure
+- Amazon Bedrock cross-region inference configuration
+- Credential storage method (keyring or session files)
+- Optional monitoring setup:
+  - Enable monitoring? (yes/no)
+  - Monitoring mode: **central collector** (ECS Fargate) or **sidecar collector** (local). Sidecar mode skips VPC configuration and Athena SQL pipeline setup (PromQL dashboards are included in both modes).
+  - VPC configuration (central collector only)
 
 ---
 
@@ -241,7 +254,7 @@ Choose whether developers will authenticate through an OIDC identity provider to
 | **Yes** (default) | You have Okta, Azure AD, Auth0, or Cognito User Pool — full per-user attribution and quota enforcement |
 | **No** | Analytics-only deployment, or developers already have IAM/role access to Bedrock |
 
-> **Note:** AWS IAM Identity Center (SSO) support is coming in a future release. If your org uses AWS SSO today, choose **No** and configure developer access via your existing IAM Identity Center setup outside this tool.
+> **Note:** AWS IAM Identity Center (SSO) integration is coming soon. If your org uses IAM IDC today, choose **No** for SSO and use your existing `aws sso login` credentials — the solution works with any valid AWS credentials that have Bedrock access.
 
 ---
 
@@ -309,10 +322,10 @@ Choose how the `credential-process` binary stores AWS temporary credentials on t
 
 | Option | What it does | When to use |
 |---|---|---|
-| **Keyring** | OS secure storage (macOS Keychain, Windows Credential Manager, Linux Secret Service) | Production — credentials survive reboots, most secure |
+| **Keyring** | OS secure storage (macOS Keychain, Windows Credential Manager, Linux Secret Service) | Production, and recommended for CoWork 3P |
 | **Session Files** | Temp files in `~/.aws/credentials` and `~/.claude-code-session/` | Dev/testing — simpler, wiped on logout |
 
-Default is **Session Files**. Either works. Keyring may show a one-time OS permission prompt on first use.
+Default is **Session Files**. Both modes work for Claude Code CLI. For **CoWork Desktop 3P**, Keyring is strongly recommended: CoWork resolves credentials through `inferenceBedrockProfile` → boto3's named-profile resolution, and boto3 reads `~/.aws/credentials` before the `credential_process` entry in `~/.aws/config`. In Session Files mode, that means boto3 uses whatever static credentials the last CLI invocation wrote to the file and will **not** auto-refresh them through `credential_process` once they expire — CoWork fails with `403 The security token included in the request is invalid` until the CLI is run again to repopulate the file. Keyring mode keeps `~/.aws/credentials` untouched, so boto3 falls through to `credential_process` and the binary handles refresh transparently. Keyring may show a one-time OS permission prompt on first use.
 
 ---
 
@@ -486,9 +499,11 @@ Deploys an AWS CodeBuild project to compile the Windows `.exe` binary using Nuit
 When **Yes**, every `ccwb package` run automatically produces MDM configuration files alongside the standard installer. These deploy Claude Desktop (Claude Cowork) pointing at Bedrock through the same credential infrastructure. No extra AWS resources required.
 
 Output files in `dist/cowork-3p/`:
-- `cowork-3p-ClaudeCode.mobileconfig` — deploy via Jamf/Kandji/Mosyle (macOS)
-- `cowork-3p-ClaudeCode.reg` — deploy via Intune/Group Policy (Windows)
-- `credential-helper-ClaudeCode` — wrapper script that must be on each user machine
+- `cowork-3p.mobileconfig` — deploy via Jamf/Kandji/Mosyle (macOS). Unsigned profiles cannot auto-install: after delivery (or when `install.sh` runs), the user must approve the profile in **System Settings → Privacy & Security → Profiles**.
+- `cowork-3p.reg` — deploy via Intune/Group Policy (Windows). Writes to `HKCU\SOFTWARE\Policies\Claude` (per-user, no admin elevation); do not redirect to `HKLM`.
+- `cowork-3p-config.json` — raw MDM JSON for the Claude Desktop Setup UI / manual review
+
+Claude Desktop authenticates via the `inferenceBedrockProfile` MDM key, which points at the AWS named profile that `install.sh` / `install.bat` writes to `~/.aws/config`. No per-user wrapper script is required. Users must run the installer **before** opening Claude Desktop — otherwise the named profile won't exist and Bedrock mode won't activate.
 
 See [COWORK_3P.md](assets/docs/COWORK_3P.md) for MDM deployment instructions.
 
@@ -574,30 +589,21 @@ This deploys in order based on what you configured in Step 2:
 
 **Monitoring stack** (if monitoring = Yes):
 
-| Resource | What it does |
-|---|---|
-| ECS Fargate cluster | Runs the ADOT (OpenTelemetry) collector container |
-| Application Load Balancer | Receives OTLP metrics from developer machines (port 4318) |
-| ACM Certificate + Route53 record | TLS for the OTEL endpoint (if custom domain configured) |
-| CloudWatch Log Groups + Metrics | Stores and visualises token usage data |
-| CloudWatch Dashboard (`ClaudeCodeMonitoring`) | Per-user token usage, costs, model breakdown |
-| DynamoDB table (`UserQuotaMetrics`) | Per-user monthly/daily token totals for quota enforcement |
-| Lambda functions | Power custom CloudWatch dashboard widgets |
-
-**Analytics stack** (if analytics = Yes):
-
-| Resource | What it does |
-|---|---|
-| Kinesis Data Firehose | Streams CloudWatch logs to S3 in Parquet format |
-| S3 bucket | 90-day hot storage, auto-transition to Glacier |
-| Athena workgroup + 10 named queries | SQL analytics over historical token data |
+- VPC and networking resources (or integration with existing VPC)
+- ECS Fargate cluster running OpenTelemetry collector
+- Application Load Balancer for OTLP ingestion
+- CloudWatch Log Groups and Metrics
+- CloudWatch Dashboard with PromQL widgets (no Lambda functions)
+- Kinesis Data Firehose for streaming metrics to S3 (if analytics enabled)
+- Amazon Athena for SQL analytics on collected metrics (if analytics enabled)
+- S3 bucket for long-term metrics storage (if analytics enabled)
 
 **Quota stack** (if quota monitoring = Yes):
 
 | Resource | What it does |
 |---|---|
 | DynamoDB table (`QuotaPolicies`) | Stores per-user/group/default token limits |
-| Lambda (quota-monitor) | Runs every 15 min — checks thresholds, sends alerts |
+| Lambda (quota-monitor) | Runs every 15 min — checks thresholds via PromQL, sends alerts |
 | SNS topic | Delivers quota alerts to subscribed email/webhook |
 | API Gateway (quota check) | Real-time quota check at credential issuance time |
 
@@ -614,26 +620,22 @@ This deploys in order based on what you configured in Step 2:
 poetry run ccwb status
 ```
 
-#### Known Limitations
-
-> **Monitoring + Private VPC (no Internet Gateway):** The OTEL collector ALB is currently hardcoded as `internet-facing` in the CloudFormation template. If your VPC has no Internet Gateway, the monitoring stack will fail with `VPC has no internet gateway`. **Workaround: disable monitoring during `ccwb init`.** The auth infrastructure deploys without any ALB or IGW requirement.
-
-> **HTTPS disabled + monitoring:** A known bug in older versions of the template causes `Unresolved resource dependencies [HTTPSListener]` when you answer No to HTTPS. If you hit this error, either enable HTTPS (requires a Route53 hosted zone) or disable monitoring entirely.
-
 ### Step 4: Create Distribution Package
 
 Build the package for end users:
 
 ```bash
-# Build all platforms (starts Windows build in background)
-poetry run ccwb package --target-platform all
+# Build all platforms using Go cross-compilation (recommended)
+poetry run ccwb package --go --target-platform all
 
-# Check Windows build status (optional)
-poetry run ccwb builds
-
-# When ready, create distribution URL (optional)
-poetry run ccwb distribute
+# Creates ready-to-distribute packages for:
+# - macOS ARM64 (Apple Silicon) and Intel
+# - Linux x64 and ARM64
+# - Windows x64
+# All from a single command, any admin OS. Requires: Go 1.24+
 ```
+
+> **Note:** Running `ccwb package` without `--go` falls back to the legacy PyInstaller/CodeBuild pipeline which requires Docker and platform-specific toolchains. Use `--go` for all new deployments.
 
 **Choosing macOS targets:**
 
@@ -669,10 +671,20 @@ Pick based on what your developers report:
 
 **Package Workflow:**
 
-1. **Local builds**: macOS/Linux executables are built locally using PyInstaller
+1. **Local builds**: macOS and Linux executables are built locally using PyInstaller. See the host-OS matrix below — PyInstaller cannot cross-compile across operating systems, so **macOS binaries must be built on macOS** and **Linux binaries must be built on Linux** (or on macOS via Docker).
 2. **Windows builds**: Trigger AWS CodeBuild for Windows executables (20+ minutes) - requires enabling CodeBuild during `init`
 3. **Check status**: Monitor build progress with `poetry run ccwb builds`
 4. **Create distribution**: Use `distribute` to upload and generate presigned URLs
+
+**Host-OS requirements for each target:**
+
+| Target binary | Build host must be | Tooling |
+|---|---|---|
+| `macos-arm64`, `macos-intel` | macOS | PyInstaller (native) |
+| `linux-x64`, `linux-arm64` | Linux, **or** macOS with Docker Desktop | PyInstaller (Docker container used when building from macOS) |
+| `windows` | any host with CodeBuild enabled | AWS CodeBuild (remote build) |
+
+> **Linux admins cannot build macOS binaries.** PyInstaller on Linux emits Linux ELF binaries regardless of the requested target architecture, and macOS cannot load ELF. If you run `ccwb package --target-platform=macos-arm64` on Linux, the build refuses with a clear error. To produce macOS binaries, use a macOS workstation or a CI macOS runner (e.g. GitHub Actions `macos-latest`) and collect the artifacts from there.
 
 > **Note**: Windows builds are optional and require CodeBuild to be enabled during the `init` process. If not enabled, the package command will skip Windows builds and continue with other platforms.
 
@@ -684,15 +696,17 @@ The `dist/` folder will contain:
 - `credential-process-linux` - Authentication executable for Linux (if built on Linux)
 - `config.json` - Embedded configuration
 - `install.sh` - Installation script for Unix systems
-- `install.bat` - Installation script for Windows
+- `install.bat` - Installation script for Windows (launcher)
+- `ccwb-install.ps1` - PowerShell installer logic (called by install.bat)
 - `README.md` - User instructions
 - `.claude/settings.json` - Claude Code telemetry settings (if monitoring enabled)
 - `otel-helper-*` - OTEL helper executables for each platform (if monitoring enabled)
 
 The package builder:
 
-- Automatically builds binaries for both macOS and Linux by default
-- Uses Docker to cross-compile Linux binaries when running on macOS — **Docker Desktop must be installed and running**; if not present, Linux builds are skipped with a warning and macOS/Windows builds continue unaffected
+- Builds binaries for the platforms your current host supports (see host-OS matrix above). On a macOS host that's macOS natively plus Linux via Docker; on a Linux host that's Linux only
+- Uses Docker to produce Linux binaries from a macOS host — **Docker Desktop must be installed and running**; if not present, Linux builds are skipped with a warning and other platforms continue unaffected
+- Refuses to attempt macOS targets from a non-macOS host (fails fast with a clear error rather than silently producing invalid binaries)
 - Includes the OTEL helper for extracting user attributes from JWT tokens
 - Creates a unified installer that auto-detects the user's platform
 
@@ -773,6 +787,7 @@ See [Distribution Comparison](assets/docs/distribution/comparison.md) for detail
 
 ### Build Requirements
 
+- **Go 1.23+** (optional): Required for building the OpenTelemetry collector sidecar binary. If not installed, the sidecar build is skipped and packages are created without it. Install from https://go.dev/dl/
 - **Windows**: AWS CodeBuild with Nuitka (automated)
 - **macOS**: PyInstaller with architecture-specific builds
   - ARM64: Native build on Apple Silicon Macs only — cannot run on Intel Macs
@@ -851,16 +866,34 @@ Force re-authentication after deployment:
 ~/claude-code-with-bedrock/credential-process --clear-cache
 ```
 
-### Port Conflicts
+If CoWork Desktop 3P fails with `403 The security token included in the request is invalid` and the user was previously on a session-files build, `~/.aws/credentials` may contain a stale `[<profile-name>]` stanza with literal `EXPIRED` values that shadows the current `credential_process` entry in `~/.aws/config`. Re-run `install.sh` / `install.bat` — it purges any such stanza before writing the new profile. Alternatively, remove the block by hand.
 
-The credential provider uses port 8400 by default for OAuth callbacks.
-If this port is in use by another application, authentication will automatically use an available port.
+### Port Configuration
 
-To manually specify a different port, set the `REDIRECT_PORT` environment variable:
+The credential provider uses port 8400 by default for OAuth callbacks. This port also serves as an inter-process lock: if multiple credential-process invocations run concurrently, the second will wait for the first to complete authentication and then read credentials from cache.
+
+**Important:** The callback port must match the redirect URI registered in your IdP application (e.g., `http://localhost:8400/callback`). If port 8400 is occupied by another application on your users' machines (e.g., Commvault, HashiCorp Vault), configure a different port.
+
+**Option 1: Configure in profile** (recommended — persisted in config.json):
+
+During `ccwb init`, select "Use a custom OAuth callback port" when prompted. Or manually add to `config.json`:
+
+```json
+{
+  "ProfileName": {
+    "redirect_port": 8401,
+    ...
+  }
+}
+```
+
+**Option 2: Environment variable** (takes precedence over config.json):
 
 ```bash
 export REDIRECT_PORT=8401
 ```
+
+Whichever port you choose, ensure `http://localhost:<port>/callback` is registered as a valid redirect URI in your IdP application configuration.
 
 ### `Exec format error` on the credential-process binary (end user)
 

@@ -5,13 +5,14 @@
 
 from cleo.application import Application
 
-from .commands.builds import BuildsCommand
 from .commands.cleanup import CleanupCommand
 from .commands.cowork import CoworkGenerateCommand
 from .commands.context import (
+    ConfigCommand,
     ConfigExportCommand,
     ConfigImportCommand,
     ConfigValidateCommand,
+    ContextCommand,
     ContextCurrentCommand,
     ContextListCommand,
     ContextShowCommand,
@@ -23,6 +24,7 @@ from .commands.distribute import DistributeCommand
 from .commands.init import InitCommand
 from .commands.package import PackageCommand
 from .commands.quota import (
+    QuotaCommand,
     QuotaDeleteCommand,
     QuotaExportCommand,
     QuotaImportCommand,
@@ -50,7 +52,6 @@ def create_application() -> Application:
     application.add(StatusCommand())
     application.add(TestCommand())
     application.add(PackageCommand())
-    application.add(BuildsCommand())
     application.add(DistributeCommand())
     application.add(DestroyCommand())
     application.add(CleanupCommand())
@@ -58,17 +59,20 @@ def create_application() -> Application:
     # application.add(TokenCommand())  # Temporarily disabled
 
     # Context management commands
+    application.add(ContextCommand())
     application.add(ContextListCommand())
     application.add(ContextCurrentCommand())
     application.add(ContextUseCommand())
     application.add(ContextShowCommand())
 
     # Config management commands
+    application.add(ConfigCommand())
     application.add(ConfigValidateCommand())
     application.add(ConfigExportCommand())
     application.add(ConfigImportCommand())
 
     # Quota management commands
+    application.add(QuotaCommand())
     application.add(QuotaSetUserCommand())
     application.add(QuotaSetGroupCommand())
     application.add(QuotaSetDefaultCommand())
@@ -85,6 +89,16 @@ def create_application() -> Application:
 
 def main():
     """Main entry point for the CLI."""
+    # Use OS certificate store if truststore is available.
+    # Fixes SSL errors with corporate proxies (Zscaler, Netskope, etc.)
+    # that intercept HTTPS and re-sign with their own CA.
+    try:
+        import truststore
+
+        truststore.inject_into_ssl()
+    except ImportError:
+        pass
+
     application = create_application()
     application.run()
 

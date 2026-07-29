@@ -171,7 +171,7 @@ class TestCommand(Command):
         console.print("✓ Found config.json")
 
         # Read and display config details
-        with open(config_path) as f:
+        with open(config_path, encoding="utf-8") as f:
             pkg_config = json.load(f)
             # Try to read from the specified profile name, fall back to "ClaudeCode" for backward compatibility
             profile_config = pkg_config.get(test_profile_name) or pkg_config.get("ClaudeCode", {})
@@ -232,7 +232,12 @@ class TestCommand(Command):
 
             # Set up temporary AWS profile for testing
             test_profile = f"ccwb-test-{uuid.uuid4().hex[:8]}"
-            credential_command = f"/bin/sh -c 'CCWB_PROFILE={test_profile_name} {credential_binary}'"
+            # Pass the profile via --profile flag (cross-platform, no shell wrapper).
+            # The binary also reads CCWB_PROFILE, but a POSIX shell wrapper does not
+            # exist on Windows, so the --profile flag is used instead.
+            # Quote the binary path so a space in it survives botocore's shell split
+            # (shlex on POSIX); the profile name is validated to [A-Za-z0-9-] so needs none.
+            credential_command = f'"{credential_binary}" --profile {test_profile_name}'
             subprocess.run(
                 ["aws", "configure", "set", f"profile.{test_profile}.credential_process", credential_command],
                 capture_output=True,
@@ -271,9 +276,12 @@ class TestCommand(Command):
         console.print(f"[dim]Using temporary profile: {test_profile}[/dim]")
 
         # Configure the test profile
-        # Set environment variable to tell credential binary which profile to use from config.json
-        # Use shell to set environment variable
-        credential_command = f"/bin/sh -c 'CCWB_PROFILE={test_profile_name} {credential_binary}'"
+        # Pass the profile via --profile flag (cross-platform, no shell wrapper).
+        # The binary also reads CCWB_PROFILE, but a POSIX shell wrapper does not
+        # exist on Windows, so the --profile flag is used instead.
+        # Quote the binary path so a space in it survives botocore's shell split
+        # (shlex on POSIX); the profile name is validated to [A-Za-z0-9-] so needs none.
+        credential_command = f'"{credential_binary}" --profile {test_profile_name}'
         aws_config_result = subprocess.run(
             ["aws", "configure", "set", f"profile.{test_profile}.credential_process", credential_command],
             capture_output=True,
@@ -406,6 +414,14 @@ class TestCommand(Command):
                 else:
                     test_results.append(("Quota Monitoring", "-", "Skipped (not enabled)"))
 
+                # Test 7: Local collector sidecar (sidecar mode only)
+                monitoring_mode = getattr(profile, "monitoring_mode", "central")
+                if profile.monitoring_enabled and monitoring_mode == "sidecar":
+                    task = progress.add_task("Testing local collector sidecar...", total=None)
+                    result = self._test_local_collector(package_dir)
+                    test_results.append(("Local Collector", result["status"], result["details"]))
+                    progress.update(task, completed=True)
+
         # Display results
         console.print("\n")
         for test_name, status, details in test_results:
@@ -492,7 +508,7 @@ class TestCommand(Command):
             if not aws_config_file.exists():
                 return {"status": "✗", "details": "AWS config file not found"}
 
-            with open(aws_config_file) as f:
+            with open(aws_config_file, encoding="utf-8") as f:
                 content = f.read()
                 if f"[profile {profile_name}]" in content:
                     return {"status": "✓", "details": f"Profile '{profile_name}' found"}
@@ -808,13 +824,53 @@ class TestCommand(Command):
         except Exception as e:
             return {"status": "✗", "details": str(e)[:50]}
 
+    def _test_local_collector(self, package_dir: Path) -> dict:
+        """Test that the local OTEL collector sidecar binary is present and can start."""
+        import platform as platform_mod
+        import time
+
+        system = platform_mod.system().lower()
+        arch = platform_mod.machine().lower()
+
+        # Determine expected binary name
+        if system == "darwin":
+            suffix = "macos-arm64" if arch == "arm64" else "macos-intel"
+        elif system == "windows":
+            suffix = "windows.exe"
+        else:
+            suffix = "linux-arm64" if arch in ["arm64", "aarch64"] else "linux-x64"
+
+        binary = package_dir / f"otelcol-{suffix}"
+        if not binary.exists():
+            return {"status": "✗", "details": f"Collector binary not found: otelcol-{suffix}"}
+
+        config = package_dir / "collector-config.yaml"
+        if not config.exists():
+            return {"status": "✗", "details": "collector-config.yaml not found in package"}
+
+        # Try starting the collector briefly to verify it's functional
+        try:
+            proc = subprocess.Popen(
+                [str(binary), "--config", str(config)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            time.sleep(2)
+            if proc.poll() is not None:
+                stderr = proc.stderr.read().decode()[:100]
+                return {"status": "✗", "details": f"Collector exited immediately: {stderr}"}
+            proc.terminate()
+            proc.wait(timeout=5)
+            return {"status": "✓", "details": f"Collector binary OK ({binary.name})"}
+        except Exception as e:
+            return {"status": "✗", "details": str(e)[:80]}
+
     def _get_package_profile_name(self, package_dir: Path) -> str | None:
         """Get the profile name from the package's config.json."""
         config_file = package_dir / "config.json"
         if not config_file.exists():
             return None
         try:
-            with open(config_file) as f:
+            with open(config_file, encoding="utf-8") as f:
                 config = json.load(f)
             # config.json has profile names as top-level keys
             # Return the first (usually only) profile
@@ -943,7 +999,7 @@ class TestCommand(Command):
             if result.returncode == 0:
                 # Check if we got a response
                 try:
-                    with open("/tmp/bedrock-test-output.json") as f:
+                    with open("/tmp/bedrock-test-output.json", encoding="utf-8") as f:
                         response = json.load(f)
                         if "content" in response and len(response["content"]) > 0:
                             text = response["content"][0].get("text", "").strip()
@@ -982,6 +1038,10 @@ class TestCommand(Command):
     def _get_expected_account(self, config_profile) -> str:
         """Get the expected AWS account ID from the deployed stack."""
         try:
+            # Skip auth stack lookup when SSO is disabled
+            if not getattr(config_profile, "sso_enabled", True):
+                return None
+
             # Try to get account ID from the auth stack
             stack_name = config_profile.stack_names.get("auth", f"{config_profile.identity_pool_name}-stack")
 
@@ -1176,30 +1236,6 @@ class TestCommand(Command):
         except Exception:
             return None
 
-    def _invoke_metrics_aggregator(self, profile) -> dict:
-        """Force-invoke the metrics aggregator Lambda."""
-        try:
-            lambda_client = boto3.client("lambda", region_name=profile.aws_region)
-
-            # Lambda name is fixed (deployed by monitoring stack)
-            function_name = "ClaudeCode-MetricsAggregator"
-
-            response = lambda_client.invoke(
-                FunctionName=function_name,
-                InvocationType="RequestResponse",
-                Payload=b"{}",
-            )
-
-            if response["StatusCode"] == 200:
-                return {"name": "Aggregator Lambda", "status": "✓", "details": "Invoked successfully"}
-            else:
-                return {"name": "Aggregator Lambda", "status": "✗", "details": f"Status: {response['StatusCode']}"}
-
-        except lambda_client.exceptions.ResourceNotFoundException:
-            return {"name": "Aggregator Lambda", "status": "✗", "details": "Lambda function not found"}
-        except Exception as e:
-            return {"name": "Aggregator Lambda", "status": "✗", "details": str(e)[:60]}
-
     def _make_quota_test_bedrock_call(self, aws_profile: str, region: str, selected_model: str = None) -> dict:
         """Make a small Bedrock call for testing usage capture."""
         import os
@@ -1295,14 +1331,7 @@ class TestCommand(Command):
             # Step 3: Wait for CloudWatch Logs sync
             time.sleep(2)
 
-            # Step 4: Force-invoke metrics aggregator Lambda
-            aggregator_result = self._invoke_metrics_aggregator(profile)
-            if aggregator_result["status"] != "✓":
-                results.append(aggregator_result)
-                return results
-            results.append(aggregator_result)
-
-            # Step 5: Wait for aggregator to complete (it queries logs)
+            # Step 4: Wait for metrics to propagate
             time.sleep(5)
 
             # Step 6: Query usage again

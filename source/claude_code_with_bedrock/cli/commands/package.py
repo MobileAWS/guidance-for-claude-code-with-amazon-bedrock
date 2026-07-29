@@ -1053,6 +1053,23 @@ EOF
     echo "  ✓ Created AWS profile '$PROFILE_NAME'"
 done
 
+# Optional: Configure Codex if org has it enabled
+if [ -f "codex-config.json" ]; then
+  CODEX_ENABLED=$(python3 -c "import json; d=json.load(open('codex-config.json')); print('true' if d.get('codex_enabled') else 'false')" 2>/dev/null || echo 'false')
+  CODEX_API_KEY=$(python3 -c "import json; print(json.load(open('codex-config.json')).get('codex_api_key',''))" 2>/dev/null || echo '')
+  if [ "$CODEX_ENABLED" = "true" ] && [ -n "$CODEX_API_KEY" ]; then
+    echo "Configuring Codex..."
+    mkdir -p ~/.codex
+    printf 'model_provider = "amazon-bedrock"\nmodel = "anthropic.claude-opus-4-5"\n' > ~/.codex/config.toml
+    SHELL_PROFILE="$HOME/.zshrc"
+    [ ! -f "$SHELL_PROFILE" ] && SHELL_PROFILE="$HOME/.bashrc"
+    [ ! -f "$SHELL_PROFILE" ] && SHELL_PROFILE="$HOME/.profile"
+    sed -i.bak '/# Codex Bedrock/,+1d' "$SHELL_PROFILE" 2>/dev/null || true
+    printf '\n# Codex Bedrock\nexport AWS_BEARER_TOKEN_BEDROCK="%s"\n' "$CODEX_API_KEY" >> "$SHELL_PROFILE"
+    echo "OK Codex configured"
+  fi
+fi
+
 # Post-install validation
 echo
 echo "Validating installation..."
@@ -1066,8 +1083,6 @@ if [ -f ~/.claude/settings.json ]; then
 else
     echo "  WARN settings.json not found at: ~/.claude/settings.json"
 fi
-
-# Install Node.js if missing (required for Claude Code CLI)
 if ! command -v node &> /dev/null; then
     echo "⚠️  Node.js not found. Installing..."
     if [[ "$OSTYPE" == "darwin"* ]]; then
@@ -1243,6 +1258,15 @@ fi
             f.write(run_content)
         run_script.chmod(0o755)
 
+        # Copy codex-config.json into the output bundle if the Nexus Lambda
+        # placed it in the working directory (the file is generated externally —
+        # package.py only forwards it when present).
+        codex_config_src = Path.cwd() / "codex-config.json"
+        if codex_config_src.exists():
+            import shutil as _shutil_codex
+            _shutil_codex.copy2(codex_config_src, output_dir / "codex-config.json")
+            self.line("  <info>codex-config.json included in bundle</info>")
+
         # Create Windows installer when Windows binaries are present
         if "windows" in platforms_built:
             self._create_windows_installer(output_dir, profile)
@@ -1346,6 +1370,22 @@ if %errorlevel% neq 0 (
     echo ERROR: Failed to configure AWS profiles
     pause
     exit /b 1
+)
+
+REM Optional: Configure Codex if org has it enabled
+if exist "codex-config.json" (
+    powershell -NoProfile -Command ^
+        "$cfg = Get-Content 'codex-config.json' | ConvertFrom-Json; " ^
+        "$enabled = [bool]$cfg.codex_enabled; " ^
+        "$apiKey = if ($cfg.codex_api_key) {{ $cfg.codex_api_key }} else {{ '' }}; " ^
+        "if ($enabled -and $apiKey) {{ " ^
+        "    Write-Host 'Configuring Codex...'; " ^
+        "    $codexDir = Join-Path $env:USERPROFILE '.codex'; " ^
+        "    if (-not (Test-Path $codexDir)) {{ New-Item -ItemType Directory -Path $codexDir | Out-Null }}; " ^
+        "    Set-Content -Path (Join-Path $codexDir 'config.toml') -Value \"model_provider = `"amazon-bedrock`"`r`nmodel = `"anthropic.claude-opus-4-5`"\"; " ^
+        "    [System.Environment]::SetEnvironmentVariable('AWS_BEARER_TOKEN_BEDROCK', $apiKey, 'User'); " ^
+        "    Write-Host 'OK Codex configured' " ^
+        "}}"
 )
 
 echo.

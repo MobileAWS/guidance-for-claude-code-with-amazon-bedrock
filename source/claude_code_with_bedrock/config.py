@@ -116,6 +116,9 @@ class Profile:
     cowork_credential_mode: str = "helper"  # "helper" (inferenceCredentialHelper) or "profile" (inferenceBedrockProfile)
     cowork_credential_helper_ttl_sec: int = 3500  # inferenceCredentialHelperTtlSec (refresh before 1h STS expiry)
 
+    # OpenAI Codex configuration
+    codex_enabled: bool = False  # Generate codex.toml and configure AWS_BEARER_TOKEN_BEDROCK during packaging
+
     # Legacy field support
     @property
     def okta_domain(self) -> str:

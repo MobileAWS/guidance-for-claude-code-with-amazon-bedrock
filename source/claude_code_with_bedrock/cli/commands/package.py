@@ -276,6 +276,11 @@ class PackageCommand(Command):
         console.print("[cyan]Creating installer script...[/cyan]")
         self._create_installer(output_dir, profile, built_executables, built_otel_helpers)
 
+        # Create Codex config when enabled for this profile
+        if getattr(profile, "codex_enabled", False):
+            console.print("[cyan]Creating Codex configuration...[/cyan]")
+            self._create_codex_config(output_dir, profile)
+
         # Copy shell wrapper for OTEL helper (Layer 2 caching - the shell wrapper
         # warms the per-profile cache before the Go otel-helper binary runs)
         if built_otel_helpers:
@@ -557,6 +562,11 @@ class PackageCommand(Command):
         # Regenerate installer scripts
         console.print("[cyan]Generating installer scripts...[/cyan]")
         self._create_installer(output_dir, profile, built_executables, built_otel_helpers)
+
+        # Regenerate Codex config when enabled for this profile
+        if getattr(profile, "codex_enabled", False):
+            console.print("[cyan]Generating Codex configuration...[/cyan]")
+            self._create_codex_config(output_dir, profile)
 
         # Regenerate documentation
         console.print("[cyan]Generating documentation...[/cyan]")
@@ -1053,6 +1063,76 @@ EOF
     echo "  ✓ Created AWS profile '$PROFILE_NAME'"
 done
 
+# ── Codex setup (optional) ──────────────────────────────────────────────────
+# If the packager embedded a codex.toml (codex_enabled=true), install it so
+# that OpenAI Codex CLI can call Bedrock without extra user configuration.
+if [ -f "codex.toml" ]; then
+    echo
+    echo "Installing Codex configuration..."
+    mkdir -p ~/.codex
+
+    # Idempotent: back up any pre-existing config before overwriting
+    if [ -f ~/.codex/config.toml ]; then
+        CODEX_BACKUP="config.toml.backup-$(date +%Y%m%d-%H%M%S)"
+        cp ~/.codex/config.toml ~/.codex/$CODEX_BACKUP
+        echo "  Backed up existing Codex config to: ~/.codex/$CODEX_BACKUP"
+    fi
+
+    cp codex.toml ~/.codex/config.toml
+    echo "  ✓ Codex config written to: ~/.codex/config.toml"
+
+    # Read the bearer token placeholder from codex.toml and resolve it against
+    # the current AWS credentials so the shell export is populated at install time.
+    BEARER_TOKEN_LINE=$(grep '^aws_bearer_token_bedrock' ~/.codex/config.toml 2>/dev/null || true)
+    if [ -n "$BEARER_TOKEN_LINE" ]; then
+        BEARER_TOKEN=$(echo "$BEARER_TOKEN_LINE" | sed 's/^aws_bearer_token_bedrock[[:space:]]*=[[:space:]]*"\?//;s/"\?[[:space:]]*$//')
+    else
+        # Derive a token via the credential-process binary so the env var is
+        # immediately usable without requiring the user to re-source their shell.
+        BEARER_TOKEN=$(~/claude-code-with-bedrock/credential-process --profile "$FIRST_PROFILE" --output-bearer-token 2>/dev/null || true)
+    fi
+
+    if [ -n "$BEARER_TOKEN" ]; then
+        BEARER_EXPORT="export AWS_BEARER_TOKEN_BEDROCK=\"$BEARER_TOKEN\""
+
+        # Append to ~/.zshrc
+        if [ -f ~/.zshrc ]; then
+            if ! grep -q 'AWS_BEARER_TOKEN_BEDROCK' ~/.zshrc; then
+                echo "" >> ~/.zshrc
+                echo "# Added by Claude Code with Bedrock installer" >> ~/.zshrc
+                echo "$BEARER_EXPORT" >> ~/.zshrc
+                echo "  ✓ AWS_BEARER_TOKEN_BEDROCK appended to ~/.zshrc"
+            else
+                # Update the existing line in-place
+                sed -i.bak "s|^export AWS_BEARER_TOKEN_BEDROCK=.*|$BEARER_EXPORT|" ~/.zshrc
+                rm -f ~/.zshrc.bak
+                echo "  ✓ AWS_BEARER_TOKEN_BEDROCK updated in ~/.zshrc"
+            fi
+        fi
+
+        # Append to ~/.bashrc
+        if [ -f ~/.bashrc ]; then
+            if ! grep -q 'AWS_BEARER_TOKEN_BEDROCK' ~/.bashrc; then
+                echo "" >> ~/.bashrc
+                echo "# Added by Claude Code with Bedrock installer" >> ~/.bashrc
+                echo "$BEARER_EXPORT" >> ~/.bashrc
+                echo "  ✓ AWS_BEARER_TOKEN_BEDROCK appended to ~/.bashrc"
+            else
+                sed -i.bak "s|^export AWS_BEARER_TOKEN_BEDROCK=.*|$BEARER_EXPORT|" ~/.bashrc
+                rm -f ~/.bashrc.bak
+                echo "  ✓ AWS_BEARER_TOKEN_BEDROCK updated in ~/.bashrc"
+            fi
+        fi
+
+        # Export for the remainder of this install session
+        export AWS_BEARER_TOKEN_BEDROCK="$BEARER_TOKEN"
+    else
+        echo "  INFO: Could not derive bearer token at install time."
+        echo "        Set AWS_BEARER_TOKEN_BEDROCK in your shell before using Codex."
+    fi
+fi
+# ── End Codex setup ──────────────────────────────────────────────────────────
+
 # Post-install validation
 echo
 echo "Validating installation..."
@@ -1348,6 +1428,47 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
+REM -- Codex setup (optional) -----------------------------------------------
+REM If the packager embedded a codex.toml (codex_enabled=true), install it so
+REM that OpenAI Codex CLI can call Bedrock without extra user configuration.
+if exist "codex.toml" (
+    echo.
+    echo Installing Codex configuration...
+
+    REM Create ~/.codex directory if it doesn't exist
+    if not exist "%USERPROFILE%\.codex" mkdir "%USERPROFILE%\.codex"
+
+    REM Idempotent: back up any pre-existing config before overwriting
+    if exist "%USERPROFILE%\.codex\config.toml" (
+        for /f "tokens=1-3 delims=/ " %%a in ('date /t') do set CODEX_DATE=%%c%%a%%b
+        for /f "tokens=1-2 delims=: " %%a in ('time /t') do set CODEX_TIME=%%a%%b
+        set CODEX_BACKUP=config.toml.backup-%CODEX_DATE%-%CODEX_TIME%
+        copy /Y "%USERPROFILE%\.codex\config.toml" "%USERPROFILE%\.codex\!CODEX_BACKUP!" >nul
+        echo   Backed up existing Codex config to: %USERPROFILE%\.codex\!CODEX_BACKUP!
+    )
+
+    copy /Y "codex.toml" "%USERPROFILE%\.codex\config.toml" >nul
+    echo   OK Codex config written to: %USERPROFILE%\.codex\config.toml
+
+    REM Read aws_bearer_token_bedrock from codex.toml and set it as a
+    REM persistent user environment variable via PowerShell.
+    powershell -NoProfile -Command ^
+        "$ErrorActionPreference = 'SilentlyContinue'; " ^
+        "$toml = Get-Content '%USERPROFILE%\.codex\config.toml' -Raw; " ^
+        "$match = [regex]::Match($toml, 'aws_bearer_token_bedrock\\s*=\\s*[^\\S\\r\\n]*([^\\r\\n]+)'); " ^
+        "if ($match.Success) {{ " ^
+        "  $token = $match.Groups[1].Value.Trim().Trim('\"'); " ^
+        "  [System.Environment]::SetEnvironmentVariable('AWS_BEARER_TOKEN_BEDROCK', $token, 'User'); " ^
+        "  Write-Host '  OK AWS_BEARER_TOKEN_BEDROCK set in user environment' " ^
+        "}} else {{ " ^
+        "  Write-Host '  INFO: aws_bearer_token_bedrock not found in codex.toml -- skipping env var' " ^
+        "}}"
+    if %errorlevel% neq 0 (
+        echo   WARNING: Could not set AWS_BEARER_TOKEN_BEDROCK. Set it manually if using Codex.
+    )
+)
+REM -- End Codex setup --------------------------------------------------------
+
 echo.
 echo ======================================
 
@@ -1402,6 +1523,49 @@ pause
 
         # Note: chmod not needed on Windows batch files
         return installer_path
+
+    def _create_codex_config(self, output_dir: Path, profile) -> Path:
+        """Create a codex.toml file in the output directory for OpenAI Codex CLI.
+
+        This file is embedded in the distribution package when ``codex_enabled``
+        is set on the profile.  The install scripts (install.sh / install.bat)
+        detect its presence and:
+
+        * Copy it to ``~/.codex/config.toml`` (``%USERPROFILE%\.codex\config.toml``
+          on Windows), backing up any pre-existing file first.
+        * Populate / persist ``AWS_BEARER_TOKEN_BEDROCK`` in the user's shell
+          config (shell rc files on macOS/Linux, user environment on Windows).
+
+        Args:
+            output_dir: The timestamped dist directory being assembled.
+            profile: Active ``Profile`` object — used to read ``selected_model``
+                     and ``aws_region``.
+
+        Returns:
+            Path to the written ``codex.toml``.
+        """
+        model = getattr(profile, "selected_model", None) or "us.anthropic.claude-sonnet-4-5"
+
+        codex_toml_lines = [
+            '# Codex CLI configuration — generated by Claude Code with Bedrock installer',
+            '# https://github.com/openai/codex',
+            '',
+            'model_provider = "amazon-bedrock"',
+            f'model = "{model}"',
+            '',
+            '# AWS_BEARER_TOKEN_BEDROCK is set in your shell by the installer.',
+            '# It is refreshed automatically by the credential-process binary.',
+            '# You can also set it manually:',
+            '#   export AWS_BEARER_TOKEN_BEDROCK=$(aws sts get-session-token --query',
+            '#     Credentials.SessionToken --output text)',
+            'aws_bearer_token_bedrock = ""',
+        ]
+
+        codex_toml_path = output_dir / "codex.toml"
+        with open(codex_toml_path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("\n".join(codex_toml_lines) + "\n")
+
+        return codex_toml_path
 
     def _create_documentation(self, output_dir: Path, profile, timestamp: str):
         """Create user documentation."""

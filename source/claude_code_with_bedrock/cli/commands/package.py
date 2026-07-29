@@ -1193,6 +1193,55 @@ if [[ -z "$REPLY" ]] || [[ $REPLY =~ ^[Yy]$ ]]; then
     echo "Starting Claude Code..."
     exec claude
 fi
+
+# ── Codex setup ──────────────────────────────────────────────────────────────
+CODEX_ENABLED=$($PYTHON -c "
+import json, sys
+profiles = json.load(open('config.json'))
+first = next(iter(profiles.values()), {{}})
+print('true' if first.get('codex_enabled') else 'false')
+" 2>/dev/null || echo 'false')
+
+if [ "$CODEX_ENABLED" = "true" ]; then
+    mkdir -p ~/.codex
+    cat > ~/.codex/config.toml << 'CODEX_TOML'
+model_provider = "amazon-bedrock"
+CODEX_TOML
+
+    # If a codex_api_key is present, export it as AWS_BEARER_TOKEN_BEDROCK
+    CODEX_API_KEY=$($PYTHON -c "
+import json, sys
+profiles = json.load(open('config.json'))
+first = next(iter(profiles.values()), {{}})
+print(first.get('codex_api_key', ''))
+" 2>/dev/null || echo '')
+
+    if [ -n "$CODEX_API_KEY" ]; then
+        for RC_FILE in ~/.bashrc ~/.zshrc; do
+            if [ -f "$RC_FILE" ] || [ "$RC_FILE" = ~/.bashrc ]; then
+                # Remove any existing guarded block
+                if grep -q '# BEGIN NEXUS CODEX' "$RC_FILE" 2>/dev/null; then
+                    $PYTHON -c "
+import re, sys
+path = sys.argv[1]
+try:
+    text = open(path).read()
+except FileNotFoundError:
+    sys.exit(0)
+cleaned = re.sub(r'\\n# BEGIN NEXUS CODEX.*?# END NEXUS CODEX\\n', '\\n', text, flags=re.DOTALL)
+open(path, 'w').write(cleaned)
+" "$RC_FILE"
+                fi
+                # Append fresh guarded block
+                printf '\\n# BEGIN NEXUS CODEX\\nexport AWS_BEARER_TOKEN_BEDROCK="%s"\\n# END NEXUS CODEX\\n' "$CODEX_API_KEY" >> "$RC_FILE"
+            fi
+        done
+    fi
+
+    echo "\u2713 Codex configured"
+else
+    echo "\u2139 Codex not enabled for this org"
+fi
 """
 
         installer_path = output_dir / "install.sh"
@@ -1394,6 +1443,9 @@ echo.
 echo Note: Authentication will automatically open your browser when needed.
 echo.
 pause
+
+REM ── Codex setup ──────────────────────────────────────────────────────────────
+powershell -NoProfile -Command "$ErrorActionPreference = 'Stop'; $cfg = Get-Content config.json | ConvertFrom-Json; $first = $cfg.PSObject.Properties | Select-Object -First 1 -ExpandProperty Value; $enabled = [bool]($first.PSObject.Properties['codex_enabled'] -and $first.codex_enabled -eq $true); if ($enabled) {{ $codexDir = Join-Path $env:USERPROFILE '.codex'; if (-not (Test-Path $codexDir)) {{ New-Item -ItemType Directory -Path $codexDir | Out-Null }}; Set-Content -Path (Join-Path $codexDir 'config.toml') -Value 'model_provider = \"amazon-bedrock\"' -Encoding UTF8; $apiKey = $first.PSObject.Properties['codex_api_key']?.Value; if ($apiKey) {{ [System.Environment]::SetEnvironmentVariable('AWS_BEARER_TOKEN_BEDROCK', $apiKey, 'User') }}; Write-Host '+ Codex configured' }} else {{ Write-Host 'i Codex not enabled for this org' }}"
 """
 
         installer_path = output_dir / "install.bat"

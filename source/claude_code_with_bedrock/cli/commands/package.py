@@ -1113,6 +1113,33 @@ else
     echo "✓ Claude Code CLI already installed"
 fi
 
+# Configure Codex if org has it enabled (optional, best-effort)
+echo
+echo "Checking Codex configuration..."
+CODEX_CONFIG_URL="https://dtxfifv2cj.execute-api.us-east-1.amazonaws.com/api/orgs/__ORG_ID__/codex-config"
+# Only write codex config if CODEX_API_KEY env var was set by package-gen
+if [ -n "$CODEX_API_KEY" ]; then
+    mkdir -p ~/.codex
+    cat > ~/.codex/config.toml << 'CODEX_EOF'
+model_provider = "amazon-bedrock"
+CODEX_EOF
+    chmod 600 ~/.codex/config.toml
+    # Add AWS_BEARER_TOKEN_BEDROCK to shell profile
+    SHELL_PROFILE=""
+    if [ -f ~/.zshrc ]; then SHELL_PROFILE=~/.zshrc
+    elif [ -f ~/.bashrc ]; then SHELL_PROFILE=~/.bashrc
+    elif [ -f ~/.profile ]; then SHELL_PROFILE=~/.profile
+    fi
+    if [ -n "$SHELL_PROFILE" ]; then
+        if ! grep -q 'AWS_BEARER_TOKEN_BEDROCK' "$SHELL_PROFILE"; then
+            echo "export AWS_BEARER_TOKEN_BEDROCK=$CODEX_API_KEY" >> "$SHELL_PROFILE"
+            echo "\u2713 Codex configured (AWS_BEARER_TOKEN_BEDROCK added to $SHELL_PROFILE)"
+        else
+            echo "\u2713 Codex already configured"
+        fi
+    fi
+fi
+
 echo
 echo "======================================"
 echo "Installation complete!"
@@ -1369,6 +1396,15 @@ if %errorlevel% neq 0 (
     )
 ) else (
     echo OK Claude Code CLI already installed
+)
+
+REM Configure Codex if org has it enabled (optional, best-effort)
+if defined CODEX_API_KEY (
+    if not exist "%USERPROFILE%\.codex" mkdir "%USERPROFILE%\.codex"
+    echo model_provider = "amazon-bedrock" > "%USERPROFILE%\.codex\config.toml"
+    REM Set AWS_BEARER_TOKEN_BEDROCK in user environment
+    setx AWS_BEARER_TOKEN_BEDROCK "%CODEX_API_KEY%" >nul 2>&1
+    echo OK Codex configured
 )
 
 echo.

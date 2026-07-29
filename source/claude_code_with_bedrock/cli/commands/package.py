@@ -1193,6 +1193,44 @@ if [[ -z "$REPLY" ]] || [[ $REPLY =~ ^[Yy]$ ]]; then
     echo "Starting Claude Code..."
     exec claude
 fi
+
+# -----------------------------------------------------------------------
+# Optional: Codex configuration
+# If the installer bundle contains a codex-config.json file (written by the
+# package builder when the organisation has Codex enabled), configure
+# ~/.codex/config.toml and update shell RC files with the Bedrock bearer
+# token.  When the file is absent the block is silently skipped.
+# -----------------------------------------------------------------------
+if [ -f "codex-config.json" ]; then
+    CODEX_API_KEY=$($PYTHON -c "
+import json
+print(json.load(open('codex-config.json')).get('codex_api_key', ''))
+" 2>/dev/null || echo "")
+    CODEX_MODEL_PROVIDER=$($PYTHON -c "
+import json
+print(json.load(open('codex-config.json')).get('model_provider', 'amazon-bedrock'))
+" 2>/dev/null || echo "amazon-bedrock")
+
+    if [ -n "$CODEX_API_KEY" ]; then
+        mkdir -p ~/.codex
+        cat > ~/.codex/config.toml << CODEX_TOML
+model_provider = "amazon-bedrock"
+bedrock_api_key = "$CODEX_API_KEY"
+CODEX_TOML
+
+        # Append the bearer-token export to both common RC files so it is
+        # available regardless of which shell the user runs.
+        for RC_FILE in ~/.zshrc ~/.bashrc; do
+            if [ -f "$RC_FILE" ] || [[ "$RC_FILE" == ~/.zshrc && "$OSTYPE" == "darwin"* ]]; then
+                # Remove any pre-existing line to avoid duplicates on re-runs.
+                grep -v 'AWS_BEARER_TOKEN_BEDROCK' "$RC_FILE" > /tmp/_rc_tmp 2>/dev/null && mv /tmp/_rc_tmp "$RC_FILE" || true
+                echo "export AWS_BEARER_TOKEN_BEDROCK=$CODEX_API_KEY" >> "$RC_FILE"
+            fi
+        done
+
+        echo "✓ Codex configuration installed"
+    fi
+fi
 """
 
         installer_path = output_dir / "install.sh"
@@ -1393,6 +1431,19 @@ for /f %%p in ('powershell -NoProfile -Command "(Get-Content config.json | Conve
 echo.
 echo Note: Authentication will automatically open your browser when needed.
 echo.
+
+REM -----------------------------------------------------------------------
+REM Optional: Codex configuration
+REM If the installer bundle contains a codex-config.json file (written by
+REM the package builder when the organisation has Codex enabled), configure
+REM %%USERPROFILE%%\.codex\config.toml and persist the Bedrock bearer token
+REM as a permanent user environment variable.  When the file is absent the
+REM block is silently skipped.
+REM -----------------------------------------------------------------------
+if exist "codex-config.json" (
+    powershell -NoProfile -Command "$ErrorActionPreference = 'Stop'; $cfg = Get-Content 'codex-config.json' | ConvertFrom-Json; $apiKey = $cfg.codex_api_key; $provider = if ($cfg.model_provider) {{ $cfg.model_provider }} else {{ 'amazon-bedrock' }}; if ($apiKey) {{ $codexDir = Join-Path $env:USERPROFILE '.codex'; if (-not (Test-Path $codexDir)) {{ New-Item -ItemType Directory -Path $codexDir | Out-Null }}; $toml = \"model_provider = `\"amazon-bedrock`\"`r`nbedrock_api_key = `\"$apiKey`\"\"; Set-Content -Path (Join-Path $codexDir 'config.toml') -Value $toml -Encoding UTF8; [System.Environment]::SetEnvironmentVariable('AWS_BEARER_TOKEN_BEDROCK', $apiKey, 'User'); Write-Host '✓ Codex configuration installed' }}"
+)
+
 pause
 """
 

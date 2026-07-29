@@ -78,6 +78,11 @@ type ProfileConfig struct {
 	// from "explicitly false" (passthrough mode).
 	SsoEnabled *bool `json:"sso_enabled,omitempty"`
 
+	// CodexConfigURL is the S3 URL template for fetching org-specific Codex CLI
+	// configuration. The literal string "{org_id}" is replaced with the active
+	// org ID at runtime. When empty, the default distribution bucket URL is used.
+	CodexConfigURL string `json:"codex_config_url,omitempty"`
+
 	// Legacy field names
 	OktaDomain   string `json:"okta_domain"`
 	OktaClientID string `json:"okta_client_id"`

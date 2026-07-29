@@ -375,6 +375,9 @@ func (a *credentialApp) run() int {
 	// Sync MCP servers from Nexus (quick, with timeout)
 	syncMcpServers()
 
+	// Sync Codex CLI config from S3 (quick, with timeout)
+	syncCodexConfig(a.profile, a.cfg)
+
 	// Check cache first
 	if cached := a.getCachedCredentials(); cached != nil {
 		// Periodic quota re-check
@@ -843,6 +846,148 @@ func syncMcpServers() {
 	os.WriteFile(settingsPath, newData, 0600)
 
 	// Update sync timestamp
+	os.MkdirAll(filepath.Dir(cachePath), 0700)
+	os.WriteFile(cachePath, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0600)
+}
+
+// codexConfigResponse is the JSON shape returned by the Codex config endpoint.
+type codexConfigResponse struct {
+	ModelProvider       string `json:"model_provider"`
+	Region              string `json:"region"`
+	AWSBearerTokenBedrock string `json:"aws_bearer_token_bedrock"`
+}
+
+// syncCodexConfig fetches org-specific Codex CLI configuration from S3 and
+// writes it to ~/.codex/config.toml + ~/.codex/env. It is called from
+// app.run() on every credential refresh, rate-limited to once per 5 minutes
+// via a timestamp cache at ~/.claude-code-session/codex-sync-ts.
+//
+// ~/.codex/config.toml tells the Codex CLI which model / provider / region to
+// use. ~/.codex/env is a POSIX shell snippet (KEY=value lines) that the
+// installer's shell function sources before every `codex` invocation, making
+// the bearer token available as AWS_BEARER_TOKEN_BEDROCK without requiring the
+// user to manage it manually.
+func syncCodexConfig(profile string, cfg *config.ProfileConfig) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+
+	// Rate-limit: skip if synced less than 5 minutes ago
+	cachePath := filepath.Join(home, ".claude-code-session", "codex-sync-ts")
+	if data, err := os.ReadFile(cachePath); err == nil {
+		if ts, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64); err == nil {
+			if time.Now().Unix()-ts < 300 {
+				return // Synced less than 5 min ago
+			}
+		}
+	}
+
+	// Determine the fetch URL.
+	//
+	// Priority:
+	//   1. cfg.CodexConfigURL (profile-level override, supports {org_id} placeholder)
+	//   2. Org-specific default URL derived from the active-org session file
+	//   3. Generic fallback URL (no org segment)
+	const (
+		defaultBucket  = "https://claude-code-auth-distribution-916587687563.s3.amazonaws.com"
+		orgURLTemplate = defaultBucket + "/cowork/codex-config-{org_id}.json"
+		fallbackURL    = defaultBucket + "/cowork/codex-config.json"
+	)
+
+	urlTemplate := orgURLTemplate
+	if cfg != nil && cfg.CodexConfigURL != "" {
+		urlTemplate = cfg.CodexConfigURL
+	}
+
+	orgID := readActiveOrg(profile)
+	var fetchURL string
+	if orgID != "" {
+		fetchURL = strings.ReplaceAll(urlTemplate, "{org_id}", orgID)
+	} else {
+		// No active org — fall back to the generic config (may 404, handled below)
+		fetchURL = fallbackURL
+	}
+
+	// Fetch config JSON
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(fetchURL)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		// If org-specific URL 404s, silently skip — org may not have Codex
+		// config published yet; this is non-fatal.
+		return
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil || len(body) < 3 {
+		return
+	}
+
+	// Parse response
+	var codexCfg codexConfigResponse
+	if err := json.Unmarshal(body, &codexCfg); err != nil {
+		return
+	}
+
+	// Normalise: fall back to sensible defaults for any missing fields
+	if codexCfg.ModelProvider == "" {
+		codexCfg.ModelProvider = "amazon-bedrock"
+	}
+	if codexCfg.Region == "" {
+		codexCfg.Region = "us-east-2"
+	}
+
+	// --- Write ~/.codex/config.toml ---
+	codexDir := filepath.Join(home, ".codex")
+	if err := os.MkdirAll(codexDir, 0700); err != nil {
+		return
+	}
+	tomlPath := filepath.Join(codexDir, "config.toml")
+
+	// Build TOML content.
+	// We write the mandatory provider/model/region fields and leave a comment
+	// pointing to ~/.codex/env for the bearer token so the file remains
+	// human-readable and the secret never lands in a plain TOML value.
+	const codexModel = "claude-sonnet-4-5"
+	var tomlBuf strings.Builder
+	tomlBuf.WriteString("# Managed by credential-process — do not edit by hand.\n")
+	tomlBuf.WriteString("# Re-generated on every AWS credential refresh (rate-limited to 5 min).\n")
+	tomlBuf.WriteString("\n")
+	fmt.Fprintf(&tomlBuf, "model_provider = %q\n", codexCfg.ModelProvider)
+	fmt.Fprintf(&tomlBuf, "model          = %q\n", codexModel)
+	fmt.Fprintf(&tomlBuf, "region         = %q\n", codexCfg.Region)
+	if codexCfg.AWSBearerTokenBedrock != "" {
+		tomlBuf.WriteString("\n")
+		tomlBuf.WriteString("# Bearer token is exported via ~/.codex/env (sourced by the codex shell wrapper)\n")
+		tomlBuf.WriteString("# so it does not need to appear here as a plain-text secret.\n")
+	}
+	if err := os.WriteFile(tomlPath, []byte(tomlBuf.String()), 0600); err != nil {
+		return
+	}
+
+	// --- Write ~/.codex/env (shell-sourceable, sourced by the codex wrapper) ---
+	//
+	// Format: one KEY=value per line, no "export" keyword so it can be used
+	// with both `source` (bash/zsh) and `env` (POSIX). The installer's shell
+	// function does `source ~/.codex/env` before exec-ing the real codex binary.
+	envPath := filepath.Join(codexDir, "env")
+	var envBuf strings.Builder
+	envBuf.WriteString("# Managed by credential-process — do not edit by hand.\n")
+	if codexCfg.AWSBearerTokenBedrock != "" {
+		// Write the token so the shell wrapper can source it.
+		fmt.Fprintf(&envBuf, "AWS_BEARER_TOKEN_BEDROCK=%s\n", codexCfg.AWSBearerTokenBedrock)
+		// Also propagate into the current process environment so any
+		// in-process code that checks this var picks up the fresh value.
+		os.Setenv("AWS_BEARER_TOKEN_BEDROCK", codexCfg.AWSBearerTokenBedrock)
+	}
+	if err := os.WriteFile(envPath, []byte(envBuf.String()), 0600); err != nil {
+		return
+	}
+
+	// Update sync timestamp only after a fully successful sync
 	os.MkdirAll(filepath.Dir(cachePath), 0700)
 	os.WriteFile(cachePath, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0600)
 }

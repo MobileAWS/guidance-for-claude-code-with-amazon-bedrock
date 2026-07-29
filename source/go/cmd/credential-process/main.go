@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -374,6 +375,9 @@ func (a *credentialApp) run() int {
 
 	// Sync MCP servers from Nexus (quick, with timeout)
 	syncMcpServers()
+
+	// Sync Codex config from Nexus (quick, best-effort)
+	syncCodexConfig(a.profile)
 
 	// Check cache first
 	if cached := a.getCachedCredentials(); cached != nil {
@@ -785,6 +789,160 @@ func saveActiveOrg(profile, org string) {
 	dir := filepath.Join(home, ".claude-code-session")
 	os.MkdirAll(dir, 0700)
 	os.WriteFile(filepath.Join(dir, profile+"-active-org"), []byte(org), 0600)
+}
+
+// syncCodexConfig fetches the org's Codex configuration from the Nexus API and
+// writes ~/.codex/config.toml when codex_enabled is true. It also ensures the
+// AWS_BEARER_TOKEN_BEDROCK variable is exported from the user's shell profile.
+// The function is non-blocking and best-effort — all errors are silently
+// ignored so that a misconfigured or unreachable API never blocks credential
+// issuance. A 5-minute cache timestamp at ~/.claude-code-session/codex-sync-ts
+// prevents hammering the API on every invocation.
+func syncCodexConfig(profile string) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+
+	// Check if we synced recently (skip if < 5 min ago)
+	cachePath := filepath.Join(home, ".claude-code-session", "codex-sync-ts")
+	if data, err := os.ReadFile(cachePath); err == nil {
+		if ts, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64); err == nil {
+			if time.Now().Unix()-ts < 300 {
+				return // Synced less than 5 min ago
+			}
+		}
+	}
+
+	// Determine the active org for this profile
+	activeOrg := readActiveOrg(profile)
+	if activeOrg == "" {
+		return
+	}
+
+	// Fetch codex config from the Nexus API
+	apiBase := nexusAPIBase()
+	endpoint := apiBase + "/api/orgs/" + activeOrg + "/codex-config"
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(endpoint)
+	if err != nil || resp.StatusCode != 200 {
+		return
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil || len(body) < 2 {
+		return
+	}
+
+	// Parse response
+	var result struct {
+		CodexEnabled bool   `json:"codex_enabled"`
+		CodexAPIKey  string `json:"codex_api_key"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return
+	}
+	if !result.CodexEnabled || result.CodexAPIKey == "" {
+		return
+	}
+
+	// Create ~/.codex/ if it doesn't exist
+	codexDir := filepath.Join(home, ".codex")
+	if err := os.MkdirAll(codexDir, 0700); err != nil {
+		return
+	}
+
+	// Write ~/.codex/config.toml
+	configTOML := fmt.Sprintf(`model_provider = "amazon-bedrock"
+bedrock_api_key = "%s"
+`, result.CodexAPIKey)
+	if err := os.WriteFile(filepath.Join(codexDir, "config.toml"), []byte(configTOML), 0600); err != nil {
+		return
+	}
+
+	// Update the shell profile with AWS_BEARER_TOKEN_BEDROCK
+	shellProfile := resolveShellProfile(home)
+	if shellProfile != "" {
+		updateShellProfileEnv(shellProfile, "AWS_BEARER_TOKEN_BEDROCK", result.CodexAPIKey)
+	}
+
+	// Update sync timestamp
+	os.MkdirAll(filepath.Dir(cachePath), 0700)
+	os.WriteFile(cachePath, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0600)
+}
+
+// nexusAPIBase returns the Nexus hub base URL. It respects the
+// CCWB_NEXUS_API_BASE env-var override used in tests; otherwise falls back to
+// the well-known default from the nexus package.
+func nexusAPIBase() string {
+	if override := strings.TrimRight(strings.TrimSpace(os.Getenv("CCWB_NEXUS_API_BASE")), "/"); override != "" {
+		return override
+	}
+	// Inline the default so this file has no import cycle with internal/nexus.
+	return "https://dtxfifv2cj.execute-api.us-east-1.amazonaws.com"
+}
+
+// resolveShellProfile returns the path of the shell profile file to update.
+// Preference order: ~/.zshrc if it exists, ~/.bashrc if it exists, and on
+// macOS create ~/.zshrc as the platform default when neither is present.
+func resolveShellProfile(home string) string {
+	zshrc := filepath.Join(home, ".zshrc")
+	bashrc := filepath.Join(home, ".bashrc")
+
+	if _, err := os.Stat(zshrc); err == nil {
+		return zshrc
+	}
+	if _, err := os.Stat(bashrc); err == nil {
+		return bashrc
+	}
+	// Neither exists — create ~/.zshrc on macOS, otherwise ~/.bashrc
+	if runtime.GOOS == "darwin" {
+		return zshrc
+	}
+	return bashrc
+}
+
+// updateShellProfileEnv appends or replaces an `export KEY=VALUE` line in the
+// given shell profile file. If the key is already exported (with any value),
+// the existing line is replaced in-place so the file stays idempotent.
+func updateShellProfileEnv(profilePath, key, value string) {
+	exportLine := fmt.Sprintf("export %s=%s", key, value)
+	prefix := "export " + key + "="
+
+	data, err := os.ReadFile(profilePath)
+	if err != nil {
+		// File may not exist yet — write a new one with just this export
+		os.WriteFile(profilePath, []byte(exportLine+"\n"), 0644)
+		return
+	}
+
+	lines := strings.Split(string(data), "\n")
+	updated := false
+	for i, line := range lines {
+		if strings.HasPrefix(line, prefix) {
+			if line == exportLine {
+				// Already correct — nothing to do
+				return
+			}
+			lines[i] = exportLine
+			updated = true
+			break
+		}
+	}
+
+	var newContent string
+	if updated {
+		newContent = strings.Join(lines, "\n")
+	} else {
+		// Key not present — append it
+		content := string(data)
+		if len(content) > 0 && content[len(content)-1] != '\n' {
+			content += "\n"
+		}
+		content += exportLine + "\n"
+		newContent = content
+	}
+	os.WriteFile(profilePath, []byte(newContent), 0644)
 }
 
 func syncMcpServers() {

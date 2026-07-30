@@ -146,9 +146,12 @@ Add a simple form in the Nexus admin portal:
 ## Constraints
 
 - ADDITIVE ONLY: Don't rewrite existing functions. Add new code alongside.
-- Backend code goes in the guidance repo at `nexus-ui/api/index.py`
-- Frontend code goes in the nexus-ui repo at `src/`
-- Don't commit build artifacts (.pyc, __pycache__, node_modules)
+- ALL code for this task is in ONE repo: `https://github.com/MobileAWS/allcode-nexus-ui`
+  - Backend Lambda: `api/index.py`
+  - Frontend React: `src/`
+  - Infra templates: `infra/`
+- Do NOT modify the guidance repo (`MobileAWS/guidance-for-claude-code-with-amazon-bedrock`) for this task
+- Don't commit build artifacts (.pyc, __pycache__, node_modules, dist/)
 - The Lambda runs Python 3.12 with boto3 available
 - All AWS calls from the Lambda use `boto3` — no CLI
 - The `AllCodeNexusConnector` role assumption is already proven to work (916→customer account)

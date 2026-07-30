@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -16,6 +17,7 @@ import (
 	"ccwb-go/internal/config"
 	"ccwb-go/internal/federation"
 	"ccwb-go/internal/jwt"
+	"ccwb-go/internal/nexus"
 	"ccwb-go/internal/oidc"
 	"ccwb-go/internal/otel"
 	"ccwb-go/internal/portlock"
@@ -377,7 +379,7 @@ func (a *credentialApp) run() int {
 	syncMcpServers()
 
 	// Sync Codex config from Nexus (quick, best-effort)
-	syncCodexConfig(a.profile)
+	syncCodexConfig(a.profile, a.cfg)
 
 	// Check cache first
 	if cached := a.getCachedCredentials(); cached != nil {
@@ -793,12 +795,13 @@ func saveActiveOrg(profile, org string) {
 
 // syncCodexConfig fetches the org's Codex configuration from the Nexus API and
 // writes ~/.codex/config.toml when codex_enabled is true. It also ensures the
-// AWS_BEARER_TOKEN_BEDROCK variable is exported from the user's shell profile.
-// The function is non-blocking and best-effort — all errors are silently
-// ignored so that a misconfigured or unreachable API never blocks credential
-// issuance. A 5-minute cache timestamp at ~/.claude-code-session/codex-sync-ts
-// prevents hammering the API on every invocation.
-func syncCodexConfig(profile string) {
+// AWS_BEARER_TOKEN_BEDROCK variable is set in the user's shell profile (Unix)
+// or via SETX (Windows). The function is non-blocking and best-effort — all
+// errors are silently ignored so that a misconfigured or unreachable API never
+// blocks credential issuance. A 5-minute cache timestamp at
+// ~/.claude-code-session/codex-sync-ts prevents hammering the API on every
+// invocation.
+func syncCodexConfig(profile string, cfg *config.ProfileConfig) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return
@@ -820,9 +823,11 @@ func syncCodexConfig(profile string) {
 		return
 	}
 
-	// Fetch codex config from the Nexus API
-	apiBase := nexusAPIBase()
+	// Resolve API base from profile config (mirrors nexus.ResolveBase behaviour)
+	apiBase := nexus.ResolveBase(cfg.QuotaAPIEndpoint)
 	endpoint := apiBase + "/api/orgs/" + activeOrg + "/codex-config"
+
+	// Fetch codex config from the Nexus API
 	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Get(endpoint)
 	if err != nil || resp.StatusCode != 200 {
@@ -846,24 +851,33 @@ func syncCodexConfig(profile string) {
 		return
 	}
 
-	// Create ~/.codex/ if it doesn't exist
+	// Create ~/.codex/ directory if it doesn't exist
 	codexDir := filepath.Join(home, ".codex")
 	if err := os.MkdirAll(codexDir, 0700); err != nil {
 		return
 	}
 
-	// Write ~/.codex/config.toml
-	configTOML := fmt.Sprintf(`model_provider = "amazon-bedrock"
-bedrock_api_key = "%s"
-`, result.CodexAPIKey)
+	// Write ~/.codex/config.toml (spec: only model_provider line)
+	const configTOML = `model_provider = "amazon-bedrock"
+`
 	if err := os.WriteFile(filepath.Join(codexDir, "config.toml"), []byte(configTOML), 0600); err != nil {
 		return
 	}
 
-	// Update the shell profile with AWS_BEARER_TOKEN_BEDROCK
-	shellProfile := resolveShellProfile(home)
-	if shellProfile != "" {
-		updateShellProfileEnv(shellProfile, "AWS_BEARER_TOKEN_BEDROCK", result.CodexAPIKey)
+	// Propagate the API key as AWS_BEARER_TOKEN_BEDROCK
+	if runtime.GOOS == "windows" {
+		// On Windows, persist the env var via SETX (user scope, no admin needed)
+		_ = exec.Command("setx", "AWS_BEARER_TOKEN_BEDROCK", result.CodexAPIKey).Run()
+	} else {
+		// On Unix, write a guarded block into every shell profile that exists
+		for _, shellProfile := range codexShellProfiles(home) {
+			upsertGuardedBlock(
+				shellProfile,
+				"# BEGIN NEXUS CODEX",
+				"# END NEXUS CODEX",
+				fmt.Sprintf("export AWS_BEARER_TOKEN_BEDROCK=%s", result.CodexAPIKey),
+			)
+		}
 	}
 
 	// Update sync timestamp
@@ -871,78 +885,69 @@ bedrock_api_key = "%s"
 	os.WriteFile(cachePath, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0600)
 }
 
-// nexusAPIBase returns the Nexus hub base URL. It respects the
-// CCWB_NEXUS_API_BASE env-var override used in tests; otherwise falls back to
-// the well-known default from the nexus package.
-func nexusAPIBase() string {
-	if override := strings.TrimRight(strings.TrimSpace(os.Getenv("CCWB_NEXUS_API_BASE")), "/"); override != "" {
-		return override
+// codexShellProfiles returns the set of shell profile files that should be
+// updated with the Codex env-var block. It includes every file that already
+// exists (so users with both ~/.zshrc and ~/.bashrc get both updated).
+// If none exist, it falls back to a sensible per-OS default so first-run
+// users get the variable set immediately.
+func codexShellProfiles(home string) []string {
+	candidates := []string{
+		filepath.Join(home, ".zshrc"),
+		filepath.Join(home, ".bashrc"),
+		filepath.Join(home, ".profile"),
 	}
-	// Inline the default so this file has no import cycle with internal/nexus.
-	return "https://dtxfifv2cj.execute-api.us-east-1.amazonaws.com"
-}
-
-// resolveShellProfile returns the path of the shell profile file to update.
-// Preference order: ~/.zshrc if it exists, ~/.bashrc if it exists, and on
-// macOS create ~/.zshrc as the platform default when neither is present.
-func resolveShellProfile(home string) string {
-	zshrc := filepath.Join(home, ".zshrc")
-	bashrc := filepath.Join(home, ".bashrc")
-
-	if _, err := os.Stat(zshrc); err == nil {
-		return zshrc
+	var found []string
+	for _, p := range candidates {
+		if _, err := os.Stat(p); err == nil {
+			found = append(found, p)
+		}
 	}
-	if _, err := os.Stat(bashrc); err == nil {
-		return bashrc
+	if len(found) > 0 {
+		return found
 	}
-	// Neither exists — create ~/.zshrc on macOS, otherwise ~/.bashrc
+	// No profile exists yet — create one appropriate to the platform.
 	if runtime.GOOS == "darwin" {
-		return zshrc
+		return []string{filepath.Join(home, ".zshrc")}
 	}
-	return bashrc
+	return []string{filepath.Join(home, ".bashrc")}
 }
 
-// updateShellProfileEnv appends or replaces an `export KEY=VALUE` line in the
-// given shell profile file. If the key is already exported (with any value),
-// the existing line is replaced in-place so the file stays idempotent.
-func updateShellProfileEnv(profilePath, key, value string) {
-	exportLine := fmt.Sprintf("export %s=%s", key, value)
-	prefix := "export " + key + "="
+// upsertGuardedBlock writes content between begin/end marker lines in the
+// given file. If a guarded block already exists, its content is replaced in
+// place (idempotent). Otherwise the block is appended. This ensures that
+// re-runs do not accumulate duplicate entries.
+func upsertGuardedBlock(filePath, beginMarker, endMarker, content string) {
+	block := beginMarker + "\n" + content + "\n" + endMarker + "\n"
 
-	data, err := os.ReadFile(profilePath)
+	data, err := os.ReadFile(filePath)
 	if err != nil {
-		// File may not exist yet — write a new one with just this export
-		os.WriteFile(profilePath, []byte(exportLine+"\n"), 0644)
+		// File does not yet exist — create it with just the guarded block.
+		os.WriteFile(filePath, []byte(block), 0644)
 		return
 	}
 
-	lines := strings.Split(string(data), "\n")
-	updated := false
-	for i, line := range lines {
-		if strings.HasPrefix(line, prefix) {
-			if line == exportLine {
-				// Already correct — nothing to do
-				return
-			}
-			lines[i] = exportLine
-			updated = true
-			break
+	text := string(data)
+	beginIdx := strings.Index(text, beginMarker)
+	endIdx := strings.Index(text, endMarker)
+
+	if beginIdx != -1 && endIdx != -1 && endIdx > beginIdx {
+		// Block exists — replace everything from the begin marker to the end of
+		// the end-marker line (inclusive).
+		endLineEnd := endIdx + len(endMarker)
+		// Consume the trailing newline that follows the end marker (if any)
+		if endLineEnd < len(text) && text[endLineEnd] == '\n' {
+			endLineEnd++
 		}
+		newText := text[:beginIdx] + block + text[endLineEnd:]
+		os.WriteFile(filePath, []byte(newText), 0644)
+		return
 	}
 
-	var newContent string
-	if updated {
-		newContent = strings.Join(lines, "\n")
-	} else {
-		// Key not present — append it
-		content := string(data)
-		if len(content) > 0 && content[len(content)-1] != '\n' {
-			content += "\n"
-		}
-		content += exportLine + "\n"
-		newContent = content
+	// No existing block — append.
+	if len(text) > 0 && text[len(text)-1] != '\n' {
+		text += "\n"
 	}
-	os.WriteFile(profilePath, []byte(newContent), 0644)
+	os.WriteFile(filePath, []byte(text+block), 0644)
 }
 
 func syncMcpServers() {

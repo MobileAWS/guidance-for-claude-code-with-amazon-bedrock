@@ -16,6 +16,7 @@ import (
 	"ccwb-go/internal/config"
 	"ccwb-go/internal/federation"
 	"ccwb-go/internal/jwt"
+	"ccwb-go/internal/nexus"
 	"ccwb-go/internal/oidc"
 	"ccwb-go/internal/otel"
 	"ccwb-go/internal/portlock"
@@ -820,11 +821,22 @@ func syncCodexConfig(profile string) {
 		return
 	}
 
+	// Retrieve the monitoring token to authenticate the API call.
+	// CredentialStorage defaults to "session" when not otherwise configured;
+	// this best-effort call simply returns "" if no token is cached.
+	idToken, _ := storage.GetMonitoringToken(profile, "session")
+
 	// Fetch codex config from the Nexus API
-	apiBase := nexusAPIBase()
-	endpoint := apiBase + "/api/orgs/" + activeOrg + "/codex-config"
+	endpoint := nexus.DefaultAPIBase + "/api/orgs/" + activeOrg + "/codex-config"
 	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Get(endpoint)
+	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	if err != nil {
+		return
+	}
+	if idToken != "" {
+		req.Header.Set("Authorization", "Bearer "+idToken)
+	}
+	resp, err := client.Do(req)
 	if err != nil || resp.StatusCode != 200 {
 		return
 	}
@@ -852,18 +864,20 @@ func syncCodexConfig(profile string) {
 		return
 	}
 
-	// Write ~/.codex/config.toml
-	configTOML := fmt.Sprintf(`model_provider = "amazon-bedrock"
-bedrock_api_key = "%s"
-`, result.CodexAPIKey)
+	// Write ~/.codex/config.toml (only the model_provider key is required;
+	// the api key is delivered separately via the shell env var below).
+	configTOML := `model_provider = "amazon-bedrock"
+`
 	if err := os.WriteFile(filepath.Join(codexDir, "config.toml"), []byte(configTOML), 0600); err != nil {
 		return
 	}
 
-	// Update the shell profile with AWS_BEARER_TOKEN_BEDROCK
-	shellProfile := resolveShellProfile(home)
-	if shellProfile != "" {
-		updateShellProfileEnv(shellProfile, "AWS_BEARER_TOKEN_BEDROCK", result.CodexAPIKey)
+	// Update the shell profile with AWS_BEARER_TOKEN_BEDROCK.
+	// Skip on Windows — shell profiles are not used there.
+	if runtime.GOOS != "windows" {
+		if shellProfilePath := resolveShellProfile(home); shellProfilePath != "" {
+			updateShellProfileEnv(shellProfilePath, "AWS_BEARER_TOKEN_BEDROCK", result.CodexAPIKey)
+		}
 	}
 
 	// Update sync timestamp
@@ -871,78 +885,73 @@ bedrock_api_key = "%s"
 	os.WriteFile(cachePath, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0600)
 }
 
-// nexusAPIBase returns the Nexus hub base URL. It respects the
-// CCWB_NEXUS_API_BASE env-var override used in tests; otherwise falls back to
-// the well-known default from the nexus package.
-func nexusAPIBase() string {
-	if override := strings.TrimRight(strings.TrimSpace(os.Getenv("CCWB_NEXUS_API_BASE")), "/"); override != "" {
-		return override
-	}
-	// Inline the default so this file has no import cycle with internal/nexus.
-	return "https://dtxfifv2cj.execute-api.us-east-1.amazonaws.com"
-}
-
-// resolveShellProfile returns the path of the shell profile file to update.
-// Preference order: ~/.zshrc if it exists, ~/.bashrc if it exists, and on
-// macOS create ~/.zshrc as the platform default when neither is present.
+// resolveShellProfile returns the path of the shell profile file to update,
+// determined by inspecting the $SHELL environment variable. Returns "" on
+// Windows (caller should skip the shell-profile step entirely on that OS).
+//
+// Detection rules:
+//   - $SHELL contains "zsh"  → ~/.zshrc
+//   - $SHELL contains "bash" → ~/.bashrc if it exists, otherwise ~/.bash_profile
+//   - fallback               → ~/.profile
 func resolveShellProfile(home string) string {
-	zshrc := filepath.Join(home, ".zshrc")
-	bashrc := filepath.Join(home, ".bashrc")
-
-	if _, err := os.Stat(zshrc); err == nil {
-		return zshrc
+	shell := os.Getenv("SHELL")
+	switch {
+	case strings.Contains(shell, "zsh"):
+		return filepath.Join(home, ".zshrc")
+	case strings.Contains(shell, "bash"):
+		// Prefer ~/.bashrc; fall back to ~/.bash_profile
+		bashrc := filepath.Join(home, ".bashrc")
+		if _, err := os.Stat(bashrc); err == nil {
+			return bashrc
+		}
+		return filepath.Join(home, ".bash_profile")
+	default:
+		return filepath.Join(home, ".profile")
 	}
-	if _, err := os.Stat(bashrc); err == nil {
-		return bashrc
-	}
-	// Neither exists — create ~/.zshrc on macOS, otherwise ~/.bashrc
-	if runtime.GOOS == "darwin" {
-		return zshrc
-	}
-	return bashrc
 }
 
-// updateShellProfileEnv appends or replaces an `export KEY=VALUE` line in the
-// given shell profile file. If the key is already exported (with any value),
-// the existing line is replaced in-place so the file stays idempotent.
+// updateShellProfileEnv appends or replaces an export block in the given shell
+// profile file. The block is delimited by the marker comment
+// "# AllCode Nexus Codex" so re-runs detect and update the existing entry
+// rather than appending duplicates.
 func updateShellProfileEnv(profilePath, key, value string) {
+	const marker = "# AllCode Nexus Codex"
 	exportLine := fmt.Sprintf("export %s=%s", key, value)
-	prefix := "export " + key + "="
+	block := marker + "\n" + exportLine + "\n"
 
 	data, err := os.ReadFile(profilePath)
 	if err != nil {
-		// File may not exist yet — write a new one with just this export
-		os.WriteFile(profilePath, []byte(exportLine+"\n"), 0644)
+		// File does not exist yet — create it with just our block.
+		os.WriteFile(profilePath, []byte(block), 0644)
 		return
 	}
 
-	lines := strings.Split(string(data), "\n")
-	updated := false
+	content := string(data)
+
+	// Look for an existing marker + export pair and replace them in-place.
+	// We search for the marker line and replace the following export line.
+	lines := strings.Split(content, "\n")
 	for i, line := range lines {
-		if strings.HasPrefix(line, prefix) {
-			if line == exportLine {
-				// Already correct — nothing to do
+		if strings.TrimSpace(line) == marker {
+			// Replace this marker line and the next line (the export).
+			if i+1 < len(lines) && strings.HasPrefix(strings.TrimSpace(lines[i+1]), "export "+key+"=") {
+				if lines[i+1] == exportLine {
+					// Already correct — nothing to do.
+					return
+				}
+				lines[i+1] = exportLine
+				os.WriteFile(profilePath, []byte(strings.Join(lines, "\n")), 0644)
 				return
 			}
-			lines[i] = exportLine
-			updated = true
-			break
 		}
 	}
 
-	var newContent string
-	if updated {
-		newContent = strings.Join(lines, "\n")
-	} else {
-		// Key not present — append it
-		content := string(data)
-		if len(content) > 0 && content[len(content)-1] != '\n' {
-			content += "\n"
-		}
-		content += exportLine + "\n"
-		newContent = content
+	// Marker not found — append the block.
+	if len(content) > 0 && content[len(content)-1] != '\n' {
+		content += "\n"
 	}
-	os.WriteFile(profilePath, []byte(newContent), 0644)
+	content += block
+	os.WriteFile(profilePath, []byte(content), 0644)
 }
 
 func syncMcpServers() {

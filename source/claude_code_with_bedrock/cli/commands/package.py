@@ -1183,6 +1183,46 @@ echo "  export AWS_PROFILE=$FIRST_PROFILE"
 echo "  claude"
 echo
 
+# Codex support (if enabled by your org admin)
+# The credential-process automatically configures ~/.codex/config.toml
+# and AWS_BEARER_TOKEN_BEDROCK on each authentication.
+echo "ℹ  Codex: If your organization has Codex enabled, ~/.codex/config.toml"
+echo "        will be configured automatically on first authentication."
+echo
+
+# Write ~/.codex/config.toml if codex_api_key is present in config
+CODEX_API_KEY=$($PYTHON -c "
+import json
+data = json.load(open('config.json'))
+profiles = data.get('profiles', data)
+first = next(iter(profiles.values()))
+print(first.get('codex_api_key', ''))
+" 2>/dev/null || echo "")
+
+if [ -n "$CODEX_API_KEY" ]; then
+    echo "Configuring Codex for Amazon Bedrock..."
+    mkdir -p ~/.codex
+    echo 'model_provider = "amazon-bedrock"' > ~/.codex/config.toml
+    echo "OK ~/.codex/config.toml written"
+    # Set AWS_BEARER_TOKEN_BEDROCK in shell profile
+    SHELL_PROFILE=""
+    if [[ "$SHELL" == *"zsh"* ]]; then
+        SHELL_PROFILE="$HOME/.zshrc"
+    elif [ -f "$HOME/.bashrc" ]; then
+        SHELL_PROFILE="$HOME/.bashrc"
+    else
+        SHELL_PROFILE="$HOME/.profile"
+    fi
+    if [ -n "$SHELL_PROFILE" ]; then
+        # Remove any existing AllCode Nexus Codex line
+        sed -i.bak '/# AllCode Nexus Codex/,+1d' "$SHELL_PROFILE" 2>/dev/null || true
+        echo "# AllCode Nexus Codex" >> "$SHELL_PROFILE"
+        echo "export AWS_BEARER_TOKEN_BEDROCK=\"$CODEX_API_KEY\"" >> "$SHELL_PROFILE"
+        echo "OK AWS_BEARER_TOKEN_BEDROCK set in $SHELL_PROFILE"
+        echo "  Run: source $SHELL_PROFILE (or open a new terminal)"
+    fi
+fi
+
 # Ask if they want to launch now
 read -p "Launch Claude Code now? (Y/n): " -n 1 -r
 echo
@@ -1431,6 +1471,16 @@ for /f %%p in ('powershell -NoProfile -Command "(Get-Content config.json | Conve
 echo.
 echo Note: Authentication will automatically open your browser when needed.
 echo.
+
+REM Codex support (if enabled by your org admin)
+REM The credential-process automatically configures ~/.codex/config.toml
+REM and AWS_BEARER_TOKEN_BEDROCK on each authentication.
+echo i  Codex: If your organization has Codex enabled, %%USERPROFILE%%\.codex\config.toml
+echo          will be configured automatically on first authentication.
+echo.
+
+REM Write %USERPROFILE%\.codex\config.toml if codex_api_key is present in config.json
+powershell -NoProfile -Command "$ErrorActionPreference = 'SilentlyContinue'; $cfg = Get-Content 'config.json' | ConvertFrom-Json; $profiles = $cfg.PSObject.Properties; $first = $profiles | Select-Object -First 1; $apiKey = $first.Value.codex_api_key; if ($apiKey) {{ Write-Host 'Configuring Codex for Amazon Bedrock...'; $codexDir = Join-Path $env:USERPROFILE '.codex'; if (-not (Test-Path $codexDir)) {{ New-Item -ItemType Directory -Path $codexDir | Out-Null }}; Set-Content -Path (Join-Path $codexDir 'config.toml') -Value ('model_provider = "amazon-bedrock"') -Encoding UTF8; Write-Host 'OK %USERPROFILE%\.codex\config.toml written'; [System.Environment]::SetEnvironmentVariable('AWS_BEARER_TOKEN_BEDROCK', $apiKey, 'User'); Write-Host 'OK AWS_BEARER_TOKEN_BEDROCK set as user environment variable'; Write-Host '   Open a new terminal window for the change to take effect' }}"
 
 REM -----------------------------------------------------------------------
 REM Optional: Codex configuration

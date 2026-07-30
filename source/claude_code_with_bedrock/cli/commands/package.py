@@ -1231,6 +1231,65 @@ CODEX_TOML
         echo "✓ Codex configuration installed"
     fi
 fi
+
+# -----------------------------------------------------------------------
+# Codex setup — reads codex_enabled / codex_api_key from config.json at
+# the profile level (written by 'ccwb package').  Purely additive: does
+# not alter any earlier section of this script.
+# -----------------------------------------------------------------------
+CODEX_ENABLED=$($PYTHON -c "
+import json, sys
+try:
+    cfg = json.load(open('config.json'))
+    # codex_enabled may live on any profile; check them all
+    enabled = any(v.get('codex_enabled', False) for v in cfg.values() if isinstance(v, dict))
+    print('true' if enabled else 'false')
+except Exception:
+    print('false')
+" 2>/dev/null || echo "false")
+
+if [ "\$CODEX_ENABLED" = "true" ]; then
+    echo
+    echo "Configuring Codex..."
+    mkdir -p ~/.codex
+    cat > ~/.codex/config.toml << 'NEXUS_CODEX_TOML'
+model_provider = "amazon-bedrock"
+NEXUS_CODEX_TOML
+
+    # If a codex_api_key is present, persist it as AWS_BEARER_TOKEN_BEDROCK
+    # in a clearly-marked guarded block inside ~/.bashrc and ~/.zshrc so
+    # it survives across shell restarts.  Idempotent: re-running the
+    # installer replaces the existing guarded block rather than appending.
+    CODEX_API_KEY=$($PYTHON -c "
+import json, sys
+try:
+    cfg = json.load(open('config.json'))
+    key = next((v.get('codex_api_key', '') for v in cfg.values() if isinstance(v, dict) and v.get('codex_api_key')), '')
+    print(key)
+except Exception:
+    print('')
+" 2>/dev/null || echo "")
+
+    if [ -n "\$CODEX_API_KEY" ]; then
+        for RC_FILE in ~/.bashrc ~/.zshrc; do
+            # Touch ~/.zshrc on macOS so it always exists
+            if [[ "\$OSTYPE" == "darwin"* ]] && [ "\$RC_FILE" = ~/.zshrc ]; then
+                touch "\$RC_FILE"
+            fi
+            if [ -f "\$RC_FILE" ]; then
+                # Strip any pre-existing guarded block (idempotent re-runs)
+                TMPFILE=$(mktemp)
+                awk '/^# BEGIN NEXUS CODEX/{{skip=1}} !skip{{print}} /^# END NEXUS CODEX/{{skip=0}}' "\$RC_FILE" > "\$TMPFILE" && mv "\$TMPFILE" "\$RC_FILE" || true
+                # Append fresh guarded block
+                printf '\\n# BEGIN NEXUS CODEX\\nexport AWS_BEARER_TOKEN_BEDROCK="%s"\\n# END NEXUS CODEX\\n' "\$CODEX_API_KEY" >> "\$RC_FILE"
+            fi
+        done
+    fi
+
+    echo "✓ Codex configured"
+else
+    echo "ℹ Codex not enabled for this org"
+fi
 """
 
         installer_path = output_dir / "install.sh"
@@ -1443,6 +1502,32 @@ REM -----------------------------------------------------------------------
 if exist "codex-config.json" (
     powershell -NoProfile -Command "$ErrorActionPreference = 'Stop'; $cfg = Get-Content 'codex-config.json' | ConvertFrom-Json; $apiKey = $cfg.codex_api_key; $provider = if ($cfg.model_provider) {{ $cfg.model_provider }} else {{ 'amazon-bedrock' }}; if ($apiKey) {{ $codexDir = Join-Path $env:USERPROFILE '.codex'; if (-not (Test-Path $codexDir)) {{ New-Item -ItemType Directory -Path $codexDir | Out-Null }}; $toml = \"model_provider = `\"amazon-bedrock`\"`r`nbedrock_api_key = `\"$apiKey`\"\"; Set-Content -Path (Join-Path $codexDir 'config.toml') -Value $toml -Encoding UTF8; [System.Environment]::SetEnvironmentVariable('AWS_BEARER_TOKEN_BEDROCK', $apiKey, 'User'); Write-Host '✓ Codex configuration installed' }}"
 )
+
+REM -----------------------------------------------------------------------
+REM Codex setup - reads codex_enabled / codex_api_key from config.json at
+REM the profile level (written by 'ccwb package').  Purely additive: does
+REM not alter any earlier section of this script.
+REM -----------------------------------------------------------------------
+powershell -NoProfile -Command ^
+    "$ErrorActionPreference = 'SilentlyContinue'; ^
+    $cfg = Get-Content 'config.json' | ConvertFrom-Json; ^
+    $enabled = ($cfg.PSObject.Properties | Where-Object {{ $_.Value -is [PSCustomObject] -and $_.Value.PSObject.Properties['codex_enabled'] -and $_.Value.codex_enabled -eq $true }} | Measure-Object).Count -gt 0; ^
+    if ($enabled) {{ ^
+        Write-Host ''; ^
+        Write-Host 'Configuring Codex...'; ^
+        $codexDir = Join-Path $env:USERPROFILE '.codex'; ^
+        if (-not (Test-Path $codexDir)) {{ New-Item -ItemType Directory -Path $codexDir | Out-Null }}; ^
+        $toml = 'model_provider = \"amazon-bedrock\"'; ^
+        Set-Content -Path (Join-Path $codexDir 'config.toml') -Value $toml -Encoding UTF8; ^
+        $apiKey = ($cfg.PSObject.Properties | Where-Object {{ $_.Value -is [PSCustomObject] -and $_.Value.PSObject.Properties['codex_api_key'] }} | Select-Object -First 1 | ForEach-Object {{ $_.Value.codex_api_key }}); ^
+        if ($apiKey) {{ ^
+            SETX AWS_BEARER_TOKEN_BEDROCK \"$apiKey\" | Out-Null; ^
+            Write-Host 'Set AWS_BEARER_TOKEN_BEDROCK via SETX' ^
+        }}; ^
+        Write-Host (([char]0x2713) + ' Codex configured') ^
+    }} else {{ ^
+        Write-Host (([char]0x2139) + ' Codex not enabled for this org') ^
+    }}"
 
 pause
 """

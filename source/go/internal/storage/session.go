@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -127,4 +128,38 @@ func ParseExpirationSeconds(expStr string) float64 {
 		}
 	}
 	return time.Until(t).Seconds()
+}
+
+// SessionCache stores credentials in ~/.claude-code-session/{profile}-creds.json
+// instead of ~/.aws/credentials, to avoid conflicting with the AWS SDK's credential_process.
+
+func sessionCachePath(profile string) string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".claude-code-session", profile+"-creds.json")
+}
+
+func SaveToSessionCache(creds *federation.AWSCredentials, profile string) error {
+	path := sessionCachePath(profile)
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+	data, err := json.Marshal(creds)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0600)
+}
+
+func ReadFromSessionCache(profile string) (*federation.AWSCredentials, error) {
+	path := sessionCachePath(profile)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, nil
+	}
+	var creds federation.AWSCredentials
+	if err := json.Unmarshal(data, &creds); err != nil {
+		return nil, nil
+	}
+	return &creds, nil
 }

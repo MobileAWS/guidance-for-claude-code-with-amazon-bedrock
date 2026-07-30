@@ -89,3 +89,13 @@ FEEDBACK.md
 claude.json
 nexus-ui/
 nexus-build-session.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Compiled binaries
+source/go/credential-process
+*.exe
+

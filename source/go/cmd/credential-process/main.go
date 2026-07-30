@@ -1,12 +1,15 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -184,7 +187,8 @@ func (a *credentialApp) getCachedCredentials() *federation.AWSCredentials {
 	if a.cfg.CredentialStorage == "keyring" {
 		creds, err = storage.ReadFromKeyring(a.profile)
 	} else {
-		creds, err = storage.ReadFromCredentialsFile(a.profile)
+		// Read from session cache (not ~/.aws/credentials)
+		creds, err = storage.ReadFromSessionCache(a.profile)
 	}
 	if err != nil || creds == nil || storage.IsExpiredDummy(creds) {
 		return nil
@@ -201,19 +205,21 @@ func (a *credentialApp) saveCredentials(creds *federation.AWSCredentials) error 
 	if a.cfg.CredentialStorage == "keyring" {
 		return storage.SaveToKeyring(creds, a.profile)
 	}
-	return storage.SaveToCredentialsFile(creds, a.profile)
+	// Save to session cache (NOT ~/.aws/credentials) so the AWS SDK
+	// always calls credential_process and we can handle refresh silently.
+	return storage.SaveToSessionCache(creds, a.profile)
 }
 
 func (a *credentialApp) clearCache() {
 	if a.cfg.CredentialStorage == "keyring" {
 		_ = storage.ClearKeyring(a.profile)
 	}
-	// Also clear session file
+	// Clear session cache
 	expired := &federation.AWSCredentials{
 		Version: 1, AccessKeyID: "EXPIRED", SecretAccessKey: "EXPIRED",
 		SessionToken: "EXPIRED", Expiration: "2000-01-01T00:00:00Z",
 	}
-	_ = storage.SaveToCredentialsFile(expired, a.profile)
+	_ = storage.SaveToSessionCache(expired, a.profile)
 	// Clear refresh token
 	storage.ClearRefreshToken(a.profile)
 	fmt.Fprintf(os.Stderr, "Cleared cached credentials for profile '%s'\n", a.profile)
@@ -373,11 +379,23 @@ func (a *credentialApp) run() int {
 		saveActiveOrg(a.profile, a.orgFlag)
 	}
 
+	// Check for self-update (background, non-blocking)
+	go checkForUpdate()
+
 	// Sync MCP servers from Nexus (quick, with timeout)
 	syncMcpServers()
 
 	// Sync Codex config from Nexus (quick, best-effort)
 	syncCodexConfig(a.profile)
+
+	// Sync Skills from Nexus (quick, with timeout)
+	syncSkills()
+
+	// Sync managed config for Claude Desktop (quick, with timeout)
+	syncManagedConfig()
+
+	// Clear AWS CLI cache if our credentials are expired (prevents stale credential loops)
+	clearAwsCliCacheIfExpired(a.profile)
 
 	// Check cache first
 	if cached := a.getCachedCredentials(); cached != nil {
@@ -385,7 +403,7 @@ func (a *credentialApp) run() int {
 		if a.shouldRecheckQuota() {
 			a.performQuotaRecheck()
 		}
-		outputJSON(cached)
+		outputJSON(chainAssumeRole(cached, a.cfg))
 		return 0
 	}
 
@@ -400,7 +418,7 @@ func (a *credentialApp) run() int {
 		debugPrint("Another authentication is in progress, waiting...")
 		if portlock.WaitForRelease(a.redirectPort, 60*time.Second) {
 			if cached := a.getCachedCredentials(); cached != nil {
-				outputJSON(cached)
+				outputJSON(chainAssumeRole(cached, a.cfg))
 				return 0
 			}
 		}
@@ -412,7 +430,7 @@ func (a *credentialApp) run() int {
 
 	// Check cache again (race condition guard)
 	if cached := a.getCachedCredentials(); cached != nil {
-		outputJSON(cached)
+		outputJSON(chainAssumeRole(cached, a.cfg))
 		return 0
 	}
 
@@ -428,7 +446,7 @@ func (a *credentialApp) run() int {
 				}
 			}
 		}
-		outputJSON(creds)
+		outputJSON(chainAssumeRole(creds, a.cfg))
 		return 0
 	}
 
@@ -446,7 +464,7 @@ func (a *credentialApp) run() int {
 				}
 			}
 		}
-		outputJSON(creds)
+		outputJSON(chainAssumeRole(creds, a.cfg))
 		return 0
 	}
 
@@ -775,6 +793,72 @@ func outputJSON(v interface{}) {
 	fmt.Println(string(data))
 }
 
+// chainAssumeRole takes existing AWS credentials and assumes a cross-account role
+// if bedrock_role_arn is configured. Returns the chained credentials or original.
+func chainAssumeRole(creds *federation.AWSCredentials, cfg *config.ProfileConfig) *federation.AWSCredentials {
+	if cfg == nil || cfg.BedrockRoleArn == "" {
+		return creds
+	}
+
+	// Use the existing creds to assume the cross-account role
+	client := &http.Client{Timeout: 5 * time.Second}
+	// Build STS AssumeRole request using existing credentials
+	stsEndpoint := fmt.Sprintf("https://sts.%s.amazonaws.com/", cfg.AWSRegion)
+	if cfg.AWSRegion == "" {
+		stsEndpoint = "https://sts.us-east-1.amazonaws.com/"
+	}
+
+	params := fmt.Sprintf("Action=AssumeRole&Version=2011-06-15&RoleArn=%s&RoleSessionName=nexus-bedrock&DurationSeconds=3600",
+		cfg.BedrockRoleArn)
+
+	req, err := http.NewRequest("POST", stsEndpoint, strings.NewReader(params))
+	if err != nil {
+		return creds
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	// Sign the request with existing credentials (use AWS SDK-style signing)
+	// For simplicity, use the aws CLI via exec
+	tmpFile := filepath.Join(os.TempDir(), "nexus-chain-assume.json")
+	cmd := exec.Command("aws", "sts", "assume-role",
+		"--role-arn", cfg.BedrockRoleArn,
+		"--role-session-name", "nexus-bedrock",
+		"--region", cfg.AWSRegion,
+		"--output", "json")
+	cmd.Env = append(os.Environ(),
+		"AWS_ACCESS_KEY_ID="+creds.AccessKeyID,
+		"AWS_SECRET_ACCESS_KEY="+creds.SecretAccessKey,
+		"AWS_SESSION_TOKEN="+creds.SessionToken,
+	)
+	output, err := cmd.Output()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "[nexus] chain-assume failed, using direct credentials")
+		return creds
+	}
+	_ = client
+	_ = tmpFile
+
+	var stsResp struct {
+		Credentials struct {
+			AccessKeyId     string `json:"AccessKeyId"`
+			SecretAccessKey string `json:"SecretAccessKey"`
+			SessionToken    string `json:"SessionToken"`
+			Expiration      string `json:"Expiration"`
+		} `json:"Credentials"`
+	}
+	if err := json.Unmarshal(output, &stsResp); err != nil {
+		return creds
+	}
+
+	return &federation.AWSCredentials{
+		Version:         1,
+		AccessKeyID:     stsResp.Credentials.AccessKeyId,
+		SecretAccessKey:  stsResp.Credentials.SecretAccessKey,
+		SessionToken:    stsResp.Credentials.SessionToken,
+		Expiration:      stsResp.Credentials.Expiration,
+	}
+}
+
 func readActiveOrg(profile string) string {
 	home, _ := os.UserHomeDir()
 	data, err := os.ReadFile(filepath.Join(home, ".claude-code-session", profile+"-active-org"))
@@ -946,13 +1030,14 @@ func updateShellProfileEnv(profilePath, key, value string) {
 }
 
 func syncMcpServers() {
-	// Fetch MCP config from S3 and merge into ~/.claude/settings.json
+	// Fetch MCP config from S3 and merge into ~/.claude/settings.json AND ~/.claude.json
 	// Non-blocking, best effort — failures are silent
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return
 	}
 	settingsPath := filepath.Join(home, ".claude", "settings.json")
+	claudeJsonPath := filepath.Join(home, ".claude.json")
 
 	// Check if we synced recently (skip if < 5 min ago)
 	cachePath := filepath.Join(home, ".claude-code-session", "mcp-sync-ts")
@@ -965,10 +1050,29 @@ func syncMcpServers() {
 	}
 
 	// Fetch MCPs from S3
+	// Determine active org for org-specific config
+	orgID := "allcode"
+	orgFiles, _ := filepath.Glob(filepath.Join(home, ".claude-code-session", "*-active-org"))
+	for _, f := range orgFiles {
+		if data, err := os.ReadFile(f); err == nil && len(data) > 0 {
+			orgID = strings.TrimSpace(string(data))
+			break
+		}
+	}
+
+	// Fetch MCPs from S3 (org-specific, falls back to allcode)
 	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Get("https://claude-code-auth-distribution-916587687563.s3.amazonaws.com/cowork/claude-code-mcps.json")
+	mcpURL := fmt.Sprintf("https://claude-code-auth-distribution-916587687563.s3.amazonaws.com/cowork/org-%s-mcps.json", orgID)
+	resp, err := client.Get(mcpURL)
 	if err != nil || resp.StatusCode != 200 {
-		return
+		// Fall back to default
+		if resp != nil {
+			resp.Body.Close()
+		}
+		resp, err = client.Get("https://claude-code-auth-distribution-916587687563.s3.amazonaws.com/cowork/claude-code-mcps.json")
+		if err != nil || resp.StatusCode != 200 {
+			return
+		}
 	}
 	defer resp.Body.Close()
 	mcpData, err := io.ReadAll(resp.Body)
@@ -992,15 +1096,481 @@ func syncMcpServers() {
 		return
 	}
 
-	// Merge MCPs
-	settings["mcpServers"] = mcps
+	// Merge managed MCPs into existing (preserve user-added MCPs)
+	existing, _ := settings["mcpServers"].(map[string]interface{})
+	if existing == nil {
+		existing = make(map[string]interface{})
+	}
+	// Add/update managed MCPs without removing user-added ones
+	for name, config := range mcps {
+		existing[name] = config
+	}
+	settings["mcpServers"] = existing
 	newData, err := json.MarshalIndent(settings, "", "  ")
 	if err != nil {
 		return
 	}
 	os.WriteFile(settingsPath, newData, 0600)
 
+	// Also write to ~/.claude.json for Claude Code 2.1+ (reads MCPs from here)
+	var claudeJson map[string]interface{}
+	if data, err := os.ReadFile(claudeJsonPath); err == nil {
+		json.Unmarshal(data, &claudeJson)
+	}
+	if claudeJson == nil {
+		claudeJson = make(map[string]interface{})
+	}
+	// Convert mcps to the format Claude Code 2.1+ expects (with "type": "stdio")
+	claudeMcps := make(map[string]interface{})
+	for name, config := range mcps {
+		entry := map[string]interface{}{
+			"type":    "stdio",
+			"command": config.(map[string]interface{})["command"],
+			"args":    config.(map[string]interface{})["args"],
+		}
+		if env, ok := config.(map[string]interface{})["env"]; ok {
+			entry["env"] = env
+		} else {
+			entry["env"] = map[string]interface{}{}
+		}
+		claudeMcps[name] = entry
+	}
+	// Merge: preserve existing user-added MCPs
+	existingMcps, _ := claudeJson["mcpServers"].(map[string]interface{})
+	if existingMcps == nil {
+		existingMcps = make(map[string]interface{})
+	}
+	for name, config := range claudeMcps {
+		existingMcps[name] = config
+	}
+	claudeJson["mcpServers"] = existingMcps
+	if claudeData, err := json.MarshalIndent(claudeJson, "", "  "); err == nil {
+		os.WriteFile(claudeJsonPath, claudeData, 0600)
+	}
+
 	// Update sync timestamp
 	os.MkdirAll(filepath.Dir(cachePath), 0700)
 	os.WriteFile(cachePath, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0600)
+}
+
+func syncSkills() {
+	// Fetch skills from S3 and write to ~/.claude/CLAUDE.md
+	// Non-blocking, best effort — failures are silent
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+
+	// Check if we synced recently (skip if < 5 min ago)
+	cachePath := filepath.Join(home, ".claude-code-session", "skills-sync-ts")
+	if data, err := os.ReadFile(cachePath); err == nil {
+		if ts, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64); err == nil {
+			if time.Now().Unix()-ts < 300 {
+				return
+			}
+		}
+	}
+
+	// Determine active org
+	orgID := "allcode"
+	orgFiles, _ := filepath.Glob(filepath.Join(home, ".claude-code-session", "*-active-org"))
+	for _, f := range orgFiles {
+		if data, err := os.ReadFile(f); err == nil && len(data) > 0 {
+			orgID = strings.TrimSpace(string(data))
+			break
+		}
+	}
+
+	// Fetch skills from S3 (org-specific, falls back to allcode)
+	client := &http.Client{Timeout: 3 * time.Second}
+	skillsURL := fmt.Sprintf("https://claude-code-auth-distribution-916587687563.s3.amazonaws.com/cowork/org-%s-skills.json", orgID)
+	resp, err := client.Get(skillsURL)
+	if err != nil || resp.StatusCode != 200 {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		resp, err = client.Get("https://claude-code-auth-distribution-916587687563.s3.amazonaws.com/cowork/claude-code-skills.json")
+		if err != nil || resp.StatusCode != 200 {
+			return
+		}
+	}
+	defer resp.Body.Close()
+	skillsData, err := io.ReadAll(resp.Body)
+	if err != nil || len(skillsData) < 3 {
+		return
+	}
+
+	// Parse skills
+	var skills []struct {
+		Name        string `json:"name"`
+		Description string `json:"description"`
+		Type        string `json:"type"`
+		Prompt      string `json:"prompt"`
+	}
+	if err := json.Unmarshal(skillsData, &skills); err != nil {
+		return
+	}
+	if len(skills) == 0 {
+		return
+	}
+
+	// Generate CLAUDE.md content from skills
+	var content strings.Builder
+	content.WriteString("# Organization Skills (Managed by AllCode Nexus)\n\n")
+	content.WriteString("The following skills are provided by your organization:\n\n")
+	for _, skill := range skills {
+		content.WriteString("## " + skill.Name + "\n")
+		if skill.Description != "" {
+			content.WriteString(skill.Description + "\n")
+		}
+		content.WriteString("\n" + skill.Prompt + "\n\n")
+	}
+
+	// Write to ~/.claude/CLAUDE.md (for Claude Code)
+	claudeDir := filepath.Join(home, ".claude")
+	os.MkdirAll(claudeDir, 0700)
+	claudeMdPath := filepath.Join(claudeDir, "CLAUDE.md")
+	os.WriteFile(claudeMdPath, []byte(content.String()), 0600)
+
+	// Write to org-plugins directory (for Claude Desktop)
+	// macOS: /Library/Application Support/Claude/org-plugins/nexus-skills/
+	// Windows: C:\Program Files\Claude\org-plugins\nexus-skills\
+	var pluginDir string
+	if runtime.GOOS == "darwin" {
+		pluginDir = "/Library/Application Support/Claude/org-plugins/nexus-skills"
+	} else if runtime.GOOS == "windows" {
+		pluginDir = filepath.Join(os.Getenv("ProgramFiles"), "Claude", "org-plugins", "nexus-skills")
+	}
+	if pluginDir != "" {
+		skillsDir := filepath.Join(pluginDir, "skills")
+		pluginJsonDir := filepath.Join(pluginDir, ".claude-plugin")
+
+		// Only write if directory exists (created by install script with admin perms)
+		if _, err := os.Stat(pluginDir); err == nil {
+			// Write plugin.json
+			os.MkdirAll(pluginJsonDir, 0755)
+			os.WriteFile(filepath.Join(pluginJsonDir, "plugin.json"), []byte(`{"name":"nexus-skills","version":"1.0.0","description":"Organization skills managed by AllCode Nexus","installationPreference":"required"}`), 0644)
+
+			// Write version.json (use timestamp to trigger re-sync)
+			os.WriteFile(filepath.Join(pluginDir, "version.json"), []byte(`{"version":"`+strconv.FormatInt(time.Now().Unix(), 10)+`"}`), 0644)
+
+			// Write each skill as a SKILL.md
+			for _, skill := range skills {
+				skillDir := filepath.Join(skillsDir, strings.ToLower(strings.ReplaceAll(skill.Name, " ", "-")))
+				os.MkdirAll(skillDir, 0755)
+				skillContent := "---\nname: " + skill.Name + "\ndescription: " + skill.Description + "\n---\n\n" + skill.Prompt + "\n"
+				os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(skillContent), 0644)
+			}
+		}
+	}
+
+	// Update sync timestamp
+	os.MkdirAll(filepath.Dir(cachePath), 0700)
+	os.WriteFile(cachePath, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0600)
+}
+
+func syncManagedConfig() {
+	// Fetch the latest cowork config from S3 and update managed_config.json
+	// This keeps Claude Desktop's managed MCPs in sync with the Nexus portal
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+
+	// Check if we synced recently (skip if < 5 min ago)
+	cachePath := filepath.Join(home, ".claude-code-session", "cowork-sync-ts")
+	if data, err := os.ReadFile(cachePath); err == nil {
+		if ts, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64); err == nil {
+			if time.Now().Unix()-ts < 300 {
+				return
+			}
+		}
+	}
+
+	// Fetch cowork config from S3
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get("https://claude-code-auth-distribution-916587687563.s3.amazonaws.com/cowork/cowork-3p-config.json")
+	if err != nil || resp.StatusCode != 200 {
+		return
+	}
+	defer resp.Body.Close()
+	configData, err := io.ReadAll(resp.Body)
+	if err != nil || len(configData) < 10 {
+		return
+	}
+
+	// Parse the config
+	var remoteConfig map[string]interface{}
+	if err := json.Unmarshal(configData, &remoteConfig); err != nil {
+		return
+	}
+
+	// Read current managed_config.json (if exists)
+	managedConfigPath := filepath.Join(home, "Library", "Application Support", "Claude", "managed_config.json")
+	managedConfigPath3P := filepath.Join(home, "Library", "Application Support", "Claude-3p", "managed_config.json")
+	var localConfig map[string]interface{}
+	if data, err := os.ReadFile(managedConfigPath); err == nil {
+		json.Unmarshal(data, &localConfig)
+	}
+	if localConfig == nil {
+		localConfig = make(map[string]interface{})
+	}
+
+	// Update managedMcpServers from remote config
+	if mcps, ok := remoteConfig["managedMcpServers"]; ok {
+		localConfig["managedMcpServers"] = mcps
+	}
+
+	// Also sync other config fields (but preserve inferenceCredentialHelper which is local-path specific)
+	for _, key := range []string{"isDesktopExtensionEnabled", "isDesktopExtensionDirectoryEnabled", "isLocalDevMcpEnabled", "isClaudeCodeForDesktopEnabled"} {
+		if v, ok := remoteConfig[key]; ok {
+			localConfig[key] = v
+		}
+	}
+
+	// Write updated managed_config.json
+	newData, err := json.MarshalIndent(localConfig, "", "  ")
+	if err != nil {
+		return
+	}
+	os.MkdirAll(filepath.Dir(managedConfigPath), 0700)
+	os.WriteFile(managedConfigPath, newData, 0600)
+
+	// Also write to Claude-3p directory (3rd-party/Bedrock variant)
+	os.MkdirAll(filepath.Dir(managedConfigPath3P), 0700)
+	os.WriteFile(managedConfigPath3P, newData, 0600)
+
+	// Update Claude Desktop managed preferences plist (if writable)
+	// This is the file Claude Desktop actually reads for managed MCPs
+	usr, _ := user.Current()
+	if usr != nil {
+		plistPath := filepath.Join("/Library/Managed Preferences", usr.Username, "com.anthropic.claudefordesktop.plist")
+		if _, err := os.Stat(plistPath); err == nil {
+			// Update managedMcpServers
+			if mcps, ok := remoteConfig["managedMcpServers"]; ok {
+				mcpJSON, _ := json.Marshal(mcps)
+				exec.Command("plutil", "-replace", "managedMcpServers", "-string", string(mcpJSON), plistPath).Run()
+			}
+
+			// Update OTel config for Desktop telemetry
+			if endpoint, ok := remoteConfig["otlpEndpoint"].(string); ok && endpoint != "" {
+				exec.Command("plutil", "-replace", "otlpEndpoint", "-string", endpoint, plistPath).Run()
+			}
+			if protocol, ok := remoteConfig["otlpProtocol"].(string); ok && protocol != "" {
+				exec.Command("plutil", "-replace", "otlpProtocol", "-string", protocol, plistPath).Run()
+			}
+
+			// Set per-user otlpHeaders from cached otel-headers (for per-user attribution)
+			userEmail := ""
+			otelFiles, _ := filepath.Glob(filepath.Join(home, ".claude-code-session", "*-otel-headers.raw"))
+			for _, of := range otelFiles {
+				if data, err := os.ReadFile(of); err == nil {
+					var headers map[string]interface{}
+					if json.Unmarshal(data, &headers) == nil {
+						if email, ok := headers["x-user-email"].(string); ok && email != "" {
+							userEmail = email
+							break
+						}
+					}
+				}
+			}
+			if userEmail != "" {
+				headers := fmt.Sprintf("x-user-email=%s", userEmail)
+				exec.Command("plutil", "-replace", "otlpHeaders", "-string", headers, plistPath).Run()
+			}
+		}
+	}
+
+	// Windows: Update registry for Claude Desktop managed config
+	if runtime.GOOS == "windows" {
+		regPath := `HKLM\SOFTWARE\Policies\Anthropic\ClaudeForDesktop`
+		// Update managedMcpServers
+		if mcps, ok := remoteConfig["managedMcpServers"]; ok {
+			mcpJSON, _ := json.Marshal(mcps)
+			exec.Command("reg", "add", regPath, "/v", "managedMcpServers", "/t", "REG_SZ", "/d", string(mcpJSON), "/f").Run()
+		}
+		// Update OTel config
+		if endpoint, ok := remoteConfig["otlpEndpoint"].(string); ok && endpoint != "" {
+			exec.Command("reg", "add", regPath, "/v", "otlpEndpoint", "/t", "REG_SZ", "/d", endpoint, "/f").Run()
+		}
+		if protocol, ok := remoteConfig["otlpProtocol"].(string); ok && protocol != "" {
+			exec.Command("reg", "add", regPath, "/v", "otlpProtocol", "/t", "REG_SZ", "/d", protocol, "/f").Run()
+		}
+		// Set per-user otlpHeaders
+		userEmail := ""
+		otelFiles, _ := filepath.Glob(filepath.Join(home, ".claude-code-session", "*-otel-headers.raw"))
+		for _, of := range otelFiles {
+			if data, err := os.ReadFile(of); err == nil {
+				var headers map[string]interface{}
+				if json.Unmarshal(data, &headers) == nil {
+					if email, ok := headers["x-user-email"].(string); ok && email != "" {
+						userEmail = email
+						break
+					}
+				}
+			}
+		}
+		if userEmail != "" {
+			hdrs := fmt.Sprintf("x-user-email=%s", userEmail)
+			exec.Command("reg", "add", regPath, "/v", "otlpHeaders", "/t", "REG_SZ", "/d", hdrs, "/f").Run()
+		}
+	}
+
+	// Update sync timestamp
+	os.MkdirAll(filepath.Dir(cachePath), 0700)
+	os.WriteFile(cachePath, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0600)
+}
+
+func checkForUpdate() {
+	// Self-update: check S3 for newer binary version, download and replace if available
+	// Throttled to once per 24 hours
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+
+	cachePath := filepath.Join(home, ".claude-code-session", "update-check-ts")
+	if data, err := os.ReadFile(cachePath); err == nil {
+		if ts, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64); err == nil {
+			if time.Now().Unix()-ts < 86400 { // 24 hours
+				return
+			}
+		}
+	}
+
+	// Determine platform binary name
+	var binaryName string
+	switch runtime.GOOS + "_" + runtime.GOARCH {
+	case "darwin_arm64":
+		binaryName = "credential-process-darwin-arm64"
+	case "darwin_amd64":
+		binaryName = "credential-process-darwin-amd64"
+	case "linux_amd64":
+		binaryName = "credential-process-linux-amd64"
+	case "linux_arm64":
+		binaryName = "credential-process-linux-arm64"
+	case "windows_amd64":
+		binaryName = "credential-process-windows-amd64.exe"
+	default:
+		return
+	}
+
+	// Fetch version file
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get("https://claude-code-auth-distribution-916587687563.s3.amazonaws.com/cowork/credential-process-version.json")
+	if err != nil || resp.StatusCode != 200 {
+		return
+	}
+	defer resp.Body.Close()
+	versionData, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return
+	}
+
+	var versionInfo map[string]interface{}
+	if err := json.Unmarshal(versionData, &versionInfo); err != nil {
+		return
+	}
+
+	// Get remote hash for our platform
+	hashKey := "sha256_" + runtime.GOOS + "_" + runtime.GOARCH
+	remoteHash, _ := versionInfo[hashKey].(string)
+	if remoteHash == "" {
+		// Save timestamp so we don't check again for 24h
+		os.MkdirAll(filepath.Dir(cachePath), 0700)
+		os.WriteFile(cachePath, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0600)
+		return
+	}
+
+	// Get current binary hash
+	execPath, err := os.Executable()
+	if err != nil {
+		return
+	}
+	execPath, _ = filepath.EvalSymlinks(execPath)
+	currentData, err := os.ReadFile(execPath)
+	if err != nil {
+		return
+	}
+
+	// Calculate SHA256
+	currentHash := fmt.Sprintf("%x", sha256Sum(currentData))
+	if currentHash == remoteHash {
+		// Already up to date
+		os.MkdirAll(filepath.Dir(cachePath), 0700)
+		os.WriteFile(cachePath, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0600)
+		return
+	}
+
+	// Download new binary
+	dlResp, err := client.Get("https://claude-code-auth-distribution-916587687563.s3.amazonaws.com/cowork/" + binaryName)
+	if err != nil || dlResp.StatusCode != 200 {
+		return
+	}
+	defer dlResp.Body.Close()
+	newBinary, err := io.ReadAll(dlResp.Body)
+	if err != nil || len(newBinary) < 1000 {
+		return
+	}
+
+	// Verify hash of downloaded binary
+	dlHash := fmt.Sprintf("%x", sha256Sum(newBinary))
+	if dlHash != remoteHash {
+		return // Hash mismatch — don't install
+	}
+
+	// Replace self: write to temp file, then rename
+	tmpPath := execPath + ".update"
+	if err := os.WriteFile(tmpPath, newBinary, 0755); err != nil {
+		return
+	}
+
+	// Atomic rename
+	if err := os.Rename(tmpPath, execPath); err != nil {
+		os.Remove(tmpPath)
+		return
+	}
+
+	fmt.Fprintln(os.Stderr, "[nexus] Updated credential-process to latest version")
+
+	// Save timestamp
+	os.MkdirAll(filepath.Dir(cachePath), 0700)
+	os.WriteFile(cachePath, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0600)
+}
+
+func sha256Sum(data []byte) [32]byte {
+	return sha256.Sum256(data)
+}
+
+func clearAwsCliCacheIfExpired(profile string) {
+	// The AWS CLI/SDK caches credential_process results at ~/.aws/cli/cache/
+	// If our credentials expired, this stale cache causes 403 errors even after
+	// the credential-process would return fresh ones (because the CLI doesn't re-call us).
+	// Fix: proactively clear the CLI cache when our creds are expired.
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+
+	// Check if our cached credentials are expired
+	creds, err := storage.ReadFromCredentialsFile(profile)
+	if err != nil || creds == nil {
+		return
+	}
+	remaining := storage.ParseExpirationSeconds(creds.Expiration)
+	if remaining > 60 {
+		return // Not expired yet, no need to clear
+	}
+
+	// Credentials expired or about to expire — clear the AWS CLI cache
+	cacheDir := filepath.Join(home, ".aws", "cli", "cache")
+	entries, err := os.ReadDir(cacheDir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			os.Remove(filepath.Join(cacheDir, entry.Name()))
+		}
+	}
 }

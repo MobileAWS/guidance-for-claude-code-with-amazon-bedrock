@@ -146,6 +146,31 @@ Resources:
         - Key: Purpose
           Value: User quota monitoring and alerts
 
+  # DynamoDB table for Nexus chat history
+  NexusChatHistory:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: NexusChatHistory
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: session_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: session_id
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Name
+          Value: NexusChatHistory
+        - Key: Purpose
+          Value: Nexus chat history storage with 30-day automatic cleanup (user_id, message, reply, created_at attributes stored per item)
+
   # SNS Topic for quota alerts
   QuotaAlertTopic:
     Type: AWS::SNS::Topic
@@ -538,3 +563,15 @@ Outputs:
     Value: !GetAtt SidecarMonitorFunction.Arn
     Export:
       Name: !Sub '${AWS::StackName}-SidecarMonitorFunctionArn'
+
+  NexusChatHistoryTableName:
+    Description: Name of the NexusChatHistory DynamoDB table
+    Value: !Ref NexusChatHistory
+    Export:
+      Name: !Sub '${AWS::StackName}-NexusChatHistoryTableName'
+
+  NexusChatHistoryTableArn:
+    Description: ARN of the NexusChatHistory DynamoDB table
+    Value: !GetAtt NexusChatHistory.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-NexusChatHistoryTableArn'

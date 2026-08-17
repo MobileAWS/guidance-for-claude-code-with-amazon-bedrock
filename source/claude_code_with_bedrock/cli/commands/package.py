@@ -16,6 +16,7 @@ from rich.console import Console
 from rich.panel import Panel
 
 from claude_code_with_bedrock.cli.utils.aws import get_stack_outputs
+from claude_code_with_bedrock.cli.utils.codesign import MacOSCodeSigner, get_codesign_config_from_env, should_enable_codesigning
 from claude_code_with_bedrock.cli.utils.display import display_configuration_info
 from claude_code_with_bedrock.config import Config
 from claude_code_with_bedrock.models import (
@@ -50,6 +51,22 @@ class PackageCommand(Command):
             "go",
             description="[DEFAULT] Build binaries using Go cross-compilation (native binaries, no AV false positives)",
             flag=True,
+        ),
+        option(
+            "sign-binaries",
+            description="Enable macOS code signing for binaries (auto-detected if not specified)",
+            flag=True,
+        ),
+        option(
+            "notarize",
+            description="Enable Apple notarization for signed binaries (requires Apple ID credentials)",
+            flag=True,
+        ),
+        option(
+            "signing-identity",
+            description="Apple Developer ID signing identity (auto-detected if not specified)",
+            flag=False,
+            default=None,
         ),
     ]
 
@@ -431,6 +448,36 @@ class PackageCommand(Command):
                     otel_helpers.append((plat, output_path))
 
         self.line(f"  <info>Built {len(executables) + len(otel_helpers)} binaries</info>")
+        
+        # Apply code signing for macOS binaries if enabled
+        all_binaries = executables + otel_helpers
+        macos_binaries = [(plat, path) for plat, path in all_binaries if plat.startswith("macos")]
+        
+        if macos_binaries and should_enable_codesigning():
+            self.line("  <info>Applying macOS code signing...</info>")
+            
+            signer = MacOSCodeSigner()
+            codesign_config = get_codesign_config_from_env()
+            
+            # Check if notarization is requested and credentials are available
+            enable_notarization = (
+                codesign_config["apple_id"] is not None and
+                os.environ.get("ENABLE_NOTARIZATION", "false").lower() == "true"
+            )
+            
+            signing_results = signer.batch_sign_binaries(
+                macos_binaries,
+                identity=codesign_config["identity"],
+                notarize=enable_notarization,
+                apple_id=codesign_config["apple_id"],
+                app_password=codesign_config["app_password"],
+                team_id=codesign_config["team_id"]
+            )
+            
+            signer.print_signing_status(signing_results)
+        elif macos_binaries:
+            self.line("  <comment>Skipping code signing (not configured or not on macOS)</comment>")
+        
         return {"executables": executables, "otel_helpers": otel_helpers}
 
     def _regenerate_installers(self, profile, profile_name: str, console: Console) -> int:
@@ -934,9 +981,25 @@ chmod +x ~/claude-code-with-bedrock/credential-process
 
 # macOS Gatekeeper + Keychain notices
 if [[ "$OSTYPE" == "darwin"* ]]; then
-    # Remove quarantine flag added by macOS when downloading unsigned binaries.
-    # Without this, Gatekeeper blocks execution with "Apple could not verify..." dialog.
-    xattr -d com.apple.quarantine ~/claude-code-with-bedrock/credential-process 2>/dev/null || true
+    # Remove quarantine flag if present (only needed for unsigned binaries)
+    # Signed binaries should not have quarantine issues, but we check anyway
+    if xattr -p com.apple.quarantine ~/claude-code-with-bedrock/credential-process >/dev/null 2>&1; then
+        echo "Removing quarantine flag from credential-process..."
+        xattr -d com.apple.quarantine ~/claude-code-with-bedrock/credential-process 2>/dev/null || true
+    fi
+    
+    # Verify code signature if present
+    if codesign --verify ~/claude-code-with-bedrock/credential-process >/dev/null 2>&1; then
+        echo "✓ Binary is properly code-signed"
+        SIGNER=$(codesign -dv ~/claude-code-with-bedrock/credential-process 2>&1 | grep 'Authority=' | head -1 | cut -d'=' -f2)
+        if [[ -n "$SIGNER" ]]; then
+            echo "  Signed by: $SIGNER"
+        fi
+    else
+        echo "⚠️  Binary is not code-signed - you may see Gatekeeper warnings"
+        echo "   On first use, right-click the binary and select 'Open' if needed"
+    fi
+    
     echo
     echo "⚠️  macOS Keychain Access:"
     echo "   On first use, macOS will ask for permission to access the keychain."
@@ -994,7 +1057,14 @@ if [ -f "$OTEL_BINARY" ]; then
     echo "Installing OTEL helper..."
     cp "$OTEL_BINARY" ~/claude-code-with-bedrock/otel-helper
     chmod +x ~/claude-code-with-bedrock/otel-helper
-    xattr -d com.apple.quarantine ~/claude-code-with-bedrock/otel-helper 2>/dev/null || true
+    
+    # Handle quarantine flag for OTEL helper
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        if xattr -p com.apple.quarantine ~/claude-code-with-bedrock/otel-helper >/dev/null 2>&1; then
+            xattr -d com.apple.quarantine ~/claude-code-with-bedrock/otel-helper 2>/dev/null || true
+        fi
+    fi
+    
     echo "✓ OTEL helper installed"
 fi
 

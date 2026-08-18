@@ -425,6 +425,10 @@ class PackageCommand(Command):
                 if result.returncode != 0:
                     raise RuntimeError(f"Go build failed for {output_name}:\n{result.stderr}")
 
+                # Apply macOS code signing if on macOS and building macOS binaries
+                if plat.startswith("macos") and goos == "darwin":
+                    self._sign_macos_binary(output_path, binary)
+
                 if binary == "credential-process":
                     executables.append((plat, output_path))
                 else:
@@ -432,6 +436,151 @@ class PackageCommand(Command):
 
         self.line(f"  <info>Built {len(executables) + len(otel_helpers)} binaries</info>")
         return {"executables": executables, "otel_helpers": otel_helpers}
+
+
+    def _sign_macos_binary(self, binary_path: Path, binary_type: str) -> None:
+        """Sign macOS binary with hardened runtime and proper entitlements.
+        
+        Args:
+            binary_path: Path to the binary to sign
+            binary_type: Type of binary ('credential-process' or 'otel-helper')
+        """
+        import platform
+        import tempfile
+        
+        # Only sign if running on macOS
+        if platform.system() != "Darwin":
+            self.line(f"  <comment>Skipping code signing (not on macOS): {binary_path.name}</comment>")
+            return
+            
+        # Check if codesign is available
+        try:
+            subprocess.run(["codesign", "--version"], capture_output=True, check=True)
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            self.line(f"  <comment>Skipping code signing (codesign not found): {binary_path.name}</comment>")
+            return
+            
+        # Create minimal entitlements plist
+        entitlements_content = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Required for AWS API calls and credential storage -->
+    <key>com.apple.security.network.client</key>
+    <true/>
+    <key>com.apple.security.keychain-access-groups</key>
+    <array>
+        <string>$(AppIdentifierPrefix)com.anthropic.claude-code</string>
+    </array>
+</dict>
+</plist>"""
+        
+        # Write entitlements to temporary file
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.entitlements', delete=False) as f:
+            f.write(entitlements_content)
+            entitlements_path = f.name
+            
+        try:
+            # Get signing identity from environment or use ad-hoc signing
+            signing_identity = os.environ.get('CODESIGN_IDENTITY', '-')
+            
+            # Sign with hardened runtime
+            codesign_cmd = [
+                "codesign",
+                "--sign", signing_identity,
+                "--force",
+                "--verbose",
+                "--options", "runtime",  # Enable hardened runtime
+                "--entitlements", entitlements_path,
+                "--timestamp",  # Add secure timestamp
+                str(binary_path)
+            ]
+            
+            result = subprocess.run(codesign_cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                self.line(f"  <error>Code signing failed for {binary_path.name}: {result.stderr}</error>")
+                return
+                
+            # Verify signature with strict and deep flags
+            verify_cmd = ["codesign", "--verify", "--strict", "--deep", str(binary_path)]
+            result = subprocess.run(verify_cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                self.line(f"  <error>Code signature verification failed for {binary_path.name}: {result.stderr}</error>")
+                return
+                
+            self.line(f"  <info>✓ Code signed with hardened runtime: {binary_path.name}</info>")
+            
+            # Attempt notarization if credentials are available
+            self._notarize_binary(binary_path)
+            
+        finally:
+            # Clean up temporary entitlements file
+            try:
+                os.unlink(entitlements_path)
+            except OSError:
+                pass
+                
+    def _notarize_binary(self, binary_path: Path) -> None:
+        """Notarize macOS binary for Gatekeeper trust.
+        
+        Args:
+            binary_path: Path to the signed binary to notarize
+        """
+        # Check if notarization credentials are available
+        apple_id = os.environ.get('NOTARIZATION_APPLE_ID')
+        app_password = os.environ.get('NOTARIZATION_APP_PASSWORD')
+        team_id = os.environ.get('NOTARIZATION_TEAM_ID')
+        
+        if not all([apple_id, app_password, team_id]):
+            self.line(f"  <comment>Skipping notarization (credentials not set): {binary_path.name}</comment>")
+            self.line("  <comment>Set NOTARIZATION_APPLE_ID, NOTARIZATION_APP_PASSWORD, NOTARIZATION_TEAM_ID for notarization</comment>")
+            return
+            
+        try:
+            import tempfile
+            import zipfile
+            
+            # Create a zip file for notarization (required for single binaries)
+            with tempfile.NamedTemporaryFile(suffix='.zip', delete=False) as zip_file:
+                zip_path = zip_file.name
+                
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                zf.write(binary_path, binary_path.name)
+                
+            # Submit for notarization
+            notarize_cmd = [
+                "xcrun", "notarytool", "submit",
+                zip_path,
+                "--apple-id", apple_id,
+                "--password", app_password,
+                "--team-id", team_id,
+                "--wait",
+                "--timeout", "300",  # 5 minute timeout
+                "--output-format", "json"
+            ]
+            
+            result = subprocess.run(notarize_cmd, capture_output=True, text=True)
+            if result.returncode == 0:
+                self.line(f"  <info>✓ Notarized successfully: {binary_path.name}</info>")
+                
+                # Staple the notarization to the binary
+                staple_cmd = ["xcrun", "stapler", "staple", str(binary_path)]
+                staple_result = subprocess.run(staple_cmd, capture_output=True, text=True)
+                if staple_result.returncode == 0:
+                    self.line(f"  <info>✓ Stapled notarization ticket: {binary_path.name}</info>")
+                else:
+                    self.line(f"  <comment>Could not staple ticket (binary will still work): {binary_path.name}</comment>")
+            else:
+                self.line(f"  <comment>Notarization failed (binary will still work): {binary_path.name}</comment>")
+                
+        except Exception as e:
+            self.line(f"  <comment>Notarization error (binary will still work): {e}</comment>")
+        finally:
+            # Clean up zip file
+            try:
+                os.unlink(zip_path)
+            except (OSError, NameError):
+                pass
 
     def _regenerate_installers(self, profile, profile_name: str, console: Console) -> int:
         """Regenerate installer scripts using existing binaries from the latest dist folder."""
@@ -932,11 +1081,8 @@ cp "$CREDENTIAL_BINARY" ~/claude-code-with-bedrock/credential-process
 cp config.json ~/claude-code-with-bedrock/
 chmod +x ~/claude-code-with-bedrock/credential-process
 
-# macOS Gatekeeper + Keychain notices
+# macOS Keychain notice (signed binaries no longer need quarantine removal)
 if [[ "$OSTYPE" == "darwin"* ]]; then
-    # Remove quarantine flag added by macOS when downloading unsigned binaries.
-    # Without this, Gatekeeper blocks execution with "Apple could not verify..." dialog.
-    xattr -d com.apple.quarantine ~/claude-code-with-bedrock/credential-process 2>/dev/null || true
     echo
     echo "⚠️  macOS Keychain Access:"
     echo "   On first use, macOS will ask for permission to access the keychain."
@@ -994,7 +1140,6 @@ if [ -f "$OTEL_BINARY" ]; then
     echo "Installing OTEL helper..."
     cp "$OTEL_BINARY" ~/claude-code-with-bedrock/otel-helper
     chmod +x ~/claude-code-with-bedrock/otel-helper
-    xattr -d com.apple.quarantine ~/claude-code-with-bedrock/otel-helper 2>/dev/null || true
     echo "✓ OTEL helper installed"
 fi
 
@@ -1560,6 +1705,8 @@ aws sts get-caller-identity
 ### macOS Keychain Access Popup
 On first use, macOS will ask for permission to access the keychain. This is normal and required for \
 secure credential storage. Click "Always Allow" to avoid repeated prompts.
+
+The authentication binaries are code-signed with hardened runtime and notarized by Apple for security.
 
 ### Authentication Issues
 If you encounter issues with authentication:

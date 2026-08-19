@@ -85,9 +85,13 @@ func WaitForCallback(resultCh chan CallbackResult, srv *http.Server, timeout tim
 func sendHTML(w http.ResponseWriter, code int, message string) {
 	w.Header().Set("Content-Type", "text/html")
 	w.WriteHeader(code)
-	page := fmt.Sprintf(`<html>
-<head><title>Authentication</title></head>
-<body style="font-family: sans-serif; text-align: center; padding: 50px;">
+	page := fmt.Sprintf(`<html lang="en">
+<head>
+    <title>Authentication</title>
+    <meta name="google" content="notranslate">
+    <meta http-equiv="Content-Language" content="en">
+</head>
+<body translate="no" class="notranslate" style="font-family: sans-serif; text-align: center; padding: 50px;">
     <h1>%s</h1>
     <p>Return to your terminal to continue.</p>
 </body>

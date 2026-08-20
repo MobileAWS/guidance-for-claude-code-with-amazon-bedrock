@@ -26,6 +26,8 @@ import (
 	"ccwb-go/internal/quota"
 	"ccwb-go/internal/storage"
 	"ccwb-go/internal/version"
+
+	browserpkg "ccwb-go/internal/browser"
 )
 
 var debug bool
@@ -384,6 +386,9 @@ func (a *credentialApp) run() int {
 
 	// Sync MCP servers from Nexus (quick, with timeout)
 	syncMcpServers()
+
+	// Inject per-user integration tokens (HubSpot OAuth, etc.)
+	syncIntegrationTokens(a.profile)
 
 	// Sync Codex config from Nexus (quick, best-effort)
 	syncCodexConfig(a.profile)
@@ -1102,7 +1107,24 @@ func syncMcpServers() {
 		existing = make(map[string]interface{})
 	}
 	// Add/update managed MCPs without removing user-added ones
+	// Preserve existing env vars (integration tokens get injected there)
 	for name, config := range mcps {
+		newConfig, _ := config.(map[string]interface{})
+		if existingConfig, ok := existing[name].(map[string]interface{}); ok && newConfig != nil {
+			// Preserve env vars from existing config that aren't in the new config
+			if existingEnv, ok := existingConfig["env"].(map[string]interface{}); ok && len(existingEnv) > 0 {
+				newEnv, _ := newConfig["env"].(map[string]interface{})
+				if newEnv == nil {
+					newEnv = make(map[string]interface{})
+				}
+				for k, v := range existingEnv {
+					if _, exists := newEnv[k]; !exists {
+						newEnv[k] = v
+					}
+				}
+				newConfig["env"] = newEnv
+			}
+		}
 		existing[name] = config
 	}
 	settings["mcpServers"] = existing
@@ -1141,6 +1163,22 @@ func syncMcpServers() {
 		existingMcps = make(map[string]interface{})
 	}
 	for name, config := range claudeMcps {
+		// Preserve existing env vars (integration tokens)
+		newConfig, _ := config.(map[string]interface{})
+		if existingConfig, ok := existingMcps[name].(map[string]interface{}); ok && newConfig != nil {
+			if existingEnv, ok := existingConfig["env"].(map[string]interface{}); ok && len(existingEnv) > 0 {
+				newEnv, _ := newConfig["env"].(map[string]interface{})
+				if newEnv == nil {
+					newEnv = make(map[string]interface{})
+				}
+				for k, v := range existingEnv {
+					if _, exists := newEnv[k]; !exists {
+						newEnv[k] = v
+					}
+				}
+				newConfig["env"] = newEnv
+			}
+		}
 		existingMcps[name] = config
 	}
 	claudeJson["mcpServers"] = existingMcps
@@ -1151,6 +1189,185 @@ func syncMcpServers() {
 	// Update sync timestamp
 	os.MkdirAll(filepath.Dir(cachePath), 0700)
 	os.WriteFile(cachePath, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0600)
+}
+
+
+// syncIntegrationTokens fetches per-user OAuth tokens for MCP servers that need them
+// (e.g., HubSpot) and injects them as env vars in settings.json.
+// If the user hasn't authenticated with a service yet, opens browser for OAuth.
+func syncIntegrationTokens(profile string) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+
+	debugPrint("syncIntegrationTokens: starting for profile %s", profile)
+
+	// Check if we synced recently (skip if < 10 min ago)
+	cachePath := filepath.Join(home, ".claude-code-session", "integration-token-sync-ts")
+	if data, err := os.ReadFile(cachePath); err == nil {
+		if ts, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64); err == nil {
+			if time.Now().Unix()-ts < 600 {
+				debugPrint("syncIntegrationTokens: skipping, synced recently")
+				return
+			}
+		}
+	}
+
+	// Get monitoring token for API auth
+	monToken, _ := storage.GetMonitoringToken(profile, "keyring")
+	if monToken == "" {
+		debugPrint("syncIntegrationTokens: no monitoring token, skipping")
+		return
+	}
+
+	debugPrint("syncIntegrationTokens: got monitoring token, checking integrations")
+
+	// integrations that need per-user tokens
+	integrations := []struct {
+		name       string
+		mcpKey     string
+		envVar     string
+		tokenURL   string
+		connectURL string
+	}{
+		{
+			name:       "hubspot",
+			mcpKey:     "hubspot",
+			envVar:     "PRIVATE_APP_ACCESS_TOKEN",
+			tokenURL:   "https://dtxfifv2cj.execute-api.us-east-1.amazonaws.com/api/integrations/hubspot/token",
+			connectURL: "https://dtxfifv2cj.execute-api.us-east-1.amazonaws.com/api/integrations/hubspot/connect",
+		},
+	}
+
+	settingsPath := filepath.Join(home, ".claude", "settings.json")
+	claudeJsonPath := filepath.Join(home, ".claude.json")
+
+	for _, integ := range integrations {
+		// Fetch token from Nexus API
+		client := &http.Client{Timeout: 5 * time.Second}
+		req, err := http.NewRequest("GET", integ.tokenURL, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("Authorization", "Bearer "+monToken)
+		resp, err := client.Do(req)
+		if err != nil || resp == nil {
+			debugPrint("syncIntegrationTokens: %s token fetch failed: %v", integ.name, err)
+			continue
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		debugPrint("syncIntegrationTokens: %s token response status=%d", integ.name, resp.StatusCode)
+
+		var tokenResp map[string]interface{}
+		if err := json.Unmarshal(body, &tokenResp); err != nil {
+			continue
+		}
+
+		accessToken, _ := tokenResp["access_token"].(string)
+		if accessToken == "" {
+			// User hasn't connected this integration yet
+			// Check if the MCP is even configured before prompting
+			settingsData, err := os.ReadFile(settingsPath)
+			if err != nil {
+				continue
+			}
+			var settings map[string]interface{}
+			if err := json.Unmarshal(settingsData, &settings); err != nil {
+				continue
+			}
+			mcpServers, _ := settings["mcpServers"].(map[string]interface{})
+			if mcpServers == nil {
+				continue
+			}
+			if _, exists := mcpServers[integ.mcpKey]; !exists {
+				continue // MCP not configured, skip
+			}
+			// MCP is configured but no token — open browser for auth (first time only)
+			connectCachePath := filepath.Join(home, ".claude-code-session", integ.name+"-connect-prompted")
+			if _, err := os.Stat(connectCachePath); err == nil {
+				continue // Already prompted, don't nag
+			}
+			debugPrint("Opening browser for %s authentication...", integ.name)
+			fmt.Fprintf(os.Stderr, "Opening browser for %s authentication...\n", integ.name)
+			browserpkg.OpenURL(integ.connectURL)
+
+			// Wait for user to complete OAuth (poll for token, up to 90 seconds)
+			fmt.Fprintf(os.Stderr, "Waiting for %s authorization...\n", integ.name)
+			var oauthToken string
+			for i := 0; i < 30; i++ {
+				time.Sleep(3 * time.Second)
+				pollReq, _ := http.NewRequest("GET", integ.tokenURL, nil)
+				pollReq.Header.Set("Authorization", "Bearer "+monToken)
+				pollResp, pollErr := client.Do(pollReq)
+				if pollErr != nil || pollResp == nil {
+					continue
+				}
+				pollBody, _ := io.ReadAll(pollResp.Body)
+				pollResp.Body.Close()
+				var pollResult map[string]interface{}
+				json.Unmarshal(pollBody, &pollResult)
+				if t, ok := pollResult["access_token"].(string); ok && t != "" {
+					oauthToken = t
+					break
+				}
+			}
+
+			if oauthToken != "" {
+				fmt.Fprintf(os.Stderr, "✓ %s connected!\n", integ.name)
+				injectMcpEnvVar(settingsPath, integ.mcpKey, integ.envVar, oauthToken)
+				injectMcpEnvVar(claudeJsonPath, integ.mcpKey, integ.envVar, oauthToken)
+			} else {
+				fmt.Fprintf(os.Stderr, "⚠ %s authorization timed out. Run claude again after connecting.\n", integ.name)
+			}
+
+			os.MkdirAll(filepath.Dir(connectCachePath), 0700)
+			os.WriteFile(connectCachePath, []byte("1"), 0600)
+			continue
+		}
+
+		// Got a token — inject into MCP env vars in settings.json
+		injectMcpEnvVar(settingsPath, integ.mcpKey, integ.envVar, accessToken)
+		injectMcpEnvVar(claudeJsonPath, integ.mcpKey, integ.envVar, accessToken)
+	}
+
+	// Update sync timestamp
+	os.MkdirAll(filepath.Dir(cachePath), 0700)
+	os.WriteFile(cachePath, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0600)
+}
+
+// injectMcpEnvVar adds/updates an env var in a specific MCP server's config within settings.json
+func injectMcpEnvVar(settingsPath, mcpKey, envVar, value string) {
+	data, err := os.ReadFile(settingsPath)
+	if err != nil {
+		return
+	}
+	var settings map[string]interface{}
+	if err := json.Unmarshal(data, &settings); err != nil {
+		return
+	}
+	mcpServers, _ := settings["mcpServers"].(map[string]interface{})
+	if mcpServers == nil {
+		return
+	}
+	mcpConfig, ok := mcpServers[mcpKey].(map[string]interface{})
+	if !ok {
+		return
+	}
+	env, _ := mcpConfig["env"].(map[string]interface{})
+	if env == nil {
+		env = make(map[string]interface{})
+	}
+	env[envVar] = value
+	mcpConfig["env"] = env
+	mcpServers[mcpKey] = mcpConfig
+	settings["mcpServers"] = mcpServers
+	newData, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return
+	}
+	os.WriteFile(settingsPath, newData, 0600)
 }
 
 func syncSkills() {

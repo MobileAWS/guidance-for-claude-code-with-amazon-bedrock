@@ -27,7 +27,7 @@ import (
 	"ccwb-go/internal/storage"
 	"ccwb-go/internal/version"
 
-	browserpkg "ccwb-go/internal/browser"
+	_ "ccwb-go/internal/browser" // available for future integration flows
 )
 
 var debug bool
@@ -385,7 +385,7 @@ func (a *credentialApp) run() int {
 	go checkForUpdate()
 
 	// Sync MCP servers from Nexus (quick, with timeout)
-	syncMcpServers()
+	syncMcpServers(a.profile)
 
 	// Inject per-user integration tokens (HubSpot OAuth, etc.)
 	syncIntegrationTokens(a.profile)
@@ -397,7 +397,7 @@ func (a *credentialApp) run() int {
 	syncSkills()
 
 	// Sync managed config for Claude Desktop (quick, with timeout)
-	syncManagedConfig()
+	syncManagedConfig(a.profile)
 
 	// Clear AWS CLI cache if our credentials are expired (prevents stale credential loops)
 	clearAwsCliCacheIfExpired(a.profile)
@@ -1034,7 +1034,7 @@ func updateShellProfileEnv(profilePath, key, value string) {
 	os.WriteFile(profilePath, []byte(newContent), 0644)
 }
 
-func syncMcpServers() {
+func syncMcpServers(profile string) {
 	// Fetch MCP config from S3 and merge into ~/.claude/settings.json AND ~/.claude.json
 	// Non-blocking, best effort — failures are silent
 	home, err := os.UserHomeDir()
@@ -1108,8 +1108,14 @@ func syncMcpServers() {
 	}
 	// Add/update managed MCPs without removing user-added ones
 	// Preserve existing env vars (integration tokens get injected there)
+	// Skip HTTP-type MCPs for settings.json (only .claude.json supports them)
 	for name, config := range mcps {
 		newConfig, _ := config.(map[string]interface{})
+		if newConfig != nil {
+			if cmd, _ := newConfig["command"].(string); cmd == "__http__" {
+				continue // HTTP MCPs only go in .claude.json
+			}
+		}
 		if existingConfig, ok := existing[name].(map[string]interface{}); ok && newConfig != nil {
 			// Preserve env vars from existing config that aren't in the new config
 			if existingEnv, ok := existingConfig["env"].(map[string]interface{}); ok && len(existingEnv) > 0 {
@@ -1142,15 +1148,48 @@ func syncMcpServers() {
 	if claudeJson == nil {
 		claudeJson = make(map[string]interface{})
 	}
-	// Convert mcps to the format Claude Code 2.1+ expects (with "type": "stdio")
+	// Convert mcps to the format Claude Code 2.1+ expects
 	claudeMcps := make(map[string]interface{})
 	for name, config := range mcps {
+		cfgMap, _ := config.(map[string]interface{})
+		if cfgMap == nil {
+			continue
+		}
+		cmd, _ := cfgMap["command"].(string)
+
+		// HTTP-type MCPs (e.g., Partner Central) — use native HTTP transport
+		if cmd == "__http__" {
+			url, _ := cfgMap["args"].(string)
+			if url == "" {
+				// args might be a []interface{} with URL as first element
+				if argsArr, ok := cfgMap["args"].([]interface{}); ok && len(argsArr) > 0 {
+					url, _ = argsArr[0].(string)
+				}
+			}
+			entry := map[string]interface{}{
+				"type": "http",
+				"url":  url,
+			}
+			// If this is our own AgentCore gateway, inject the auth header
+			if strings.Contains(url, "gateway.bedrock-agentcore") {
+				monToken, _ := storage.GetMonitoringToken(profile, "keyring")
+				if monToken != "" {
+					entry["headers"] = map[string]interface{}{
+						"Authorization": "Bearer " + monToken,
+					}
+				}
+			}
+			claudeMcps[name] = entry
+			continue
+		}
+
+		// Standard stdio MCPs
 		entry := map[string]interface{}{
 			"type":    "stdio",
-			"command": config.(map[string]interface{})["command"],
-			"args":    config.(map[string]interface{})["args"],
+			"command": cmd,
+			"args":    cfgMap["args"],
 		}
-		if env, ok := config.(map[string]interface{})["env"]; ok {
+		if env, ok := cfgMap["env"]; ok {
 			entry["env"] = env
 		} else {
 			entry["env"] = map[string]interface{}{}
@@ -1228,6 +1267,7 @@ func syncIntegrationTokens(profile string) {
 		name       string
 		mcpKey     string
 		envVar     string
+		extraEnvs  map[string]string // additional env vars to inject from token response
 		tokenURL   string
 		connectURL string
 	}{
@@ -1237,6 +1277,28 @@ func syncIntegrationTokens(profile string) {
 			envVar:     "PRIVATE_APP_ACCESS_TOKEN",
 			tokenURL:   "https://dtxfifv2cj.execute-api.us-east-1.amazonaws.com/api/integrations/hubspot/token",
 			connectURL: "https://dtxfifv2cj.execute-api.us-east-1.amazonaws.com/api/integrations/hubspot/connect",
+		},
+		{
+			name:       "activecampaign",
+			mcpKey:     "activecampaign",
+			envVar:     "ACTIVECAMPAIGN_API_KEY",
+			extraEnvs:  map[string]string{"account_url": "ACTIVECAMPAIGN_API_URL"},
+			tokenURL:   "https://dtxfifv2cj.execute-api.us-east-1.amazonaws.com/api/integrations/activecampaign/token",
+			connectURL: "https://nexus.allcode.com/me",
+		},
+		{
+			name:       "zapier",
+			mcpKey:     "zapier",
+			envVar:     "ZAPIER_MCP_TOKEN",
+			tokenURL:   "https://dtxfifv2cj.execute-api.us-east-1.amazonaws.com/api/integrations/zapier/token",
+			connectURL: "https://nexus.allcode.com/me",
+		},
+		{
+			name:       "nexus-factory",
+			mcpKey:     "nexus-factory",
+			envVar:     "NEXUS_FACTORY_API_KEY",
+			tokenURL:   "https://dtxfifv2cj.execute-api.us-east-1.amazonaws.com/api/integrations/nexus-factory/token",
+			connectURL: "https://nexus.allcode.com/me",
 		},
 	}
 
@@ -1284,52 +1346,31 @@ func syncIntegrationTokens(profile string) {
 			if _, exists := mcpServers[integ.mcpKey]; !exists {
 				continue // MCP not configured, skip
 			}
-			// MCP is configured but no token — open browser for auth (first time only)
+			// MCP is configured but no token — show user how to connect
 			connectCachePath := filepath.Join(home, ".claude-code-session", integ.name+"-connect-prompted")
-			if _, err := os.Stat(connectCachePath); err == nil {
-				continue // Already prompted, don't nag
+			if _, err := os.Stat(connectCachePath); err != nil {
+				// First time seeing this - show the message
+				fmt.Fprintf(os.Stderr, "\n⚠ %s MCP needs authentication.\n  Open this URL in your browser to connect:\n  %s\n  Then restart claude.\n\n", integ.name, integ.connectURL)
+				os.MkdirAll(filepath.Dir(connectCachePath), 0700)
+				os.WriteFile(connectCachePath, []byte("1"), 0600)
 			}
-			debugPrint("Opening browser for %s authentication...", integ.name)
-			fmt.Fprintf(os.Stderr, "Opening browser for %s authentication...\n", integ.name)
-			browserpkg.OpenURL(integ.connectURL)
-
-			// Wait for user to complete OAuth (poll for token, up to 90 seconds)
-			fmt.Fprintf(os.Stderr, "Waiting for %s authorization...\n", integ.name)
-			var oauthToken string
-			for i := 0; i < 30; i++ {
-				time.Sleep(3 * time.Second)
-				pollReq, _ := http.NewRequest("GET", integ.tokenURL, nil)
-				pollReq.Header.Set("Authorization", "Bearer "+monToken)
-				pollResp, pollErr := client.Do(pollReq)
-				if pollErr != nil || pollResp == nil {
-					continue
-				}
-				pollBody, _ := io.ReadAll(pollResp.Body)
-				pollResp.Body.Close()
-				var pollResult map[string]interface{}
-				json.Unmarshal(pollBody, &pollResult)
-				if t, ok := pollResult["access_token"].(string); ok && t != "" {
-					oauthToken = t
-					break
-				}
-			}
-
-			if oauthToken != "" {
-				fmt.Fprintf(os.Stderr, "✓ %s connected!\n", integ.name)
-				injectMcpEnvVar(settingsPath, integ.mcpKey, integ.envVar, oauthToken)
-				injectMcpEnvVar(claudeJsonPath, integ.mcpKey, integ.envVar, oauthToken)
-			} else {
-				fmt.Fprintf(os.Stderr, "⚠ %s authorization timed out. Run claude again after connecting.\n", integ.name)
-			}
-
-			os.MkdirAll(filepath.Dir(connectCachePath), 0700)
-			os.WriteFile(connectCachePath, []byte("1"), 0600)
+			debugPrint("syncIntegrationTokens: %s not connected, skipping (user will auth on first use)", integ.name)
 			continue
 		}
 
 		// Got a token — inject into MCP env vars in settings.json
 		injectMcpEnvVar(settingsPath, integ.mcpKey, integ.envVar, accessToken)
 		injectMcpEnvVar(claudeJsonPath, integ.mcpKey, integ.envVar, accessToken)
+
+		// Inject additional env vars from the token response (e.g., account_url -> ACTIVECAMPAIGN_API_URL)
+		if integ.extraEnvs != nil {
+			for responseKey, envVarName := range integ.extraEnvs {
+				if val, ok := tokenResp[responseKey].(string); ok && val != "" {
+					injectMcpEnvVar(settingsPath, integ.mcpKey, envVarName, val)
+					injectMcpEnvVar(claudeJsonPath, integ.mcpKey, envVarName, val)
+				}
+			}
+		}
 	}
 
 	// Update sync timestamp
@@ -1486,7 +1527,7 @@ func syncSkills() {
 	os.WriteFile(cachePath, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0600)
 }
 
-func syncManagedConfig() {
+func syncManagedConfig(profile string) {
 	// Fetch the latest cowork config from S3 and update managed_config.json
 	// This keeps Claude Desktop's managed MCPs in sync with the Nexus portal
 	home, err := os.UserHomeDir()
@@ -1538,6 +1579,45 @@ func syncManagedConfig() {
 		localConfig["managedMcpServers"] = mcps
 	}
 
+	// Inject per-user integration tokens into managed MCP env vars (e.g., HubSpot)
+	if mcps, ok := localConfig["managedMcpServers"].([]interface{}); ok {
+		monToken, _ := storage.GetMonitoringToken(profile, "keyring")
+		if monToken != "" {
+			client := &http.Client{Timeout: 5 * time.Second}
+			// HubSpot token injection
+			for i, mcp := range mcps {
+				mcpMap, _ := mcp.(map[string]interface{})
+				if mcpMap == nil {
+					continue
+				}
+				name, _ := mcpMap["name"].(string)
+				if name == "HubSpot" {
+					req, _ := http.NewRequest("GET", "https://dtxfifv2cj.execute-api.us-east-1.amazonaws.com/api/integrations/hubspot/token", nil)
+					if req != nil {
+						req.Header.Set("Authorization", "Bearer "+monToken)
+						resp, err := client.Do(req)
+						if err == nil && resp != nil {
+							body, _ := io.ReadAll(resp.Body)
+							resp.Body.Close()
+							var tokenResp map[string]interface{}
+							json.Unmarshal(body, &tokenResp)
+							if token, ok := tokenResp["access_token"].(string); ok && token != "" {
+								env, _ := mcpMap["env"].(map[string]interface{})
+								if env == nil {
+									env = make(map[string]interface{})
+								}
+								env["PRIVATE_APP_ACCESS_TOKEN"] = token
+								mcpMap["env"] = env
+								mcps[i] = mcpMap
+							}
+						}
+					}
+				}
+			}
+			localConfig["managedMcpServers"] = mcps
+		}
+	}
+
 	// Also sync other config fields (but preserve inferenceCredentialHelper which is local-path specific)
 	for _, key := range []string{"isDesktopExtensionEnabled", "isDesktopExtensionDirectoryEnabled", "isLocalDevMcpEnabled", "isClaudeCodeForDesktopEnabled"} {
 		if v, ok := remoteConfig[key]; ok {
@@ -1556,6 +1636,45 @@ func syncManagedConfig() {
 	// Also write to Claude-3p directory (3rd-party/Bedrock variant)
 	os.MkdirAll(filepath.Dir(managedConfigPath3P), 0700)
 	os.WriteFile(managedConfigPath3P, newData, 0600)
+
+	// Write mcpServers to Claude-3p/claude_desktop_config.json (Cowork on Bedrock reads from here)
+	desktopConfigPath := filepath.Join(home, "Library", "Application Support", "Claude-3p", "claude_desktop_config.json")
+	var desktopConfig map[string]interface{}
+	if data, err := os.ReadFile(desktopConfigPath); err == nil {
+		json.Unmarshal(data, &desktopConfig)
+	}
+	if desktopConfig == nil {
+		desktopConfig = make(map[string]interface{})
+	}
+	if mcps, ok := localConfig["managedMcpServers"].([]interface{}); ok {
+		mcpServers, _ := desktopConfig["mcpServers"].(map[string]interface{})
+		if mcpServers == nil {
+			mcpServers = make(map[string]interface{})
+		}
+		for _, mcp := range mcps {
+			mcpMap, _ := mcp.(map[string]interface{})
+			if mcpMap == nil {
+				continue
+			}
+			name, _ := mcpMap["name"].(string)
+			if name == "" {
+				continue
+			}
+			key := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(name, " ", "-"), "&", "and"))
+			entry := map[string]interface{}{
+				"command": mcpMap["command"],
+				"args":    mcpMap["args"],
+			}
+			if env, ok := mcpMap["env"].(map[string]interface{}); ok && len(env) > 0 {
+				entry["env"] = env
+			}
+			mcpServers[key] = entry
+		}
+		desktopConfig["mcpServers"] = mcpServers
+	}
+	if desktopData, err := json.MarshalIndent(desktopConfig, "", "  "); err == nil {
+		os.WriteFile(desktopConfigPath, desktopData, 0600)
+	}
 
 	// Update Claude Desktop managed preferences plist (if writable)
 	// This is the file Claude Desktop actually reads for managed MCPs
@@ -1649,7 +1768,7 @@ func checkForUpdate() {
 	cachePath := filepath.Join(home, ".claude-code-session", "update-check-ts")
 	if data, err := os.ReadFile(cachePath); err == nil {
 		if ts, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64); err == nil {
-			if time.Now().Unix()-ts < 86400 { // 24 hours
+			if time.Now().Unix()-ts < 3600 { // 1 hour
 				return
 			}
 		}

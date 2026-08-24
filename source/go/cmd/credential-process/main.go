@@ -1545,9 +1545,39 @@ func syncManagedConfig(profile string) {
 		}
 	}
 
-	// Fetch cowork config from S3
+	// Fetch cowork config from S3 (org-specific based on profile)
 	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Get("https://claude-code-auth-distribution-916587687563.s3.amazonaws.com/cowork/cowork-3p-config.json")
+
+	// Determine org from profile name (e.g., "lets-play-us-east-2" → "lets-play")
+	orgID := "allcode"
+	parts := strings.Split(profile, "-")
+	if len(parts) >= 3 {
+		// Remove the last 2 parts (region like "us-east-2") to get org slug
+		regionParts := 0
+		for i := len(parts) - 1; i >= 0; i-- {
+			if parts[i] == "east" || parts[i] == "west" || parts[i] == "us" || len(parts[i]) <= 2 {
+				regionParts++
+			} else {
+				break
+			}
+		}
+		if regionParts > 0 && regionParts < len(parts) {
+			orgID = strings.Join(parts[:len(parts)-regionParts], "-")
+		}
+	}
+	if profile == "allcode-dev-us-east-1" {
+		orgID = "allcode"
+	}
+
+	// Try org-specific config first, fall back to default
+	coworkURL := fmt.Sprintf("https://claude-code-auth-distribution-916587687563.s3.amazonaws.com/cowork/org-%s-cowork-3p-config.json", orgID)
+	resp, err := client.Get(coworkURL)
+	if err != nil || resp.StatusCode != 200 {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		resp, err = client.Get("https://claude-code-auth-distribution-916587687563.s3.amazonaws.com/cowork/cowork-3p-config.json")
+	}
 	if err != nil || resp.StatusCode != 200 {
 		return
 	}
@@ -1619,7 +1649,7 @@ func syncManagedConfig(profile string) {
 	}
 
 	// Also sync other config fields (but preserve inferenceCredentialHelper which is local-path specific)
-	for _, key := range []string{"isDesktopExtensionEnabled", "isDesktopExtensionDirectoryEnabled", "isLocalDevMcpEnabled", "isClaudeCodeForDesktopEnabled"} {
+	for _, key := range []string{"isDesktopExtensionEnabled", "isDesktopExtensionDirectoryEnabled", "isLocalDevMcpEnabled", "isClaudeCodeForDesktopEnabled", "inferenceProvider", "inferenceBedrockRegion", "inferenceBedrockProfile", "inferenceCredentialHelper", "inferenceCredentialHelperTtlSec", "inferenceModels"} {
 		if v, ok := remoteConfig[key]; ok {
 			localConfig[key] = v
 		}

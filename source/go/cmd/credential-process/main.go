@@ -1609,38 +1609,60 @@ func syncManagedConfig(profile string) {
 		localConfig["managedMcpServers"] = mcps
 	}
 
-	// Inject per-user integration tokens into managed MCP env vars (e.g., HubSpot)
+	// Inject per-user integration tokens into managed MCP env vars (HubSpot, ActiveCampaign, Zapier, Nexus Factory)
 	if mcps, ok := localConfig["managedMcpServers"].([]interface{}); ok {
 		monToken, _ := storage.GetMonitoringToken(profile, "keyring")
 		if monToken != "" {
 			client := &http.Client{Timeout: 5 * time.Second}
-			// HubSpot token injection
+			type mcpTokenConfig struct {
+				mcpName  string
+				tokenURL string
+				envMap   map[string]string // response field → env var name
+			}
+			tokenConfigs := []mcpTokenConfig{
+				{"HubSpot", "https://dtxfifv2cj.execute-api.us-east-1.amazonaws.com/api/integrations/hubspot/token", map[string]string{"access_token": "PRIVATE_APP_ACCESS_TOKEN"}},
+				{"ActiveCampaign", "https://dtxfifv2cj.execute-api.us-east-1.amazonaws.com/api/integrations/activecampaign/token", map[string]string{"access_token": "ACTIVECAMPAIGN_API_KEY", "account_url": "ACTIVECAMPAIGN_API_URL"}},
+				{"Zapier", "https://dtxfifv2cj.execute-api.us-east-1.amazonaws.com/api/integrations/zapier/token", map[string]string{"access_token": "ZAPIER_MCP_TOKEN"}},
+				{"Nexus Factory", "https://dtxfifv2cj.execute-api.us-east-1.amazonaws.com/api/integrations/nexus-factory/token", map[string]string{"access_token": "NEXUS_FACTORY_API_KEY"}},
+			}
+
 			for i, mcp := range mcps {
 				mcpMap, _ := mcp.(map[string]interface{})
 				if mcpMap == nil {
 					continue
 				}
 				name, _ := mcpMap["name"].(string)
-				if name == "HubSpot" {
-					req, _ := http.NewRequest("GET", "https://dtxfifv2cj.execute-api.us-east-1.amazonaws.com/api/integrations/hubspot/token", nil)
-					if req != nil {
+				for _, tc := range tokenConfigs {
+					if name == tc.mcpName {
+						req, _ := http.NewRequest("GET", tc.tokenURL, nil)
+						if req == nil {
+							break
+						}
 						req.Header.Set("Authorization", "Bearer "+monToken)
 						resp, err := client.Do(req)
-						if err == nil && resp != nil {
-							body, _ := io.ReadAll(resp.Body)
-							resp.Body.Close()
-							var tokenResp map[string]interface{}
-							json.Unmarshal(body, &tokenResp)
-							if token, ok := tokenResp["access_token"].(string); ok && token != "" {
-								env, _ := mcpMap["env"].(map[string]interface{})
-								if env == nil {
-									env = make(map[string]interface{})
-								}
-								env["PRIVATE_APP_ACCESS_TOKEN"] = token
-								mcpMap["env"] = env
-								mcps[i] = mcpMap
+						if err != nil || resp == nil {
+							break
+						}
+						body, _ := io.ReadAll(resp.Body)
+						resp.Body.Close()
+						var tokenResp map[string]interface{}
+						json.Unmarshal(body, &tokenResp)
+						env, _ := mcpMap["env"].(map[string]interface{})
+						if env == nil {
+							env = make(map[string]interface{})
+						}
+						injected := false
+						for respField, envVar := range tc.envMap {
+							if val, ok := tokenResp[respField].(string); ok && val != "" {
+								env[envVar] = val
+								injected = true
 							}
 						}
+						if injected {
+							mcpMap["env"] = env
+							mcps[i] = mcpMap
+						}
+						break
 					}
 				}
 			}

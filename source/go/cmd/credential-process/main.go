@@ -1676,13 +1676,27 @@ func syncManagedConfig(profile string) {
 	}
 
 	// Also sync other config fields (but preserve inferenceCredentialHelper which is local-path specific)
-	for _, key := range []string{"isDesktopExtensionEnabled", "isDesktopExtensionDirectoryEnabled", "isLocalDevMcpEnabled", "isClaudeCodeForDesktopEnabled", "inferenceProvider", "inferenceBedrockRegion", "inferenceBedrockProfile", "inferenceCredentialHelper", "inferenceCredentialHelperTtlSec", "inferenceModels"} {
+	for _, key := range []string{"isDesktopExtensionEnabled", "isDesktopExtensionDirectoryEnabled", "isLocalDevMcpEnabled", "isClaudeCodeForDesktopEnabled", "inferenceProvider", "inferenceBedrockRegion", "inferenceBedrockProfile", "inferenceCredentialHelper", "inferenceCredentialHelperTtlSec", "inferenceModels", "otlpEndpoint", "otlpProtocol", "coworkEgressAllowedHosts"} {
 		if v, ok := remoteConfig[key]; ok {
 			localConfig[key] = v
 		}
 	}
 
 	// Write updated managed_config.json
+	// Inject per-user otlpHeaders for Cowork telemetry attribution
+	otelFiles, _ := filepath.Glob(filepath.Join(home, ".claude-code-session", "*-otel-headers.raw"))
+	for _, of := range otelFiles {
+		if data, err := os.ReadFile(of); err == nil {
+			var otelHeaders map[string]interface{}
+			if json.Unmarshal(data, &otelHeaders) == nil {
+				if email, ok := otelHeaders["x-user-email"].(string); ok && email != "" {
+					localConfig["otlpHeaders"] = fmt.Sprintf("x-user-email=%s", email)
+					break
+				}
+			}
+		}
+	}
+
 	newData, err := json.MarshalIndent(localConfig, "", "  ")
 	if err != nil {
 		return

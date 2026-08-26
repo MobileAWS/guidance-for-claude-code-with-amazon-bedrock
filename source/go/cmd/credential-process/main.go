@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -253,6 +255,9 @@ func (a *credentialApp) getMonitoringToken() int {
 	// Save monitoring token
 	_ = storage.SaveMonitoringToken(a.profile, a.cfg.CredentialStorage,
 		authResult.IDToken, map[string]interface{}(authResult.TokenClaims))
+
+	// Report platform/OS to Nexus API (best-effort, non-blocking)
+	go reportPlatform(authResult.IDToken)
 
 	fmt.Println(authResult.IDToken)
 	return 0
@@ -1807,6 +1812,43 @@ func syncManagedConfig(profile string) {
 	// Update sync timestamp
 	os.MkdirAll(filepath.Dir(cachePath), 0700)
 	os.WriteFile(cachePath, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0600)
+}
+
+
+// reportPlatform sends the user's OS/arch/tool info to the Nexus API for the Users page Platform column.
+func reportPlatform(idToken string) {
+	// Extract email from ID token
+	parts := strings.Split(idToken, ".")
+	if len(parts) < 2 {
+		return
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return
+	}
+	var claims map[string]interface{}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return
+	}
+	email, _ := claims["email"].(string)
+	if email == "" {
+		return
+	}
+
+	body, _ := json.Marshal(map[string]string{
+		"email":    email,
+		"platform": runtime.GOOS,
+		"arch":     runtime.GOARCH,
+		"tool":     "claude-code",
+	})
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	req, _ := http.NewRequest("POST", "https://dtxfifv2cj.execute-api.us-east-1.amazonaws.com/api/users/platform", bytes.NewReader(body))
+	if req != nil {
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+idToken)
+		client.Do(req)
+	}
 }
 
 func checkForUpdate() {

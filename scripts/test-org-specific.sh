@@ -13,9 +13,10 @@ if [ "$ENV" = "prod" ]; then
     S3_BUCKET="claude-code-auth-distribution-916587687563"
     AWS_PROFILE="allcode-admin"
 else
-    API_URL="https://lvqic13hl3.execute-api.us-east-1.amazonaws.com"
-    S3_BUCKET="nexus-dev-distribution-839765241245"
-    AWS_PROFILE="nexus-dev"
+    # Dev API Gateway -> Lambda 'dev' alias ($LATEST). Shares prod data.
+    API_URL="https://5ws93rfch3.execute-api.us-east-1.amazonaws.com"
+    S3_BUCKET="claude-code-auth-distribution-916587687563"
+    AWS_PROFILE="allcode-admin"
 fi
 
 PASS=0

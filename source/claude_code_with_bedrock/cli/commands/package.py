@@ -937,6 +937,11 @@ else
     UNINSTALL_SCOPE_FLAG="--prod"
 fi
 
+# $HOME-relative form of the install dir (e.g. "$HOME/claude-code-with-bedrock-dev").
+# Used when substituting settings.json placeholders so the recorded paths match the
+# directory the binaries are actually copied into.
+INSTALL_DIR_HOME_REL="$HOME/$(basename "$INSTALL_DIR")"
+
 # ---------------------------------------------------------------------------
 # Idempotent pre-install cleanup.
 # If a previous Nexus install is detected (either scoped install dir exists, OR a
@@ -1025,8 +1030,9 @@ if [ -d "claude-settings" ]; then
 
         if [ "$SKIP_SETTINGS" != "true" ]; then
             # Replace placeholders and write settings
-            sed -e "s|__OTEL_HELPER_PATH__|$INSTALL_DIR/otel-helper|g" \
-                -e "s|__CREDENTIAL_PROCESS_PATH__|$INSTALL_DIR/credential-process|g" \
+            # Replace placeholders and write settings
+            sed -e "s|__OTEL_HELPER_PATH__|$INSTALL_DIR_HOME_REL/otel-helper|g" \
+                -e "s|__CREDENTIAL_PROCESS_PATH__|$INSTALL_DIR_HOME_REL/credential-process|g" \
                 "claude-settings/settings.json" > ~/.claude/settings.json
 
             # Verify placeholders were replaced

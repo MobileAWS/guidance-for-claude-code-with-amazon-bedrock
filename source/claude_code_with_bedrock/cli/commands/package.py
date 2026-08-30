@@ -275,6 +275,7 @@ class PackageCommand(Command):
         # Create installer
         console.print("[cyan]Creating installer script...[/cyan]")
         self._create_installer(output_dir, profile, built_executables, built_otel_helpers)
+        self._create_uninstaller(output_dir, profile, built_executables)
 
         # Copy shell wrapper for OTEL helper (Layer 2 caching - the shell wrapper
         # warms the per-profile cache before the Go otel-helper binary runs)
@@ -313,6 +314,7 @@ class PackageCommand(Command):
 
         console.print("  • config.json - Configuration")
         console.print("  • install.sh - Installation script for macOS/Linux")
+        console.print("  • uninstall.sh - Uninstaller for macOS/Linux")
         # Check if Windows installer exists (created when Windows binaries are present)
         if (output_dir / "install.bat").exists():
             console.print("  • install.bat - Installation script for Windows")
@@ -557,6 +559,7 @@ class PackageCommand(Command):
         # Regenerate installer scripts
         console.print("[cyan]Generating installer scripts...[/cyan]")
         self._create_installer(output_dir, profile, built_executables, built_otel_helpers)
+        self._create_uninstaller(output_dir, profile, built_executables)
 
         # Regenerate documentation
         console.print("[cyan]Generating documentation...[/cyan]")
@@ -572,6 +575,7 @@ class PackageCommand(Command):
         console.print("\nRegenerated files:")
         console.print("  • config.json")
         console.print("  • install.sh")
+        console.print("  • uninstall.sh")
         if (output_dir / "install.bat").exists():
             console.print("  • install.bat")
             console.print("  • ccwb-install.ps1")
@@ -1193,6 +1197,44 @@ if [[ -z "$REPLY" ]] || [[ $REPLY =~ ^[Yy]$ ]]; then
     echo "Starting Claude Code..."
     exec claude
 fi
+
+# -----------------------------------------------------------------------
+# Optional: Codex configuration
+# If the installer bundle contains a codex-config.json file (written by the
+# package builder when the organisation has Codex enabled), configure
+# ~/.codex/config.toml and update shell RC files with the Bedrock bearer
+# token.  When the file is absent the block is silently skipped.
+# -----------------------------------------------------------------------
+if [ -f "codex-config.json" ]; then
+    CODEX_API_KEY=$($PYTHON -c "
+import json
+print(json.load(open('codex-config.json')).get('codex_api_key', ''))
+" 2>/dev/null || echo "")
+    CODEX_MODEL_PROVIDER=$($PYTHON -c "
+import json
+print(json.load(open('codex-config.json')).get('model_provider', 'amazon-bedrock'))
+" 2>/dev/null || echo "amazon-bedrock")
+
+    if [ -n "$CODEX_API_KEY" ]; then
+        mkdir -p ~/.codex
+        cat > ~/.codex/config.toml << CODEX_TOML
+model_provider = "amazon-bedrock"
+bedrock_api_key = "$CODEX_API_KEY"
+CODEX_TOML
+
+        # Append the bearer-token export to both common RC files so it is
+        # available regardless of which shell the user runs.
+        for RC_FILE in ~/.zshrc ~/.bashrc; do
+            if [ -f "$RC_FILE" ] || [[ "$RC_FILE" == ~/.zshrc && "$OSTYPE" == "darwin"* ]]; then
+                # Remove any pre-existing line to avoid duplicates on re-runs.
+                grep -v 'AWS_BEARER_TOKEN_BEDROCK' "$RC_FILE" > /tmp/_rc_tmp 2>/dev/null && mv /tmp/_rc_tmp "$RC_FILE" || true
+                echo "export AWS_BEARER_TOKEN_BEDROCK=$CODEX_API_KEY" >> "$RC_FILE"
+            fi
+        done
+
+        echo "✓ Codex configuration installed"
+    fi
+fi
 """
 
         installer_path = output_dir / "install.sh"
@@ -1248,6 +1290,482 @@ fi
             self._create_windows_installer(output_dir, profile)
 
         return installer_path
+
+    def _create_uninstaller(self, output_dir: Path, profile, built_executables) -> Path:
+        """Create uninstall.sh — a self-contained bash + python3 script that fully removes a Nexus install.
+
+        Follows the same pattern as _create_installer: build an inline f-string,
+        write it to output_dir / 'uninstall.sh' (utf-8, LF newlines) and chmod 0o755.
+
+        The generated script has no external dependencies beyond bash and python3,
+        is safe by default (prints an inventory and prompts before removing),
+        idempotent, and runs as the user (only using sudo for root-owned
+        /usr/local/share/allcode-nexus* directories).
+        """
+        uninstaller_content = f"""#!/bin/bash
+# Claude Code / Nexus Uninstaller
+# Organization: {profile.provider_domain}
+# Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+#
+# Fully removes a Nexus install. Safe by default: prints an inventory of what
+# will be removed and prompts before acting. Runs as the current user; only
+# uses sudo for root-owned /usr/local/share/allcode-nexus* directories.
+
+set -u
+
+# ---------------------------------------------------------------------------
+# Flags
+# ---------------------------------------------------------------------------
+ASSUME_YES=false
+PURGE=false
+KEEP_TOKENS=false
+SCOPE="both"   # both | dev | prod
+
+usage() {{
+    cat <<'USAGE'
+Usage: uninstall.sh [options]
+
+Options:
+  -y, --yes        Do not prompt; remove everything in scope.
+  --purge          Also remove the Claude Code CLI global npm package
+                   (@anthropic-ai/claude-code) and local Google credential
+                   files (~/.config/google-drive-mcp/ and
+                   ~/.gdrive-server-credentials.json).
+  --keep-tokens    Do NOT touch integration credential files. By default the
+                   local Google file-bridge is removed, but server-side Nexus
+                   tokens are NEVER touched regardless of this flag.
+  --dev            Only remove the dev install.
+  --prod           Only remove the prod install.
+  -h, --help       Show this help and exit.
+USAGE
+}}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -y|--yes) ASSUME_YES=true ;;
+        --purge) PURGE=true ;;
+        --keep-tokens) KEEP_TOKENS=true ;;
+        --dev) SCOPE="dev" ;;
+        --prod) SCOPE="prod" ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "Unknown option: $1" >&2; usage; exit 2 ;;
+    esac
+    shift
+done
+
+# ---------------------------------------------------------------------------
+# Resolve the target user's HOME. On macOS, when run via sudo/root we derive
+# the console user (matching the postinstall pattern). Never hardcode a path.
+# ---------------------------------------------------------------------------
+TARGET_USER="${{USER:-$(id -un)}}"
+if [ "$(uname)" = "Darwin" ]; then
+    CONSOLE_USER="$(stat -f%Su /dev/console 2>/dev/null || true)"
+    if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ]; then
+        TARGET_USER="$CONSOLE_USER"
+    fi
+    USER_HOME="$(dscl . -read /Users/"$TARGET_USER" NFSHomeDirectory 2>/dev/null | awk '{{print $2}}')"
+    if [ -z "$USER_HOME" ]; then
+        USER_HOME="/Users/$TARGET_USER"
+    fi
+else
+    if [ "$(id -u)" = "0" ] && [ -n "${{SUDO_USER:-}}" ]; then
+        TARGET_USER="$SUDO_USER"
+        USER_HOME="$(eval echo ~"$SUDO_USER")"
+    else
+        USER_HOME="${{HOME:-$(eval echo ~"$TARGET_USER")}}"
+    fi
+fi
+
+# Find a python3 interpreter (required for robust config editing).
+PY=""
+if command -v python3 >/dev/null 2>&1; then
+    PY="python3"
+elif command -v python >/dev/null 2>&1; then
+    PY="python"
+fi
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+PROD_DIR="$USER_HOME/claude-code-with-bedrock"
+DEV_DIR="$USER_HOME/claude-code-with-bedrock-dev"
+SHARE_PROD="/usr/local/share/allcode-nexus"
+SHARE_DEV="/usr/local/share/allcode-nexus-dev"
+
+REMOVED=()
+SKIPPED=()
+
+mark_removed() {{ REMOVED+=("$1"); }}
+mark_skipped() {{ SKIPPED+=("$1"); }}
+
+want_dev() {{ [ "$SCOPE" = "both" ] || [ "$SCOPE" = "dev" ]; }}
+want_prod() {{ [ "$SCOPE" = "both" ] || [ "$SCOPE" = "prod" ]; }}
+
+# ---------------------------------------------------------------------------
+# STEP 1: Detect installs and build an inventory.
+# ---------------------------------------------------------------------------
+INVENTORY=()
+FOUND_ANY=false
+
+if want_prod && [ -d "$PROD_DIR" ]; then INVENTORY+=("install dir: $PROD_DIR"); FOUND_ANY=true; fi
+if want_dev  && [ -d "$DEV_DIR" ];  then INVENTORY+=("install dir: $DEV_DIR");  FOUND_ANY=true; fi
+if want_prod && [ -d "$SHARE_PROD" ]; then INVENTORY+=("shared dir: $SHARE_PROD (may need sudo)"); FOUND_ANY=true; fi
+if want_dev  && [ -d "$SHARE_DEV" ];  then INVENTORY+=("shared dir: $SHARE_DEV (may need sudo)");  FOUND_ANY=true; fi
+
+[ -f "$USER_HOME/.aws/config" ] && {{ INVENTORY+=("AWS config: Nexus profile block(s) in ~/.aws/config"); FOUND_ANY=true; }}
+[ -f "$USER_HOME/.zshrc" ] && grep -q '# AllCode Nexus DEV install' "$USER_HOME/.zshrc" 2>/dev/null && {{ INVENTORY+=("shell: NEXUS_ENV line in ~/.zshrc"); FOUND_ANY=true; }}
+[ -f "$USER_HOME/.bashrc" ] && grep -q '# AllCode Nexus DEV install' "$USER_HOME/.bashrc" 2>/dev/null && {{ INVENTORY+=("shell: NEXUS_ENV line in ~/.bashrc"); FOUND_ANY=true; }}
+[ -f "$USER_HOME/.claude.json" ] && {{ INVENTORY+=("MCP: Nexus-managed servers in ~/.claude.json"); FOUND_ANY=true; }}
+[ -f "$USER_HOME/.claude/settings.json" ] && {{ INVENTORY+=("settings: Nexus env keys in ~/.claude/settings.json"); FOUND_ANY=true; }}
+[ -d "$USER_HOME/.claude-code-session" ] && {{ INVENTORY+=("runtime state: ~/.claude-code-session/"); FOUND_ANY=true; }}
+[ -f "$USER_HOME/Library/Application Support/Claude-3p/managed_config.json" ] && {{ INVENTORY+=("cowork: Claude-3p/managed_config.json"); FOUND_ANY=true; }}
+[ -f "$USER_HOME/Library/Application Support/Claude-3p/claude_desktop_config.json" ] && {{ INVENTORY+=("cowork: Claude-3p/claude_desktop_config.json"); FOUND_ANY=true; }}
+[ -f "$USER_HOME/Library/Application Support/Claude/managed_config.json" ] && {{ INVENTORY+=("cowork: Claude/managed_config.json"); FOUND_ANY=true; }}
+if [ "$PURGE" = true ]; then
+    [ -d "$USER_HOME/.config/google-drive-mcp" ] && {{ INVENTORY+=("purge: ~/.config/google-drive-mcp/"); FOUND_ANY=true; }}
+    [ -f "$USER_HOME/.gdrive-server-credentials.json" ] && {{ INVENTORY+=("purge: ~/.gdrive-server-credentials.json"); FOUND_ANY=true; }}
+    command -v npm >/dev/null 2>&1 && npm ls -g @anthropic-ai/claude-code >/dev/null 2>&1 && {{ INVENTORY+=("purge: npm global @anthropic-ai/claude-code"); FOUND_ANY=true; }}
+fi
+[ -d "$USER_HOME/.codex" ] && grep -rqs 'allcode-nexus\\|NEXUS_ENV\\|nexus-factory' "$USER_HOME/.codex" 2>/dev/null && {{ INVENTORY+=("codex: ~/.codex/ (Nexus-created)"); FOUND_ANY=true; }}
+ls /tmp/nexus-* >/dev/null 2>&1 && {{ INVENTORY+=("temp: /tmp/nexus-*"); FOUND_ANY=true; }}
+
+echo "======================================"
+echo "Claude Code / Nexus Uninstaller"
+echo "======================================"
+echo "Target user : $TARGET_USER"
+echo "Home        : $USER_HOME"
+echo "Scope       : $SCOPE"
+echo "Purge       : $PURGE   Keep tokens: $KEEP_TOKENS"
+echo
+
+if [ "$FOUND_ANY" != true ]; then
+    echo "Nothing to remove — no Nexus install detected."
+    exit 0
+fi
+
+echo "The following will be removed:"
+for item in "${{INVENTORY[@]}}"; do
+    echo "  - $item"
+done
+echo
+
+if [ "$ASSUME_YES" != true ]; then
+    printf "Proceed with uninstall? (y/N) "
+    read -r REPLY
+    case "$REPLY" in
+        y|Y|yes|YES) ;;
+        *) echo "Aborted."; exit 0 ;;
+    esac
+fi
+
+echo
+
+# ---------------------------------------------------------------------------
+# STEP 2: Remove install dirs per scope.
+# ---------------------------------------------------------------------------
+if want_prod && [ -d "$PROD_DIR" ]; then rm -rf "$PROD_DIR" && mark_removed "$PROD_DIR"; fi
+if want_dev  && [ -d "$DEV_DIR" ];  then rm -rf "$DEV_DIR"  && mark_removed "$DEV_DIR"; fi
+
+# Shared dirs: only sudo if they exist and are root-owned.
+remove_shared() {{
+    local d="$1"
+    [ -d "$d" ] || return 0
+    local owner
+    owner="$(stat -f%Su "$d" 2>/dev/null || stat -c%U "$d" 2>/dev/null || echo "")"
+    if [ "$owner" = "root" ]; then
+        if command -v sudo >/dev/null 2>&1; then
+            echo "  (sudo required to remove root-owned $d)"
+            sudo rm -rf "$d" && mark_removed "$d (sudo)"
+        else
+            mark_skipped "$d (root-owned, sudo unavailable)"
+        fi
+    else
+        rm -rf "$d" && mark_removed "$d"
+    fi
+}}
+if want_prod; then remove_shared "$SHARE_PROD"; fi
+if want_dev;  then remove_shared "$SHARE_DEV"; fi
+
+# ---------------------------------------------------------------------------
+# STEP 3: Clean ~/.aws/config — remove only [profile <name>] blocks whose
+# credential_process points at a Nexus credential-process binary.
+# ---------------------------------------------------------------------------
+AWS_CONFIG="$USER_HOME/.aws/config"
+if [ -n "$PY" ] && [ -f "$AWS_CONFIG" ]; then
+    "$PY" - "$AWS_CONFIG" <<'PYAWS'
+import re, sys
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as f:
+    lines = f.readlines()
+
+# Split into blocks headed by a [section] line, keeping any preamble.
+sections = []
+current = {{"header": None, "lines": []}}
+header_re = re.compile(r"^\\s*\\[")
+for line in lines:
+    if header_re.match(line):
+        sections.append(current)
+        current = {{"header": line, "lines": [line]}}
+    else:
+        current["lines"].append(line)
+sections.append(current)
+
+def is_nexus_profile(sec):
+    if not sec["header"]:
+        return False
+    if not re.match(r"^\\s*\\[profile\\s+", sec["header"]):
+        return False
+    for l in sec["lines"]:
+        m = re.match(r"^\\s*credential_process\\s*=\\s*(.+)$", l)
+        if m and "credential-process" in m.group(1):
+            return True
+    return False
+
+out = []
+removed = 0
+for sec in sections:
+    if is_nexus_profile(sec):
+        removed += 1
+        continue
+    out.append("".join(sec["lines"]))
+
+if removed:
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("".join(out))
+    print("  cleaned %d Nexus profile block(s) from ~/.aws/config" % removed)
+    sys.exit(10)
+else:
+    sys.exit(0)
+PYAWS
+    rc=$?
+    if [ "$rc" = "10" ]; then mark_removed "~/.aws/config Nexus profile block(s)"; fi
+fi
+
+# ---------------------------------------------------------------------------
+# STEP 4: Clean shell profiles — remove ONLY the line ending with the marker
+# comment '# AllCode Nexus DEV install'. Leave PATH lines alone.
+# ---------------------------------------------------------------------------
+clean_shell_profile() {{
+    local rc_file="$1"
+    [ -f "$rc_file" ] || return 0
+    if grep -q '# AllCode Nexus DEV install' "$rc_file" 2>/dev/null; then
+        # Remove only lines that END with the marker comment.
+        grep -v '# AllCode Nexus DEV install[[:space:]]*$' "$rc_file" > "$rc_file.nexus_tmp" && mv "$rc_file.nexus_tmp" "$rc_file"
+        mark_removed "NEXUS_ENV line in $rc_file"
+    fi
+}}
+clean_shell_profile "$USER_HOME/.zshrc"
+clean_shell_profile "$USER_HOME/.bashrc"
+
+# ---------------------------------------------------------------------------
+# STEP 5: Remove Nexus-managed MCP servers from ~/.claude.json and
+# ~/.claude/settings.json using the managed-key list.
+# ---------------------------------------------------------------------------
+if [ -n "$PY" ]; then
+    "$PY" - "$USER_HOME" <<'PYMCP'
+import json, os, sys
+home = sys.argv[1]
+state = os.path.join(home, ".claude-code-session", "nexus-managed-mcps.json")
+managed = None
+if os.path.isfile(state):
+    try:
+        with open(state, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            managed = data.get("managed") or data.get("keys") or list(data.keys())
+        elif isinstance(data, list):
+            managed = data
+    except Exception:
+        managed = None
+if not managed:
+    managed = [
+        "github", "slack", "hubspot", "activecampaign", "zapier",
+        "nexus-factory", "web-search", "partner-central", "atlassian",
+        "jira", "google-drive", "google-docs", "google-slides",
+        "google-workspace", "google-docs-&-slides",
+    ]
+managed = set(managed)
+
+def prune(path):
+    if not os.path.isfile(path):
+        return 0
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception:
+        return 0
+    servers = cfg.get("mcpServers")
+    if not isinstance(servers, dict):
+        return 0
+    removed = 0
+    for key in list(servers.keys()):
+        if key in managed:
+            del servers[key]
+            removed += 1
+    if removed:
+        if not servers:
+            cfg.pop("mcpServers", None)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+    return removed
+
+total = 0
+total += prune(os.path.join(home, ".claude.json"))
+total += prune(os.path.join(home, ".claude", "settings.json"))
+if total:
+    print("  removed %d Nexus-managed MCP server(s)" % total)
+    sys.exit(10)
+sys.exit(0)
+PYMCP
+    [ "$?" = "10" ] && mark_removed "Nexus-managed MCP servers"
+fi
+
+# ---------------------------------------------------------------------------
+# STEP 6: Clean Nexus env-block keys from ~/.claude/settings.json.
+# ---------------------------------------------------------------------------
+if [ -n "$PY" ] && [ -f "$USER_HOME/.claude/settings.json" ]; then
+    "$PY" - "$USER_HOME/.claude/settings.json" <<'PYENV'
+import json, sys
+path = sys.argv[1]
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+except Exception:
+    sys.exit(0)
+
+fixed_keys = {{
+    "AWS_PROFILE", "AWS_REGION", "CLAUDE_CODE_USE_BEDROCK", "ANTHROPIC_MODEL",
+    "ANTHROPIC_CUSTOM_HEADERS", "CLAUDE_CODE_ENABLE_TELEMETRY", "NEXUS_ENV",
+}}
+
+changed = False
+env = cfg.get("env")
+if isinstance(env, dict):
+    for k in list(env.keys()):
+        if k in fixed_keys or k.startswith("OTEL_"):
+            del env[k]
+            changed = True
+    if not env:
+        cfg.pop("env", None)
+        changed = True
+
+if "otelHeadersHelper" in cfg:
+    cfg.pop("otelHeadersHelper", None)
+    changed = True
+
+if changed:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+    print("  cleaned Nexus env keys from ~/.claude/settings.json")
+    sys.exit(10)
+sys.exit(0)
+PYENV
+    [ "$?" = "10" ] && mark_removed "Nexus env keys in ~/.claude/settings.json"
+fi
+
+# ---------------------------------------------------------------------------
+# STEP 7: Remove Cowork config files (do NOT delete the whole Claude-3p dir).
+# ---------------------------------------------------------------------------
+for cw in \\
+    "$USER_HOME/Library/Application Support/Claude-3p/managed_config.json" \\
+    "$USER_HOME/Library/Application Support/Claude-3p/claude_desktop_config.json" \\
+    "$USER_HOME/Library/Application Support/Claude/managed_config.json"; do
+    if [ -f "$cw" ]; then rm -f "$cw" && mark_removed "$cw"; fi
+done
+
+# ---------------------------------------------------------------------------
+# STEP 8: Remove runtime state.
+# ---------------------------------------------------------------------------
+if [ -d "$USER_HOME/.claude-code-session" ]; then
+    rm -rf "$USER_HOME/.claude-code-session" && mark_removed "~/.claude-code-session/"
+fi
+
+# ---------------------------------------------------------------------------
+# STEP 9: Google file-bridge (only with --purge; never server-side tokens).
+# ---------------------------------------------------------------------------
+if [ "$PURGE" = true ] && [ "$KEEP_TOKENS" != true ]; then
+    if [ -d "$USER_HOME/.config/google-drive-mcp" ]; then
+        rm -rf "$USER_HOME/.config/google-drive-mcp" && mark_removed "~/.config/google-drive-mcp/"
+    fi
+    if [ -f "$USER_HOME/.gdrive-server-credentials.json" ]; then
+        rm -f "$USER_HOME/.gdrive-server-credentials.json" && mark_removed "~/.gdrive-server-credentials.json"
+    fi
+elif [ "$PURGE" != true ] && [ "$KEEP_TOKENS" != true ]; then
+    # Default (no --purge, no --keep-tokens): remove local Google file-bridge only.
+    if [ -f "$USER_HOME/.gdrive-server-credentials.json" ]; then
+        rm -f "$USER_HOME/.gdrive-server-credentials.json" && mark_removed "~/.gdrive-server-credentials.json (local file-bridge)"
+    fi
+fi
+
+# --purge also removes the Claude Code CLI global npm package.
+if [ "$PURGE" = true ]; then
+    if command -v npm >/dev/null 2>&1 && npm ls -g @anthropic-ai/claude-code >/dev/null 2>&1; then
+        npm uninstall -g @anthropic-ai/claude-code >/dev/null 2>&1 && mark_removed "npm global @anthropic-ai/claude-code"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# STEP 10: Codex — remove only if Nexus-created.
+# ---------------------------------------------------------------------------
+if [ -d "$USER_HOME/.codex" ]; then
+    if grep -rqs 'allcode-nexus\\|NEXUS_ENV\\|nexus-factory' "$USER_HOME/.codex" 2>/dev/null; then
+        rm -rf "$USER_HOME/.codex" && mark_removed "~/.codex/ (Nexus-created)"
+    else
+        mark_skipped "~/.codex/ (not Nexus-created, left intact)"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# STEP 11: Managed Preferences plist (best-effort, needs sudo, non-fatal).
+# ---------------------------------------------------------------------------
+PLIST="/Library/Managed Preferences/$TARGET_USER/com.anthropic.claudefordesktop.plist"
+if [ -f "$PLIST" ]; then
+    if defaults read "$PLIST" 2>/dev/null | grep -qs 'allcode-nexus\\|NEXUS_ENV\\|nexus'; then
+        if command -v sudo >/dev/null 2>&1; then
+            sudo rm -f "$PLIST" 2>/dev/null && mark_removed "$PLIST (Nexus, sudo)" || mark_skipped "$PLIST (could not remove)"
+        else
+            mark_skipped "$PLIST (sudo unavailable)"
+        fi
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# STEP 12: Temp files.
+# ---------------------------------------------------------------------------
+if ls /tmp/nexus-* >/dev/null 2>&1; then
+    rm -f /tmp/nexus-* 2>/dev/null && mark_removed "/tmp/nexus-*"
+fi
+
+# ---------------------------------------------------------------------------
+# STEP 13: Summary.
+# ---------------------------------------------------------------------------
+echo
+echo "======================================"
+echo "Uninstall summary"
+echo "======================================"
+if [ "${{#REMOVED[@]}}" -eq 0 ]; then
+    echo "  – nothing was removed"
+else
+    for item in "${{REMOVED[@]}}"; do
+        echo "  ✓ removed: $item"
+    done
+fi
+if [ "${{#SKIPPED[@]}}" -gt 0 ]; then
+    for item in "${{SKIPPED[@]}}"; do
+        echo "  – skipped: $item"
+    done
+fi
+echo
+echo "Done. Please restart Claude Code / Cowork for changes to take effect."
+exit 0
+"""
+
+        uninstaller_path = output_dir / "uninstall.sh"
+        with open(uninstaller_path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(uninstaller_content)
+        uninstaller_path.chmod(0o755)
+
+        return uninstaller_path
 
     def _create_windows_installer(self, output_dir: Path, profile) -> Path:
         """Create Windows batch installer script."""
@@ -1393,6 +1911,19 @@ for /f %%p in ('powershell -NoProfile -Command "(Get-Content config.json | Conve
 echo.
 echo Note: Authentication will automatically open your browser when needed.
 echo.
+
+REM -----------------------------------------------------------------------
+REM Optional: Codex configuration
+REM If the installer bundle contains a codex-config.json file (written by
+REM the package builder when the organisation has Codex enabled), configure
+REM %%USERPROFILE%%\.codex\config.toml and persist the Bedrock bearer token
+REM as a permanent user environment variable.  When the file is absent the
+REM block is silently skipped.
+REM -----------------------------------------------------------------------
+if exist "codex-config.json" (
+    powershell -NoProfile -Command "$ErrorActionPreference = 'Stop'; $cfg = Get-Content 'codex-config.json' | ConvertFrom-Json; $apiKey = $cfg.codex_api_key; $provider = if ($cfg.model_provider) {{ $cfg.model_provider }} else {{ 'amazon-bedrock' }}; if ($apiKey) {{ $codexDir = Join-Path $env:USERPROFILE '.codex'; if (-not (Test-Path $codexDir)) {{ New-Item -ItemType Directory -Path $codexDir | Out-Null }}; $toml = \"model_provider = `\"amazon-bedrock`\"`r`nbedrock_api_key = `\"$apiKey`\"\"; Set-Content -Path (Join-Path $codexDir 'config.toml') -Value $toml -Encoding UTF8; [System.Environment]::SetEnvironmentVariable('AWS_BEARER_TOKEN_BEDROCK', $apiKey, 'User'); Write-Host '✓ Codex configuration installed' }}"
+)
+
 pause
 """
 

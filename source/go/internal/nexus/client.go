@@ -132,13 +132,17 @@ func DeviceFlow(baseURL string, openBrowser func(string) error, logf func(string
 // ReportPlatform sends a best-effort platform report to the Nexus hub
 // (POST /api/users/platform). It is non-blocking by contract: callers ignore the
 // error. A short timeout keeps it off the credential-issuance hot path.
-func ReportPlatform(baseURL, email, idToken string) error {
+func ReportPlatform(baseURL, email, idToken, tool string) error {
 	base := ResolveBase(baseURL)
 	client := &http.Client{Timeout: 5 * time.Second}
+	if tool == "" {
+		tool = "claude-code"
+	}
 	body, _ := json.Marshal(map[string]string{
 		"email":    email,
 		"platform": runtime.GOOS,
 		"arch":     runtime.GOARCH,
+		"tool":     tool,
 	})
 	return postJSON(client, base+"/api/users/platform", idToken, body, nil)
 }

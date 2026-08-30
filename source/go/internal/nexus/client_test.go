@@ -122,7 +122,7 @@ func TestReportPlatform(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if err := ReportPlatform(srv.URL, "user@example.com", "TOK123"); err != nil {
+	if err := ReportPlatform(srv.URL, "user@example.com", "TOK123", "claude-code"); err != nil {
 		t.Fatalf("ReportPlatform error: %v", err)
 	}
 	if gotAuth != "Bearer TOK123" {

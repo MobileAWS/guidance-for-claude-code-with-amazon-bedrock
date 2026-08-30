@@ -87,5 +87,17 @@ FEEDBACK.md
 .claudeignore
 .mcp.json
 claude.json
-nexus-ui/
+nexus-ui/node_modules/
+nexus-ui/dist/
+nexus-ui/.vite/
 nexus-build-session.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Compiled binaries
+source/go/credential-process
+*.exe
+

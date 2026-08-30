@@ -1,13 +1,19 @@
 package main
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
+	"os/user"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -22,6 +28,8 @@ import (
 	"ccwb-go/internal/quota"
 	"ccwb-go/internal/storage"
 	"ccwb-go/internal/version"
+
+	_ "ccwb-go/internal/browser" // available for future integration flows
 )
 
 var debug bool
@@ -183,7 +191,8 @@ func (a *credentialApp) getCachedCredentials() *federation.AWSCredentials {
 	if a.cfg.CredentialStorage == "keyring" {
 		creds, err = storage.ReadFromKeyring(a.profile)
 	} else {
-		creds, err = storage.ReadFromCredentialsFile(a.profile)
+		// Read from session cache (not ~/.aws/credentials)
+		creds, err = storage.ReadFromSessionCache(a.profile)
 	}
 	if err != nil || creds == nil || storage.IsExpiredDummy(creds) {
 		return nil
@@ -200,19 +209,21 @@ func (a *credentialApp) saveCredentials(creds *federation.AWSCredentials) error 
 	if a.cfg.CredentialStorage == "keyring" {
 		return storage.SaveToKeyring(creds, a.profile)
 	}
-	return storage.SaveToCredentialsFile(creds, a.profile)
+	// Save to session cache (NOT ~/.aws/credentials) so the AWS SDK
+	// always calls credential_process and we can handle refresh silently.
+	return storage.SaveToSessionCache(creds, a.profile)
 }
 
 func (a *credentialApp) clearCache() {
 	if a.cfg.CredentialStorage == "keyring" {
 		_ = storage.ClearKeyring(a.profile)
 	}
-	// Also clear session file
+	// Clear session cache
 	expired := &federation.AWSCredentials{
 		Version: 1, AccessKeyID: "EXPIRED", SecretAccessKey: "EXPIRED",
 		SessionToken: "EXPIRED", Expiration: "2000-01-01T00:00:00Z",
 	}
-	_ = storage.SaveToCredentialsFile(expired, a.profile)
+	_ = storage.SaveToSessionCache(expired, a.profile)
 	// Clear refresh token
 	storage.ClearRefreshToken(a.profile)
 	fmt.Fprintf(os.Stderr, "Cleared cached credentials for profile '%s'\n", a.profile)
@@ -244,6 +255,9 @@ func (a *credentialApp) getMonitoringToken() int {
 	// Save monitoring token
 	_ = storage.SaveMonitoringToken(a.profile, a.cfg.CredentialStorage,
 		authResult.IDToken, map[string]interface{}(authResult.TokenClaims))
+
+	// Report platform/OS to Nexus API (best-effort, non-blocking)
+	go reportPlatform(authResult.IDToken)
 
 	fmt.Println(authResult.IDToken)
 	return 0
@@ -372,8 +386,26 @@ func (a *credentialApp) run() int {
 		saveActiveOrg(a.profile, a.orgFlag)
 	}
 
+	// Check for self-update (background, non-blocking)
+	go checkForUpdate()
+
 	// Sync MCP servers from Nexus (quick, with timeout)
-	syncMcpServers()
+	syncMcpServers(a.profile)
+
+	// Inject per-user integration tokens (HubSpot OAuth, etc.)
+	syncIntegrationTokens(a.profile)
+
+	// Sync Codex config from Nexus (quick, best-effort)
+	syncCodexConfig(a.profile)
+
+	// Sync Skills from Nexus (quick, with timeout)
+	syncSkills()
+
+	// Sync managed config for Claude Desktop (quick, with timeout)
+	syncManagedConfig(a.profile)
+
+	// Clear AWS CLI cache if our credentials are expired (prevents stale credential loops)
+	clearAwsCliCacheIfExpired(a.profile)
 
 	// Check cache first
 	if cached := a.getCachedCredentials(); cached != nil {
@@ -381,7 +413,7 @@ func (a *credentialApp) run() int {
 		if a.shouldRecheckQuota() {
 			a.performQuotaRecheck()
 		}
-		outputJSON(cached)
+		outputJSON(chainAssumeRole(cached, a.cfg))
 		return 0
 	}
 
@@ -396,7 +428,7 @@ func (a *credentialApp) run() int {
 		debugPrint("Another authentication is in progress, waiting...")
 		if portlock.WaitForRelease(a.redirectPort, 60*time.Second) {
 			if cached := a.getCachedCredentials(); cached != nil {
-				outputJSON(cached)
+				outputJSON(chainAssumeRole(cached, a.cfg))
 				return 0
 			}
 		}
@@ -408,7 +440,7 @@ func (a *credentialApp) run() int {
 
 	// Check cache again (race condition guard)
 	if cached := a.getCachedCredentials(); cached != nil {
-		outputJSON(cached)
+		outputJSON(chainAssumeRole(cached, a.cfg))
 		return 0
 	}
 
@@ -424,7 +456,7 @@ func (a *credentialApp) run() int {
 				}
 			}
 		}
-		outputJSON(creds)
+		outputJSON(chainAssumeRole(creds, a.cfg))
 		return 0
 	}
 
@@ -442,7 +474,7 @@ func (a *credentialApp) run() int {
 				}
 			}
 		}
-		outputJSON(creds)
+		outputJSON(chainAssumeRole(creds, a.cfg))
 		return 0
 	}
 
@@ -771,6 +803,72 @@ func outputJSON(v interface{}) {
 	fmt.Println(string(data))
 }
 
+// chainAssumeRole takes existing AWS credentials and assumes a cross-account role
+// if bedrock_role_arn is configured. Returns the chained credentials or original.
+func chainAssumeRole(creds *federation.AWSCredentials, cfg *config.ProfileConfig) *federation.AWSCredentials {
+	if cfg == nil || cfg.BedrockRoleArn == "" {
+		return creds
+	}
+
+	// Use the existing creds to assume the cross-account role
+	client := &http.Client{Timeout: 5 * time.Second}
+	// Build STS AssumeRole request using existing credentials
+	stsEndpoint := fmt.Sprintf("https://sts.%s.amazonaws.com/", cfg.AWSRegion)
+	if cfg.AWSRegion == "" {
+		stsEndpoint = "https://sts.us-east-1.amazonaws.com/"
+	}
+
+	params := fmt.Sprintf("Action=AssumeRole&Version=2011-06-15&RoleArn=%s&RoleSessionName=nexus-bedrock&DurationSeconds=3600",
+		cfg.BedrockRoleArn)
+
+	req, err := http.NewRequest("POST", stsEndpoint, strings.NewReader(params))
+	if err != nil {
+		return creds
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	// Sign the request with existing credentials (use AWS SDK-style signing)
+	// For simplicity, use the aws CLI via exec
+	tmpFile := filepath.Join(os.TempDir(), "nexus-chain-assume.json")
+	cmd := exec.Command("aws", "sts", "assume-role",
+		"--role-arn", cfg.BedrockRoleArn,
+		"--role-session-name", "nexus-bedrock",
+		"--region", cfg.AWSRegion,
+		"--output", "json")
+	cmd.Env = append(os.Environ(),
+		"AWS_ACCESS_KEY_ID="+creds.AccessKeyID,
+		"AWS_SECRET_ACCESS_KEY="+creds.SecretAccessKey,
+		"AWS_SESSION_TOKEN="+creds.SessionToken,
+	)
+	output, err := cmd.Output()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "[nexus] chain-assume failed, using direct credentials")
+		return creds
+	}
+	_ = client
+	_ = tmpFile
+
+	var stsResp struct {
+		Credentials struct {
+			AccessKeyId     string `json:"AccessKeyId"`
+			SecretAccessKey string `json:"SecretAccessKey"`
+			SessionToken    string `json:"SessionToken"`
+			Expiration      string `json:"Expiration"`
+		} `json:"Credentials"`
+	}
+	if err := json.Unmarshal(output, &stsResp); err != nil {
+		return creds
+	}
+
+	return &federation.AWSCredentials{
+		Version:         1,
+		AccessKeyID:     stsResp.Credentials.AccessKeyId,
+		SecretAccessKey:  stsResp.Credentials.SecretAccessKey,
+		SessionToken:    stsResp.Credentials.SessionToken,
+		Expiration:      stsResp.Credentials.Expiration,
+	}
+}
+
 func readActiveOrg(profile string) string {
 	home, _ := os.UserHomeDir()
 	data, err := os.ReadFile(filepath.Join(home, ".claude-code-session", profile+"-active-org"))
@@ -787,14 +885,169 @@ func saveActiveOrg(profile, org string) {
 	os.WriteFile(filepath.Join(dir, profile+"-active-org"), []byte(org), 0600)
 }
 
-func syncMcpServers() {
-	// Fetch MCP config from S3 and merge into ~/.claude/settings.json
+// syncCodexConfig fetches the org's Codex configuration from the Nexus API and
+// writes ~/.codex/config.toml when codex_enabled is true. It also ensures the
+// AWS_BEARER_TOKEN_BEDROCK variable is exported from the user's shell profile.
+// The function is non-blocking and best-effort — all errors are silently
+// ignored so that a misconfigured or unreachable API never blocks credential
+// issuance. A 5-minute cache timestamp at ~/.claude-code-session/codex-sync-ts
+// prevents hammering the API on every invocation.
+func syncCodexConfig(profile string) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+
+	// Check if we synced recently (skip if < 5 min ago)
+	cachePath := filepath.Join(home, ".claude-code-session", "codex-sync-ts")
+	if data, err := os.ReadFile(cachePath); err == nil {
+		if ts, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64); err == nil {
+			if time.Now().Unix()-ts < 300 {
+				return // Synced less than 5 min ago
+			}
+		}
+	}
+
+	// Determine the active org for this profile
+	activeOrg := readActiveOrg(profile)
+	if activeOrg == "" {
+		return
+	}
+
+	// Fetch codex config from the Nexus API
+	apiBase := nexusAPIBase()
+	endpoint := apiBase + "/api/orgs/" + activeOrg + "/codex-config"
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(endpoint)
+	if err != nil || resp.StatusCode != 200 {
+		return
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil || len(body) < 2 {
+		return
+	}
+
+	// Parse response
+	var result struct {
+		CodexEnabled bool   `json:"codex_enabled"`
+		CodexAPIKey  string `json:"codex_api_key"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return
+	}
+	if !result.CodexEnabled || result.CodexAPIKey == "" {
+		return
+	}
+
+	// Create ~/.codex/ if it doesn't exist
+	codexDir := filepath.Join(home, ".codex")
+	if err := os.MkdirAll(codexDir, 0700); err != nil {
+		return
+	}
+
+	// Write ~/.codex/config.toml
+	configTOML := fmt.Sprintf(`model_provider = "amazon-bedrock"
+bedrock_api_key = "%s"
+`, result.CodexAPIKey)
+	if err := os.WriteFile(filepath.Join(codexDir, "config.toml"), []byte(configTOML), 0600); err != nil {
+		return
+	}
+
+	// Update the shell profile with AWS_BEARER_TOKEN_BEDROCK
+	shellProfile := resolveShellProfile(home)
+	if shellProfile != "" {
+		updateShellProfileEnv(shellProfile, "AWS_BEARER_TOKEN_BEDROCK", result.CodexAPIKey)
+	}
+
+	// Update sync timestamp
+	os.MkdirAll(filepath.Dir(cachePath), 0700)
+	os.WriteFile(cachePath, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0600)
+}
+
+// nexusAPIBase returns the Nexus hub base URL. It respects the
+// CCWB_NEXUS_API_BASE env-var override used in tests; otherwise falls back to
+// the well-known default from the nexus package.
+func nexusAPIBase() string {
+	if override := strings.TrimRight(strings.TrimSpace(os.Getenv("CCWB_NEXUS_API_BASE")), "/"); override != "" {
+		return override
+	}
+	// Inline the default so this file has no import cycle with internal/nexus.
+	return "https://dtxfifv2cj.execute-api.us-east-1.amazonaws.com"
+}
+
+// resolveShellProfile returns the path of the shell profile file to update.
+// Preference order: ~/.zshrc if it exists, ~/.bashrc if it exists, and on
+// macOS create ~/.zshrc as the platform default when neither is present.
+func resolveShellProfile(home string) string {
+	zshrc := filepath.Join(home, ".zshrc")
+	bashrc := filepath.Join(home, ".bashrc")
+
+	if _, err := os.Stat(zshrc); err == nil {
+		return zshrc
+	}
+	if _, err := os.Stat(bashrc); err == nil {
+		return bashrc
+	}
+	// Neither exists — create ~/.zshrc on macOS, otherwise ~/.bashrc
+	if runtime.GOOS == "darwin" {
+		return zshrc
+	}
+	return bashrc
+}
+
+// updateShellProfileEnv appends or replaces an `export KEY=VALUE` line in the
+// given shell profile file. If the key is already exported (with any value),
+// the existing line is replaced in-place so the file stays idempotent.
+func updateShellProfileEnv(profilePath, key, value string) {
+	exportLine := fmt.Sprintf("export %s=%s", key, value)
+	prefix := "export " + key + "="
+
+	data, err := os.ReadFile(profilePath)
+	if err != nil {
+		// File may not exist yet — write a new one with just this export
+		os.WriteFile(profilePath, []byte(exportLine+"\n"), 0644)
+		return
+	}
+
+	lines := strings.Split(string(data), "\n")
+	updated := false
+	for i, line := range lines {
+		if strings.HasPrefix(line, prefix) {
+			if line == exportLine {
+				// Already correct — nothing to do
+				return
+			}
+			lines[i] = exportLine
+			updated = true
+			break
+		}
+	}
+
+	var newContent string
+	if updated {
+		newContent = strings.Join(lines, "\n")
+	} else {
+		// Key not present — append it
+		content := string(data)
+		if len(content) > 0 && content[len(content)-1] != '\n' {
+			content += "\n"
+		}
+		content += exportLine + "\n"
+		newContent = content
+	}
+	os.WriteFile(profilePath, []byte(newContent), 0644)
+}
+
+func syncMcpServers(profile string) {
+	// Fetch MCP config from S3 and merge into ~/.claude/settings.json AND ~/.claude.json
 	// Non-blocking, best effort — failures are silent
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return
 	}
 	settingsPath := filepath.Join(home, ".claude", "settings.json")
+	claudeJsonPath := filepath.Join(home, ".claude.json")
 
 	// Check if we synced recently (skip if < 5 min ago)
 	cachePath := filepath.Join(home, ".claude-code-session", "mcp-sync-ts")
@@ -807,10 +1060,29 @@ func syncMcpServers() {
 	}
 
 	// Fetch MCPs from S3
+	// Determine active org for org-specific config
+	orgID := "allcode"
+	orgFiles, _ := filepath.Glob(filepath.Join(home, ".claude-code-session", "*-active-org"))
+	for _, f := range orgFiles {
+		if data, err := os.ReadFile(f); err == nil && len(data) > 0 {
+			orgID = strings.TrimSpace(string(data))
+			break
+		}
+	}
+
+	// Fetch MCPs from S3 (org-specific, falls back to allcode)
 	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Get("https://claude-code-auth-distribution-916587687563.s3.amazonaws.com/cowork/claude-code-mcps.json")
+	mcpURL := fmt.Sprintf("https://claude-code-auth-distribution-916587687563.s3.amazonaws.com/cowork/org-%s-mcps.json", orgID)
+	resp, err := client.Get(mcpURL)
 	if err != nil || resp.StatusCode != 200 {
-		return
+		// Fall back to default
+		if resp != nil {
+			resp.Body.Close()
+		}
+		resp, err = client.Get("https://claude-code-auth-distribution-916587687563.s3.amazonaws.com/cowork/claude-code-mcps.json")
+		if err != nil || resp.StatusCode != 200 {
+			return
+		}
 	}
 	defer resp.Body.Close()
 	mcpData, err := io.ReadAll(resp.Body)
@@ -834,15 +1106,915 @@ func syncMcpServers() {
 		return
 	}
 
-	// Merge MCPs
-	settings["mcpServers"] = mcps
+	// Merge managed MCPs into existing (preserve user-added MCPs)
+	existing, _ := settings["mcpServers"].(map[string]interface{})
+	if existing == nil {
+		existing = make(map[string]interface{})
+	}
+	// Add/update managed MCPs without removing user-added ones
+	// Preserve existing env vars (integration tokens get injected there)
+	// Skip HTTP-type MCPs for settings.json (only .claude.json supports them)
+	for name, config := range mcps {
+		newConfig, _ := config.(map[string]interface{})
+		if newConfig != nil {
+			if cmd, _ := newConfig["command"].(string); cmd == "__http__" {
+				continue // HTTP MCPs only go in .claude.json
+			}
+		}
+		if existingConfig, ok := existing[name].(map[string]interface{}); ok && newConfig != nil {
+			// Preserve env vars from existing config that aren't in the new config
+			if existingEnv, ok := existingConfig["env"].(map[string]interface{}); ok && len(existingEnv) > 0 {
+				newEnv, _ := newConfig["env"].(map[string]interface{})
+				if newEnv == nil {
+					newEnv = make(map[string]interface{})
+				}
+				for k, v := range existingEnv {
+					if _, exists := newEnv[k]; !exists {
+						newEnv[k] = v
+					}
+				}
+				newConfig["env"] = newEnv
+			}
+		}
+		existing[name] = config
+	}
+	settings["mcpServers"] = existing
 	newData, err := json.MarshalIndent(settings, "", "  ")
 	if err != nil {
 		return
 	}
 	os.WriteFile(settingsPath, newData, 0600)
 
+	// Also write to ~/.claude.json for Claude Code 2.1+ (reads MCPs from here)
+	var claudeJson map[string]interface{}
+	if data, err := os.ReadFile(claudeJsonPath); err == nil {
+		json.Unmarshal(data, &claudeJson)
+	}
+	if claudeJson == nil {
+		claudeJson = make(map[string]interface{})
+	}
+	// Convert mcps to the format Claude Code 2.1+ expects
+	claudeMcps := make(map[string]interface{})
+	for name, config := range mcps {
+		cfgMap, _ := config.(map[string]interface{})
+		if cfgMap == nil {
+			continue
+		}
+		cmd, _ := cfgMap["command"].(string)
+
+		// HTTP-type MCPs (e.g., Partner Central) — use native HTTP transport
+		if cmd == "__http__" {
+			url, _ := cfgMap["args"].(string)
+			if url == "" {
+				// args might be a []interface{} with URL as first element
+				if argsArr, ok := cfgMap["args"].([]interface{}); ok && len(argsArr) > 0 {
+					url, _ = argsArr[0].(string)
+				}
+			}
+			entry := map[string]interface{}{
+				"type": "http",
+				"url":  url,
+			}
+			// If this is our own AgentCore gateway, inject the auth header
+			if strings.Contains(url, "gateway.bedrock-agentcore") {
+				monToken, _ := storage.GetMonitoringToken(profile, "keyring")
+				if monToken != "" {
+					entry["headers"] = map[string]interface{}{
+						"Authorization": "Bearer " + monToken,
+					}
+				}
+			}
+			claudeMcps[name] = entry
+			continue
+		}
+
+		// Standard stdio MCPs
+		entry := map[string]interface{}{
+			"type":    "stdio",
+			"command": cmd,
+			"args":    cfgMap["args"],
+		}
+		if env, ok := cfgMap["env"]; ok {
+			entry["env"] = env
+		} else {
+			entry["env"] = map[string]interface{}{}
+		}
+		claudeMcps[name] = entry
+	}
+	// Merge: preserve existing user-added MCPs
+	existingMcps, _ := claudeJson["mcpServers"].(map[string]interface{})
+	if existingMcps == nil {
+		existingMcps = make(map[string]interface{})
+	}
+	for name, config := range claudeMcps {
+		// Preserve existing env vars (integration tokens)
+		newConfig, _ := config.(map[string]interface{})
+		if existingConfig, ok := existingMcps[name].(map[string]interface{}); ok && newConfig != nil {
+			if existingEnv, ok := existingConfig["env"].(map[string]interface{}); ok && len(existingEnv) > 0 {
+				newEnv, _ := newConfig["env"].(map[string]interface{})
+				if newEnv == nil {
+					newEnv = make(map[string]interface{})
+				}
+				for k, v := range existingEnv {
+					if _, exists := newEnv[k]; !exists {
+						newEnv[k] = v
+					}
+				}
+				newConfig["env"] = newEnv
+			}
+		}
+		existingMcps[name] = config
+	}
+	claudeJson["mcpServers"] = existingMcps
+	if claudeData, err := json.MarshalIndent(claudeJson, "", "  "); err == nil {
+		os.WriteFile(claudeJsonPath, claudeData, 0600)
+	}
+
 	// Update sync timestamp
 	os.MkdirAll(filepath.Dir(cachePath), 0700)
 	os.WriteFile(cachePath, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0600)
+}
+
+
+// syncIntegrationTokens fetches per-user OAuth tokens for MCP servers that need them
+// (e.g., HubSpot) and injects them as env vars in settings.json.
+// If the user hasn't authenticated with a service yet, opens browser for OAuth.
+func syncIntegrationTokens(profile string) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+
+	debugPrint("syncIntegrationTokens: starting for profile %s", profile)
+
+	// Check if we synced recently (skip if < 10 min ago)
+	cachePath := filepath.Join(home, ".claude-code-session", "integration-token-sync-ts")
+	if data, err := os.ReadFile(cachePath); err == nil {
+		if ts, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64); err == nil {
+			if time.Now().Unix()-ts < 600 {
+				debugPrint("syncIntegrationTokens: skipping, synced recently")
+				return
+			}
+		}
+	}
+
+	// Get monitoring token for API auth
+	monToken, _ := storage.GetMonitoringToken(profile, "keyring")
+	if monToken == "" {
+		debugPrint("syncIntegrationTokens: no monitoring token, skipping")
+		return
+	}
+
+	debugPrint("syncIntegrationTokens: got monitoring token, checking integrations")
+
+	// integrations that need per-user tokens
+	integrations := []struct {
+		name       string
+		mcpKey     string
+		envVar     string
+		extraEnvs  map[string]string // additional env vars to inject from token response
+		tokenURL   string
+		connectURL string
+	}{
+		{
+			name:       "hubspot",
+			mcpKey:     "hubspot",
+			envVar:     "PRIVATE_APP_ACCESS_TOKEN",
+			tokenURL:   "https://dtxfifv2cj.execute-api.us-east-1.amazonaws.com/api/integrations/hubspot/token",
+			connectURL: "https://dtxfifv2cj.execute-api.us-east-1.amazonaws.com/api/integrations/hubspot/connect",
+		},
+		{
+			name:       "activecampaign",
+			mcpKey:     "activecampaign",
+			envVar:     "ACTIVECAMPAIGN_API_KEY",
+			extraEnvs:  map[string]string{"account_url": "ACTIVECAMPAIGN_API_URL"},
+			tokenURL:   "https://dtxfifv2cj.execute-api.us-east-1.amazonaws.com/api/integrations/activecampaign/token",
+			connectURL: "https://nexus.allcode.com/me",
+		},
+		{
+			name:       "zapier",
+			mcpKey:     "zapier",
+			envVar:     "ZAPIER_MCP_TOKEN",
+			tokenURL:   "https://dtxfifv2cj.execute-api.us-east-1.amazonaws.com/api/integrations/zapier/token",
+			connectURL: "https://nexus.allcode.com/me",
+		},
+		{
+			name:       "nexus-factory",
+			mcpKey:     "nexus-factory",
+			envVar:     "NEXUS_FACTORY_API_KEY",
+			tokenURL:   "https://dtxfifv2cj.execute-api.us-east-1.amazonaws.com/api/integrations/nexus-factory/token",
+			connectURL: "https://nexus.allcode.com/me",
+		},
+	}
+
+	settingsPath := filepath.Join(home, ".claude", "settings.json")
+	claudeJsonPath := filepath.Join(home, ".claude.json")
+
+	for _, integ := range integrations {
+		// Fetch token from Nexus API
+		client := &http.Client{Timeout: 5 * time.Second}
+		req, err := http.NewRequest("GET", integ.tokenURL, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("Authorization", "Bearer "+monToken)
+		resp, err := client.Do(req)
+		if err != nil || resp == nil {
+			debugPrint("syncIntegrationTokens: %s token fetch failed: %v", integ.name, err)
+			continue
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		debugPrint("syncIntegrationTokens: %s token response status=%d", integ.name, resp.StatusCode)
+
+		var tokenResp map[string]interface{}
+		if err := json.Unmarshal(body, &tokenResp); err != nil {
+			continue
+		}
+
+		accessToken, _ := tokenResp["access_token"].(string)
+		if accessToken == "" {
+			// User hasn't connected this integration yet
+			// Check if the MCP is even configured before prompting
+			settingsData, err := os.ReadFile(settingsPath)
+			if err != nil {
+				continue
+			}
+			var settings map[string]interface{}
+			if err := json.Unmarshal(settingsData, &settings); err != nil {
+				continue
+			}
+			mcpServers, _ := settings["mcpServers"].(map[string]interface{})
+			if mcpServers == nil {
+				continue
+			}
+			if _, exists := mcpServers[integ.mcpKey]; !exists {
+				continue // MCP not configured, skip
+			}
+			// MCP is configured but no token — show user how to connect
+			connectCachePath := filepath.Join(home, ".claude-code-session", integ.name+"-connect-prompted")
+			if _, err := os.Stat(connectCachePath); err != nil {
+				// First time seeing this - show the message
+				fmt.Fprintf(os.Stderr, "\n⚠ %s MCP needs authentication.\n  Open this URL in your browser to connect:\n  %s\n  Then restart claude.\n\n", integ.name, integ.connectURL)
+				os.MkdirAll(filepath.Dir(connectCachePath), 0700)
+				os.WriteFile(connectCachePath, []byte("1"), 0600)
+			}
+			debugPrint("syncIntegrationTokens: %s not connected, skipping (user will auth on first use)", integ.name)
+			continue
+		}
+
+		// Got a token — inject into MCP env vars in settings.json
+		injectMcpEnvVar(settingsPath, integ.mcpKey, integ.envVar, accessToken)
+		injectMcpEnvVar(claudeJsonPath, integ.mcpKey, integ.envVar, accessToken)
+
+		// Inject additional env vars from the token response (e.g., account_url -> ACTIVECAMPAIGN_API_URL)
+		if integ.extraEnvs != nil {
+			for responseKey, envVarName := range integ.extraEnvs {
+				if val, ok := tokenResp[responseKey].(string); ok && val != "" {
+					injectMcpEnvVar(settingsPath, integ.mcpKey, envVarName, val)
+					injectMcpEnvVar(claudeJsonPath, integ.mcpKey, envVarName, val)
+				}
+			}
+		}
+	}
+
+	// Update sync timestamp
+	os.MkdirAll(filepath.Dir(cachePath), 0700)
+	os.WriteFile(cachePath, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0600)
+}
+
+// injectMcpEnvVar adds/updates an env var in a specific MCP server's config within settings.json
+func injectMcpEnvVar(settingsPath, mcpKey, envVar, value string) {
+	data, err := os.ReadFile(settingsPath)
+	if err != nil {
+		return
+	}
+	var settings map[string]interface{}
+	if err := json.Unmarshal(data, &settings); err != nil {
+		return
+	}
+	mcpServers, _ := settings["mcpServers"].(map[string]interface{})
+	if mcpServers == nil {
+		return
+	}
+	mcpConfig, ok := mcpServers[mcpKey].(map[string]interface{})
+	if !ok {
+		return
+	}
+	env, _ := mcpConfig["env"].(map[string]interface{})
+	if env == nil {
+		env = make(map[string]interface{})
+	}
+	env[envVar] = value
+	mcpConfig["env"] = env
+	mcpServers[mcpKey] = mcpConfig
+	settings["mcpServers"] = mcpServers
+	newData, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return
+	}
+	os.WriteFile(settingsPath, newData, 0600)
+}
+
+func syncSkills() {
+	// Fetch skills from S3 and write to ~/.claude/CLAUDE.md
+	// Non-blocking, best effort — failures are silent
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+
+	// Check if we synced recently (skip if < 5 min ago)
+	cachePath := filepath.Join(home, ".claude-code-session", "skills-sync-ts")
+	if data, err := os.ReadFile(cachePath); err == nil {
+		if ts, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64); err == nil {
+			if time.Now().Unix()-ts < 300 {
+				return
+			}
+		}
+	}
+
+	// Determine active org
+	orgID := "allcode"
+	orgFiles, _ := filepath.Glob(filepath.Join(home, ".claude-code-session", "*-active-org"))
+	for _, f := range orgFiles {
+		if data, err := os.ReadFile(f); err == nil && len(data) > 0 {
+			orgID = strings.TrimSpace(string(data))
+			break
+		}
+	}
+
+	// Fetch skills from S3 (org-specific, falls back to allcode)
+	client := &http.Client{Timeout: 3 * time.Second}
+	skillsURL := fmt.Sprintf("https://claude-code-auth-distribution-916587687563.s3.amazonaws.com/cowork/org-%s-skills.json", orgID)
+	resp, err := client.Get(skillsURL)
+	if err != nil || resp.StatusCode != 200 {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		resp, err = client.Get("https://claude-code-auth-distribution-916587687563.s3.amazonaws.com/cowork/claude-code-skills.json")
+		if err != nil || resp.StatusCode != 200 {
+			return
+		}
+	}
+	defer resp.Body.Close()
+	skillsData, err := io.ReadAll(resp.Body)
+	if err != nil || len(skillsData) < 3 {
+		return
+	}
+
+	// Parse skills
+	var skills []struct {
+		Name        string `json:"name"`
+		Description string `json:"description"`
+		Type        string `json:"type"`
+		Prompt      string `json:"prompt"`
+	}
+	if err := json.Unmarshal(skillsData, &skills); err != nil {
+		return
+	}
+	if len(skills) == 0 {
+		return
+	}
+
+	// Generate CLAUDE.md content from skills
+	var content strings.Builder
+	content.WriteString("# Organization Skills (Managed by AllCode Nexus)\n\n")
+	content.WriteString("The following skills are provided by your organization:\n\n")
+	for _, skill := range skills {
+		content.WriteString("## " + skill.Name + "\n")
+		if skill.Description != "" {
+			content.WriteString(skill.Description + "\n")
+		}
+		content.WriteString("\n" + skill.Prompt + "\n\n")
+	}
+
+	// Write to ~/.claude/CLAUDE.md (for Claude Code)
+	claudeDir := filepath.Join(home, ".claude")
+	os.MkdirAll(claudeDir, 0700)
+	claudeMdPath := filepath.Join(claudeDir, "CLAUDE.md")
+	os.WriteFile(claudeMdPath, []byte(content.String()), 0600)
+
+	// Write to org-plugins directory (for Claude Desktop)
+	// macOS: /Library/Application Support/Claude/org-plugins/nexus-skills/
+	// Windows: C:\Program Files\Claude\org-plugins\nexus-skills\
+	var pluginDir string
+	if runtime.GOOS == "darwin" {
+		pluginDir = "/Library/Application Support/Claude/org-plugins/nexus-skills"
+	} else if runtime.GOOS == "windows" {
+		pluginDir = filepath.Join(os.Getenv("ProgramFiles"), "Claude", "org-plugins", "nexus-skills")
+	}
+	if pluginDir != "" {
+		skillsDir := filepath.Join(pluginDir, "skills")
+		pluginJsonDir := filepath.Join(pluginDir, ".claude-plugin")
+
+		// Only write if directory exists (created by install script with admin perms)
+		if _, err := os.Stat(pluginDir); err == nil {
+			// Write plugin.json
+			os.MkdirAll(pluginJsonDir, 0755)
+			os.WriteFile(filepath.Join(pluginJsonDir, "plugin.json"), []byte(`{"name":"nexus-skills","version":"1.0.0","description":"Organization skills managed by AllCode Nexus","installationPreference":"required"}`), 0644)
+
+			// Write version.json (use timestamp to trigger re-sync)
+			os.WriteFile(filepath.Join(pluginDir, "version.json"), []byte(`{"version":"`+strconv.FormatInt(time.Now().Unix(), 10)+`"}`), 0644)
+
+			// Write each skill as a SKILL.md
+			for _, skill := range skills {
+				skillDir := filepath.Join(skillsDir, strings.ToLower(strings.ReplaceAll(skill.Name, " ", "-")))
+				os.MkdirAll(skillDir, 0755)
+				skillContent := "---\nname: " + skill.Name + "\ndescription: " + skill.Description + "\n---\n\n" + skill.Prompt + "\n"
+				os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(skillContent), 0644)
+			}
+		}
+	}
+
+	// Update sync timestamp
+	os.MkdirAll(filepath.Dir(cachePath), 0700)
+	os.WriteFile(cachePath, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0600)
+}
+
+func syncManagedConfig(profile string) {
+	// Fetch the latest cowork config from S3 and update managed_config.json
+	// This keeps Claude Desktop's managed MCPs in sync with the Nexus portal
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+
+	// Check if we synced recently (skip if < 5 min ago)
+	cachePath := filepath.Join(home, ".claude-code-session", "cowork-sync-ts")
+	if data, err := os.ReadFile(cachePath); err == nil {
+		if ts, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64); err == nil {
+			if time.Now().Unix()-ts < 300 {
+				return
+			}
+		}
+	}
+
+	// Fetch cowork config from S3 (org-specific based on profile)
+	client := &http.Client{Timeout: 3 * time.Second}
+
+	// Determine org from profile name (e.g., "lets-play-us-east-2" → "lets-play")
+	orgID := "allcode"
+	parts := strings.Split(profile, "-")
+	if len(parts) >= 3 {
+		// Remove the last 2 parts (region like "us-east-2") to get org slug
+		regionParts := 0
+		for i := len(parts) - 1; i >= 0; i-- {
+			if parts[i] == "east" || parts[i] == "west" || parts[i] == "us" || len(parts[i]) <= 2 {
+				regionParts++
+			} else {
+				break
+			}
+		}
+		if regionParts > 0 && regionParts < len(parts) {
+			orgID = strings.Join(parts[:len(parts)-regionParts], "-")
+		}
+	}
+	if profile == "allcode-dev-us-east-1" {
+		orgID = "allcode"
+	}
+
+	// Try org-specific config first, fall back to default
+	coworkURL := fmt.Sprintf("https://claude-code-auth-distribution-916587687563.s3.amazonaws.com/cowork/org-%s-cowork-3p-config.json", orgID)
+	resp, err := client.Get(coworkURL)
+	if err != nil || resp.StatusCode != 200 {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		resp, err = client.Get("https://claude-code-auth-distribution-916587687563.s3.amazonaws.com/cowork/cowork-3p-config.json")
+	}
+	if err != nil || resp.StatusCode != 200 {
+		return
+	}
+	defer resp.Body.Close()
+	configData, err := io.ReadAll(resp.Body)
+	if err != nil || len(configData) < 10 {
+		return
+	}
+
+	// Parse the config
+	var remoteConfig map[string]interface{}
+	if err := json.Unmarshal(configData, &remoteConfig); err != nil {
+		return
+	}
+
+	// Read current managed_config.json (if exists)
+	managedConfigPath := filepath.Join(home, "Library", "Application Support", "Claude", "managed_config.json")
+	managedConfigPath3P := filepath.Join(home, "Library", "Application Support", "Claude-3p", "managed_config.json")
+	var localConfig map[string]interface{}
+	if data, err := os.ReadFile(managedConfigPath); err == nil {
+		json.Unmarshal(data, &localConfig)
+	}
+	if localConfig == nil {
+		localConfig = make(map[string]interface{})
+	}
+
+	// Update managedMcpServers from remote config
+	if mcps, ok := remoteConfig["managedMcpServers"]; ok {
+		localConfig["managedMcpServers"] = mcps
+	}
+
+	// Inject per-user integration tokens into managed MCP env vars (HubSpot, ActiveCampaign, Zapier, Nexus Factory)
+	if mcps, ok := localConfig["managedMcpServers"].([]interface{}); ok {
+		monToken, _ := storage.GetMonitoringToken(profile, "keyring")
+		if monToken != "" {
+			client := &http.Client{Timeout: 5 * time.Second}
+			type mcpTokenConfig struct {
+				mcpName  string
+				tokenURL string
+				envMap   map[string]string // response field → env var name
+			}
+			tokenConfigs := []mcpTokenConfig{
+				{"HubSpot", "https://dtxfifv2cj.execute-api.us-east-1.amazonaws.com/api/integrations/hubspot/token", map[string]string{"access_token": "PRIVATE_APP_ACCESS_TOKEN"}},
+				{"ActiveCampaign", "https://dtxfifv2cj.execute-api.us-east-1.amazonaws.com/api/integrations/activecampaign/token", map[string]string{"access_token": "ACTIVECAMPAIGN_API_KEY", "account_url": "ACTIVECAMPAIGN_API_URL"}},
+				{"Zapier", "https://dtxfifv2cj.execute-api.us-east-1.amazonaws.com/api/integrations/zapier/token", map[string]string{"access_token": "ZAPIER_MCP_TOKEN"}},
+				{"Nexus Factory", "https://dtxfifv2cj.execute-api.us-east-1.amazonaws.com/api/integrations/nexus-factory/token", map[string]string{"access_token": "NEXUS_FACTORY_API_KEY"}},
+			}
+
+			for i, mcp := range mcps {
+				mcpMap, _ := mcp.(map[string]interface{})
+				if mcpMap == nil {
+					continue
+				}
+				name, _ := mcpMap["name"].(string)
+				for _, tc := range tokenConfigs {
+					if name == tc.mcpName {
+						req, _ := http.NewRequest("GET", tc.tokenURL, nil)
+						if req == nil {
+							break
+						}
+						req.Header.Set("Authorization", "Bearer "+monToken)
+						resp, err := client.Do(req)
+						if err != nil || resp == nil {
+							break
+						}
+						body, _ := io.ReadAll(resp.Body)
+						resp.Body.Close()
+						var tokenResp map[string]interface{}
+						json.Unmarshal(body, &tokenResp)
+						env, _ := mcpMap["env"].(map[string]interface{})
+						if env == nil {
+							env = make(map[string]interface{})
+						}
+						injected := false
+						for respField, envVar := range tc.envMap {
+							if val, ok := tokenResp[respField].(string); ok && val != "" {
+								env[envVar] = val
+								injected = true
+							}
+						}
+						if injected {
+							mcpMap["env"] = env
+							mcps[i] = mcpMap
+						}
+						break
+					}
+				}
+			}
+			localConfig["managedMcpServers"] = mcps
+		}
+	}
+
+	// Also sync other config fields (but preserve inferenceCredentialHelper which is local-path specific)
+	for _, key := range []string{"isDesktopExtensionEnabled", "isDesktopExtensionDirectoryEnabled", "isLocalDevMcpEnabled", "isClaudeCodeForDesktopEnabled", "inferenceProvider", "inferenceBedrockRegion", "inferenceBedrockProfile", "inferenceCredentialHelper", "inferenceCredentialHelperTtlSec", "inferenceModels", "otlpEndpoint", "otlpProtocol", "coworkEgressAllowedHosts"} {
+		if v, ok := remoteConfig[key]; ok {
+			localConfig[key] = v
+		}
+	}
+
+	// Write updated managed_config.json
+	// Inject per-user otlpHeaders for Cowork telemetry attribution
+	otelFiles, _ := filepath.Glob(filepath.Join(home, ".claude-code-session", "*-otel-headers.raw"))
+	for _, of := range otelFiles {
+		if data, err := os.ReadFile(of); err == nil {
+			var otelHeaders map[string]interface{}
+			if json.Unmarshal(data, &otelHeaders) == nil {
+				if email, ok := otelHeaders["x-user-email"].(string); ok && email != "" {
+					localConfig["otlpHeaders"] = fmt.Sprintf("x-user-email=%s", email)
+					break
+				}
+			}
+		}
+	}
+
+	newData, err := json.MarshalIndent(localConfig, "", "  ")
+	if err != nil {
+		return
+	}
+	os.MkdirAll(filepath.Dir(managedConfigPath), 0700)
+	os.WriteFile(managedConfigPath, newData, 0600)
+
+	// Also write to Claude-3p directory (3rd-party/Bedrock variant)
+	os.MkdirAll(filepath.Dir(managedConfigPath3P), 0700)
+	os.WriteFile(managedConfigPath3P, newData, 0600)
+
+	// Write mcpServers to Claude-3p/claude_desktop_config.json (Cowork on Bedrock reads from here)
+	desktopConfigPath := filepath.Join(home, "Library", "Application Support", "Claude-3p", "claude_desktop_config.json")
+	var desktopConfig map[string]interface{}
+	if data, err := os.ReadFile(desktopConfigPath); err == nil {
+		json.Unmarshal(data, &desktopConfig)
+	}
+	if desktopConfig == nil {
+		desktopConfig = make(map[string]interface{})
+	}
+	if mcps, ok := localConfig["managedMcpServers"].([]interface{}); ok {
+		mcpServers, _ := desktopConfig["mcpServers"].(map[string]interface{})
+		if mcpServers == nil {
+			mcpServers = make(map[string]interface{})
+		}
+		for _, mcp := range mcps {
+			mcpMap, _ := mcp.(map[string]interface{})
+			if mcpMap == nil {
+				continue
+			}
+			name, _ := mcpMap["name"].(string)
+			if name == "" {
+				continue
+			}
+			key := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(name, " ", "-"), "&", "and"))
+			entry := map[string]interface{}{
+				"command": mcpMap["command"],
+				"args":    mcpMap["args"],
+			}
+			if env, ok := mcpMap["env"].(map[string]interface{}); ok && len(env) > 0 {
+				entry["env"] = env
+			}
+			mcpServers[key] = entry
+		}
+		desktopConfig["mcpServers"] = mcpServers
+	}
+	if desktopData, err := json.MarshalIndent(desktopConfig, "", "  "); err == nil {
+		os.WriteFile(desktopConfigPath, desktopData, 0600)
+	}
+
+	// Update Claude Desktop managed preferences plist (if writable)
+	// This is the file Claude Desktop actually reads for managed MCPs
+	usr, _ := user.Current()
+	if usr != nil {
+		plistPath := filepath.Join("/Library/Managed Preferences", usr.Username, "com.anthropic.claudefordesktop.plist")
+		if _, err := os.Stat(plistPath); err == nil {
+			// Update managedMcpServers
+			if mcps, ok := remoteConfig["managedMcpServers"]; ok {
+				mcpJSON, _ := json.Marshal(mcps)
+				exec.Command("plutil", "-replace", "managedMcpServers", "-string", string(mcpJSON), plistPath).Run()
+			}
+
+			// Update OTel config for Desktop telemetry
+			if endpoint, ok := remoteConfig["otlpEndpoint"].(string); ok && endpoint != "" {
+				exec.Command("plutil", "-replace", "otlpEndpoint", "-string", endpoint, plistPath).Run()
+			}
+			if protocol, ok := remoteConfig["otlpProtocol"].(string); ok && protocol != "" {
+				exec.Command("plutil", "-replace", "otlpProtocol", "-string", protocol, plistPath).Run()
+			}
+
+			// Set per-user otlpHeaders from cached otel-headers (for per-user attribution)
+			userEmail := ""
+			otelFiles, _ := filepath.Glob(filepath.Join(home, ".claude-code-session", "*-otel-headers.raw"))
+			for _, of := range otelFiles {
+				if data, err := os.ReadFile(of); err == nil {
+					var headers map[string]interface{}
+					if json.Unmarshal(data, &headers) == nil {
+						if email, ok := headers["x-user-email"].(string); ok && email != "" {
+							userEmail = email
+							break
+						}
+					}
+				}
+			}
+			if userEmail != "" {
+				headers := fmt.Sprintf("x-user-email=%s", userEmail)
+				exec.Command("plutil", "-replace", "otlpHeaders", "-string", headers, plistPath).Run()
+			}
+		}
+	}
+
+	// Windows: Update registry for Claude Desktop managed config
+	if runtime.GOOS == "windows" {
+		regPath := `HKLM\SOFTWARE\Policies\Anthropic\ClaudeForDesktop`
+		// Update managedMcpServers
+		if mcps, ok := remoteConfig["managedMcpServers"]; ok {
+			mcpJSON, _ := json.Marshal(mcps)
+			exec.Command("reg", "add", regPath, "/v", "managedMcpServers", "/t", "REG_SZ", "/d", string(mcpJSON), "/f").Run()
+		}
+		// Update OTel config
+		if endpoint, ok := remoteConfig["otlpEndpoint"].(string); ok && endpoint != "" {
+			exec.Command("reg", "add", regPath, "/v", "otlpEndpoint", "/t", "REG_SZ", "/d", endpoint, "/f").Run()
+		}
+		if protocol, ok := remoteConfig["otlpProtocol"].(string); ok && protocol != "" {
+			exec.Command("reg", "add", regPath, "/v", "otlpProtocol", "/t", "REG_SZ", "/d", protocol, "/f").Run()
+		}
+		// Set per-user otlpHeaders
+		userEmail := ""
+		otelFiles, _ := filepath.Glob(filepath.Join(home, ".claude-code-session", "*-otel-headers.raw"))
+		for _, of := range otelFiles {
+			if data, err := os.ReadFile(of); err == nil {
+				var headers map[string]interface{}
+				if json.Unmarshal(data, &headers) == nil {
+					if email, ok := headers["x-user-email"].(string); ok && email != "" {
+						userEmail = email
+						break
+					}
+				}
+			}
+		}
+		if userEmail != "" {
+			hdrs := fmt.Sprintf("x-user-email=%s", userEmail)
+			exec.Command("reg", "add", regPath, "/v", "otlpHeaders", "/t", "REG_SZ", "/d", hdrs, "/f").Run()
+		}
+	}
+
+	// Update sync timestamp
+	os.MkdirAll(filepath.Dir(cachePath), 0700)
+	os.WriteFile(cachePath, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0600)
+}
+
+
+// reportPlatform sends the user's OS/arch/tool info to the Nexus API for the Users page Platform column.
+func reportPlatform(idToken string) {
+	// Extract email from ID token
+	parts := strings.Split(idToken, ".")
+	if len(parts) < 2 {
+		return
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return
+	}
+	var claims map[string]interface{}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return
+	}
+	email, _ := claims["email"].(string)
+	if email == "" {
+		return
+	}
+
+	body, _ := json.Marshal(map[string]string{
+		"email":    email,
+		"platform": runtime.GOOS,
+		"arch":     runtime.GOARCH,
+		"tool":     "claude-code",
+	})
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	req, _ := http.NewRequest("POST", "https://dtxfifv2cj.execute-api.us-east-1.amazonaws.com/api/users/platform", bytes.NewReader(body))
+	if req != nil {
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+idToken)
+		client.Do(req)
+	}
+}
+
+func checkForUpdate() {
+	// Self-update: check S3 for newer binary version, download and replace if available
+	// Throttled to once per 24 hours
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+
+	cachePath := filepath.Join(home, ".claude-code-session", "update-check-ts")
+	if data, err := os.ReadFile(cachePath); err == nil {
+		if ts, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64); err == nil {
+			if time.Now().Unix()-ts < 3600 { // 1 hour
+				return
+			}
+		}
+	}
+
+	// Determine platform binary name
+	var binaryName string
+	switch runtime.GOOS + "_" + runtime.GOARCH {
+	case "darwin_arm64":
+		binaryName = "credential-process-darwin-arm64"
+	case "darwin_amd64":
+		binaryName = "credential-process-darwin-amd64"
+	case "linux_amd64":
+		binaryName = "credential-process-linux-amd64"
+	case "linux_arm64":
+		binaryName = "credential-process-linux-arm64"
+	case "windows_amd64":
+		binaryName = "credential-process-windows-amd64.exe"
+	default:
+		return
+	}
+
+	// Fetch version file
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get("https://claude-code-auth-distribution-916587687563.s3.amazonaws.com/cowork/credential-process-version.json")
+	if err != nil || resp.StatusCode != 200 {
+		return
+	}
+	defer resp.Body.Close()
+	versionData, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return
+	}
+
+	var versionInfo map[string]interface{}
+	if err := json.Unmarshal(versionData, &versionInfo); err != nil {
+		return
+	}
+
+	// Get remote hash for our platform
+	hashKey := "sha256_" + runtime.GOOS + "_" + runtime.GOARCH
+	remoteHash, _ := versionInfo[hashKey].(string)
+	if remoteHash == "" {
+		// Save timestamp so we don't check again for 24h
+		os.MkdirAll(filepath.Dir(cachePath), 0700)
+		os.WriteFile(cachePath, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0600)
+		return
+	}
+
+	// Get current binary hash
+	execPath, err := os.Executable()
+	if err != nil {
+		return
+	}
+	execPath, _ = filepath.EvalSymlinks(execPath)
+	currentData, err := os.ReadFile(execPath)
+	if err != nil {
+		return
+	}
+
+	// Calculate SHA256
+	currentHash := fmt.Sprintf("%x", sha256Sum(currentData))
+	if currentHash == remoteHash {
+		// Already up to date
+		os.MkdirAll(filepath.Dir(cachePath), 0700)
+		os.WriteFile(cachePath, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0600)
+		return
+	}
+
+	// Download new binary
+	dlResp, err := client.Get("https://claude-code-auth-distribution-916587687563.s3.amazonaws.com/cowork/" + binaryName)
+	if err != nil || dlResp.StatusCode != 200 {
+		return
+	}
+	defer dlResp.Body.Close()
+	newBinary, err := io.ReadAll(dlResp.Body)
+	if err != nil || len(newBinary) < 1000 {
+		return
+	}
+
+	// Verify hash of downloaded binary
+	dlHash := fmt.Sprintf("%x", sha256Sum(newBinary))
+	if dlHash != remoteHash {
+		return // Hash mismatch — don't install
+	}
+
+	// Replace self: write to temp file, then rename
+	tmpPath := execPath + ".update"
+	if err := os.WriteFile(tmpPath, newBinary, 0755); err != nil {
+		return
+	}
+
+	// Atomic rename
+	if err := os.Rename(tmpPath, execPath); err != nil {
+		os.Remove(tmpPath)
+		return
+	}
+
+	fmt.Fprintln(os.Stderr, "[nexus] Updated credential-process to latest version")
+
+	// Save timestamp
+	os.MkdirAll(filepath.Dir(cachePath), 0700)
+	os.WriteFile(cachePath, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0600)
+}
+
+func sha256Sum(data []byte) [32]byte {
+	return sha256.Sum256(data)
+}
+
+func clearAwsCliCacheIfExpired(profile string) {
+	// The AWS CLI/SDK caches credential_process results at ~/.aws/cli/cache/
+	// If our credentials expired, this stale cache causes 403 errors even after
+	// the credential-process would return fresh ones (because the CLI doesn't re-call us).
+	// Fix: proactively clear the CLI cache when our creds are expired.
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+
+	// Check if our cached credentials are expired
+	creds, err := storage.ReadFromCredentialsFile(profile)
+	if err != nil || creds == nil {
+		return
+	}
+	remaining := storage.ParseExpirationSeconds(creds.Expiration)
+	if remaining > 60 {
+		return // Not expired yet, no need to clear
+	}
+
+	// Credentials expired or about to expire — clear the AWS CLI cache
+	cacheDir := filepath.Join(home, ".aws", "cli", "cache")
+	entries, err := os.ReadDir(cacheDir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			os.Remove(filepath.Join(cacheDir, entry.Name()))
+		}
+	}
 }

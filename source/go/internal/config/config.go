@@ -34,6 +34,7 @@ type ProfileConfig struct {
 	QuotaFailMode      string `json:"quota_fail_mode"`
 	QuotaCheckInterval int    `json:"quota_check_interval"`
 	QuotaCheckTimeout  int    `json:"quota_check_timeout"`
+	BedrockRoleArn     string `json:"bedrock_role_arn"`
 
 	// Okta Custom Authorization Server id. Absent / empty / "default" all
 	// mean "use the default CAS" -- the Go code normalizes these equivalently.

@@ -476,3 +476,77 @@ class TestInstallerScripts:
             content = bat_path.read_text(encoding="utf-8")
             assert "credential-process" in content
             assert r"\.claude" in content or ".claude" in content
+
+
+class TestInstallerIdempotency:
+    """Validate the generated install.sh is idempotent and ships uninstall.sh."""
+
+    def _generate(self, profile):
+        command = PackageCommand()
+        tmpdir = tempfile.mkdtemp()
+        output_dir = Path(tmpdir)
+        command._create_installer(
+            output_dir,
+            profile,
+            [("macos-arm64", Path("credential-process-macos-arm64"))],
+            [],
+        )
+        return output_dir
+
+    def test_install_sh_runs_pre_install_uninstaller(self, base_profile):
+        """install.sh must invoke the bundled uninstaller before writing new state."""
+        output_dir = self._generate(base_profile)
+        content = (output_dir / "install.sh").read_text(encoding="utf-8")
+        # Pre-install cleanup invocation with idempotent flags
+        assert "./uninstall.sh --yes --keep-tokens" in content
+        # Only run when the uninstaller is actually bundled
+        assert '[ -f "$SCRIPT_DIR/uninstall.sh" ]' in content
+
+    def test_install_sh_uses_python_profile_dedupe(self, base_profile):
+        """install.sh must use a python3-based profile dedupe, not the naive sed range delete."""
+        output_dir = self._generate(base_profile)
+        content = (output_dir / "install.sh").read_text(encoding="utf-8")
+        # The old naive sed range-delete must be gone
+        assert 'sed -i.bak "/\\[profile' not in content
+        assert "/^$/d" not in content
+        # A python3 heredoc that parses the AWS config must be present
+        assert "PYEOF" in content
+        assert '$PYTHON - "$HOME/.aws/config"' in content
+        assert 'target_header = "[profile "' in content
+
+    def test_install_sh_copies_uninstaller_into_install_dir(self, base_profile):
+        """install.sh must copy the bundled uninstaller into the install dir."""
+        output_dir = self._generate(base_profile)
+        content = (output_dir / "install.sh").read_text(encoding="utf-8")
+        assert 'cp "$SCRIPT_DIR/uninstall.sh" ~/claude-code-with-bedrock/uninstall.sh' in content
+        assert "chmod +x ~/claude-code-with-bedrock/uninstall.sh" in content
+
+    def test_install_sh_has_ownership_safety_net(self, base_profile):
+        """install.sh must chown files back to the invoking user after elevated ops."""
+        output_dir = self._generate(base_profile)
+        content = (output_dir / "install.sh").read_text(encoding="utf-8")
+        assert 'if [ "$(id -u)" = "0" ]; then' in content
+        assert "stat -f%Su /dev/console" in content
+        assert 'chown -R "$OWNER_USER" "$OWNER_HOME/claude-code-with-bedrock"' in content
+
+    def test_uninstall_sh_generated(self, base_profile):
+        """uninstall.sh must be generated with --yes/--keep-tokens/--purge flags."""
+        output_dir = self._generate(base_profile)
+        uninstall_path = output_dir / "uninstall.sh"
+        assert uninstall_path.exists(), "uninstall.sh not generated"
+        content = uninstall_path.read_text(encoding="utf-8")
+        assert "--yes" in content
+        assert "--keep-tokens" in content
+        assert "--purge" in content
+        # Removes the AWS profile block that points at our credential-process
+        assert "claude-code-with-bedrock/credential-process" in content
+
+    def test_readme_references_uninstall(self, base_profile):
+        """Generated README must tell users how to remove the installation."""
+        command = PackageCommand()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            command._create_documentation(output_dir, base_profile, "20260101-000000")
+            readme = (output_dir / "README.md").read_text(encoding="utf-8")
+            assert "uninstall.sh" in readme
+            assert "~/claude-code-with-bedrock/uninstall.sh" in readme

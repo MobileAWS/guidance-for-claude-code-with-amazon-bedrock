@@ -920,6 +920,30 @@ fi
 """
 
         installer_content += f"""
+# ---------------------------------------------------------------------------
+# Pre-install cleanup (idempotency)
+#
+# A fresh install should cleanly supersede any prior install. If we detect a
+# previous install (existing install dir, or an existing AWS profile block that
+# points at our credential-process) AND the bundled uninstaller is present,
+# run it silently to remove stale dirs, the old AWS profile block, and stale
+# Claude Code state BEFORE writing new state. --keep-tokens preserves any
+# server-side tokens and local credential cache so users are not forced to
+# re-authenticate after re-running the installer.
+# ---------------------------------------------------------------------------
+PRIOR_INSTALL=false
+if [ -d ~/claude-code-with-bedrock ]; then
+    PRIOR_INSTALL=true
+elif [ -f ~/.aws/config ] && grep -q "claude-code-with-bedrock/credential-process" ~/.aws/config 2>/dev/null; then
+    PRIOR_INSTALL=true
+fi
+
+if [ "$PRIOR_INSTALL" = "true" ] && [ -f "$SCRIPT_DIR/uninstall.sh" ]; then
+    echo
+    echo "Previous installation detected — cleaning up before reinstall..."
+    ( cd "$SCRIPT_DIR" && bash ./uninstall.sh --yes --keep-tokens ) || true
+fi
+
 # Create directory
 echo
 echo "Installing authentication tools..."
@@ -927,6 +951,9 @@ mkdir -p ~/claude-code-with-bedrock
 
 # Copy appropriate binary
 cp "$CREDENTIAL_BINARY" ~/claude-code-with-bedrock/credential-process
+
+# Ship the uninstaller alongside the binaries so users can always find it
+cp "$SCRIPT_DIR/uninstall.sh" ~/claude-code-with-bedrock/uninstall.sh 2>/dev/null && chmod +x ~/claude-code-with-bedrock/uninstall.sh 2>/dev/null || true
 
 # Copy config
 cp config.json ~/claude-code-with-bedrock/
@@ -1035,8 +1062,47 @@ fi
 for PROFILE_NAME in $PROFILES; do
     echo "Configuring AWS profile: $PROFILE_NAME"
 
-    # Remove old profile if exists
-    sed -i.bak "/\\[profile $PROFILE_NAME\\]/,/^$/d" ~/.aws/config 2>/dev/null || true
+    # Remove ANY existing [profile <name>] block for this exact name before
+    # appending a fresh one, so there is never more than one block with the
+    # same profile name. A naive sed range-delete can leave duplicates or
+    # partial deletes, so parse the file properly with Python instead.
+    if [ -f ~/.aws/config ]; then
+        PROFILE_NAME="$PROFILE_NAME" $PYTHON - "$HOME/.aws/config" << 'PYEOF'
+import os
+import re
+import sys
+
+path = sys.argv[1]
+target = os.environ["PROFILE_NAME"]
+try:
+    with open(path, "r") as f:
+        lines = f.readlines()
+except FileNotFoundError:
+    lines = []
+
+header = re.compile(r"^\\s*\\[")
+target_header = "[profile " + target + "]"
+
+out = []
+skip = False
+for line in lines:
+    stripped = line.strip()
+    if header.match(line):
+        # A new section starts here; decide whether to skip it.
+        skip = (stripped == target_header)
+    if not skip:
+        out.append(line)
+
+# Collapse trailing blank lines to a single newline boundary.
+while out and out[-1].strip() == "":
+    out.pop()
+
+with open(path, "w") as f:
+    f.write("".join(out))
+    if out:
+        f.write("\n")
+PYEOF
+    fi
 
     # Get profile-specific region from config.json
     PROFILE_REGION=$($PYTHON -c "
@@ -1044,7 +1110,7 @@ import json
 print(json.load(open('config.json')).get('$PROFILE_NAME', {{}}).get('aws_region', '$DEFAULT_REGION'))
 ")
 
-    # Add new profile with --profile flag (cross-platform, no shell required)
+    # Add exactly one fresh profile block with --profile flag (cross-platform, no shell required)
     cat >> ~/.aws/config << EOF
 [profile $PROFILE_NAME]
 credential_process = $HOME/claude-code-with-bedrock/credential-process --profile $PROFILE_NAME
@@ -1135,6 +1201,35 @@ echo
 echo "Note: Authentication will automatically open your browser when needed."
 echo
 
+# ---------------------------------------------------------------------------
+# Ownership safety net
+#
+# Some steps above may run under sudo (installing prerequisites, writing to
+# /usr/local/bin). If this script itself was run with elevated privileges,
+# make sure nothing in the user's home ends up root-owned. Chown the install
+# dir and Claude Code state back to the invoking user.
+# ---------------------------------------------------------------------------
+if [ "$(id -u)" = "0" ]; then
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        OWNER_USER="$(stat -f%Su /dev/console 2>/dev/null)"
+        OWNER_HOME="$(dscl . -read /Users/$OWNER_USER NFSHomeDirectory 2>/dev/null | awk '{{print $2}}')"
+        [ -z "$OWNER_HOME" ] && OWNER_HOME="$HOME"
+    else
+        OWNER_USER="${{SUDO_USER:-$USER}}"
+        OWNER_HOME="$HOME"
+        if [ -n "$SUDO_USER" ]; then
+            OWNER_HOME="$(eval echo ~$SUDO_USER)"
+        fi
+    fi
+
+    if [ -n "$OWNER_USER" ] && [ "$OWNER_USER" != "root" ]; then
+        chown -R "$OWNER_USER" "$OWNER_HOME/claude-code-with-bedrock" 2>/dev/null || true
+        for f in "$OWNER_HOME/.claude" "$OWNER_HOME/.claude.json" "$OWNER_HOME/.claude-code-session"; do
+            [ -e "$f" ] && chown -R "$OWNER_USER" "$f" 2>/dev/null || true
+        done
+    fi
+fi
+
 # Create a launcher script on PATH
 echo "Creating Claude launcher..."
 LAUNCHER="/usr/local/bin/claude-code"
@@ -1199,6 +1294,169 @@ fi
         with open(installer_path, "w", encoding="utf-8", newline="\n") as f:
             f.write(installer_content)
         installer_path.chmod(0o755)
+
+        # ------------------------------------------------------------------
+        # Uninstaller
+        #
+        # Shipped in the package (and copied into the install dir by install.sh)
+        # so a fresh install can cleanly supersede a prior one and so users can
+        # always remove the tools. Supports:
+        #   --yes          non-interactive (assume yes)
+        #   --keep-tokens  preserve cached credentials / tokens
+        #   --purge        also remove the globally-installed Claude Code CLI
+        # ------------------------------------------------------------------
+        uninstaller_content = f"""#!/bin/bash
+# Claude Code Authentication Uninstaller
+# Organization: {profile.provider_domain}
+# Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+set -e
+
+INSTALL_DIR="$HOME/claude-code-with-bedrock"
+
+ASSUME_YES=false
+KEEP_TOKENS=false
+PURGE=false
+
+for arg in "$@"; do
+    case "$arg" in
+        --yes|-y) ASSUME_YES=true ;;
+        --keep-tokens) KEEP_TOKENS=true ;;
+        --purge) PURGE=true ;;
+        *) echo "Unknown option: $arg" ;;
+    esac
+done
+
+echo "======================================"
+echo "Claude Code Authentication Uninstaller"
+echo "======================================"
+echo
+
+if [ "$ASSUME_YES" != "true" ]; then
+    read -p "Remove Claude Code Bedrock authentication tools? (y/N): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo "Aborted."
+        exit 0
+    fi
+fi
+
+# Resolve a Python interpreter for AWS config parsing
+PYTHON=""
+if command -v python3 &> /dev/null; then
+    PYTHON="python3"
+elif command -v python &> /dev/null; then
+    PYTHON="python"
+fi
+
+# Remove the AWS profile blocks that point at our credential-process.
+# Parse the config properly so we never leave partial/duplicate blocks.
+if [ -f "$HOME/.aws/config" ] && [ -n "$PYTHON" ]; then
+    echo "Removing AWS profile blocks..."
+    $PYTHON - "$HOME/.aws/config" << 'PYEOF'
+import re
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path, "r") as f:
+        lines = f.readlines()
+except FileNotFoundError:
+    lines = []
+
+header = re.compile(r"^\\s*\\[")
+marker = "claude-code-with-bedrock/credential-process"
+
+# Group the file into (header_line, [body_lines]) sections. Preamble lines
+# before the first header are kept verbatim.
+sections = []
+preamble = []
+current = None
+for line in lines:
+    if header.match(line):
+        if current is not None:
+            sections.append(current)
+        current = [line, []]
+    elif current is None:
+        preamble.append(line)
+    else:
+        current[1].append(line)
+if current is not None:
+    sections.append(current)
+
+out = list(preamble)
+for head, body in sections:
+    if any(marker in b for b in body):
+        # Drop this whole section (it is one of ours).
+        continue
+    out.append(head)
+    out.extend(body)
+
+while out and out[-1].strip() == "":
+    out.pop()
+
+with open(path, "w") as f:
+    f.write("".join(out))
+    if out:
+        f.write("\\n")
+PYEOF
+    echo "  ✓ AWS profile blocks removed"
+fi
+
+# Remove the launcher from PATH
+for LAUNCHER in /usr/local/bin/claude-code "$HOME/bin/claude-code"; do
+    if [ -f "$LAUNCHER" ]; then
+        rm -f "$LAUNCHER" 2>/dev/null || sudo rm -f "$LAUNCHER" 2>/dev/null || true
+        echo "  ✓ Removed launcher: $LAUNCHER"
+    fi
+done
+
+# Remove Claude Code settings written by the installer (leave user backups).
+if [ -f "$HOME/.claude/settings.json" ]; then
+    rm -f "$HOME/.claude/settings.json"
+    echo "  ✓ Removed ~/.claude/settings.json"
+fi
+
+# Remove stale MCP / session state unless we are keeping tokens.
+if [ "$KEEP_TOKENS" != "true" ]; then
+    rm -f "$HOME/.claude-code-session" 2>/dev/null || true
+    if [ -d "$INSTALL_DIR" ]; then
+        rm -rf "$INSTALL_DIR"
+        echo "  ✓ Removed $INSTALL_DIR"
+    fi
+else
+    # Keep cached credentials/tokens but remove the binaries + config so a
+    # reinstall starts clean. Preserve any credential cache files.
+    if [ -d "$INSTALL_DIR" ]; then
+        find "$INSTALL_DIR" -mindepth 1 \\
+            ! -name "*.cache" \\
+            ! -name "*token*" \\
+            ! -name "*.json.tokens" \\
+            -exec rm -rf {{}} + 2>/dev/null || true
+        echo "  ✓ Cleaned $INSTALL_DIR (kept cached tokens)"
+    fi
+fi
+
+# Optionally remove the globally-installed Claude Code CLI (npm global).
+if [ "$PURGE" = "true" ]; then
+    if command -v npm &> /dev/null; then
+        echo "Removing globally installed Claude Code CLI..."
+        npm uninstall -g @anthropic-ai/claude-code 2>/dev/null \\
+            || sudo npm uninstall -g @anthropic-ai/claude-code 2>/dev/null \\
+            || true
+    fi
+fi
+
+echo
+echo "======================================"
+echo "✓ Uninstall complete!"
+echo "======================================"
+"""
+
+        uninstaller_path = output_dir / "uninstall.sh"
+        with open(uninstaller_path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(uninstaller_content)
+        uninstaller_path.chmod(0o755)
 
         # Create .command wrapper for macOS double-click install
         command_path = output_dir / "Install Claude Code.command"
@@ -1529,6 +1787,12 @@ To manually clear cached credentials (if needed):
 ```
 
 This will force re-authentication on your next AWS command.
+
+### Removing the installation
+
+To remove: run ~/claude-code-with-bedrock/uninstall.sh
+
+This removes the installed tools, the AWS profile block, and local Claude Code state.
 
 ### Browser doesn't open
 Check that you're not in an SSH session. The browser needs to open on your local machine.

@@ -976,20 +976,19 @@ fi
 echo
 echo "Installing authentication tools..."
 mkdir -p "$INSTALL_DIR"
-mkdir -p ~/claude-code-with-bedrock
 
 # Copy appropriate binary
-cp "$CREDENTIAL_BINARY" ~/claude-code-with-bedrock/credential-process
+cp "$CREDENTIAL_BINARY" "$INSTALL_DIR/credential-process"
 
 # Copy config
-cp config.json ~/claude-code-with-bedrock/
-chmod +x ~/claude-code-with-bedrock/credential-process
+cp config.json "$INSTALL_DIR/"
+chmod +x "$INSTALL_DIR/credential-process"
 
 # macOS Gatekeeper + Keychain notices
 if [[ "$OSTYPE" == "darwin"* ]]; then
     # Remove quarantine flag added by macOS when downloading unsigned binaries.
     # Without this, Gatekeeper blocks execution with "Apple could not verify..." dialog.
-    xattr -d com.apple.quarantine ~/claude-code-with-bedrock/credential-process 2>/dev/null || true
+    xattr -d com.apple.quarantine "$INSTALL_DIR/credential-process" 2>/dev/null || true
     echo
     echo "⚠️  macOS Keychain Access:"
     echo "   On first use, macOS will ask for permission to access the keychain."
@@ -1026,8 +1025,8 @@ if [ -d "claude-settings" ]; then
 
         if [ "$SKIP_SETTINGS" != "true" ]; then
             # Replace placeholders and write settings
-            sed -e "s|__OTEL_HELPER_PATH__|$HOME/claude-code-with-bedrock/otel-helper|g" \
-                -e "s|__CREDENTIAL_PROCESS_PATH__|$HOME/claude-code-with-bedrock/credential-process|g" \
+            sed -e "s|__OTEL_HELPER_PATH__|$INSTALL_DIR/otel-helper|g" \
+                -e "s|__CREDENTIAL_PROCESS_PATH__|$INSTALL_DIR/credential-process|g" \
                 "claude-settings/settings.json" > ~/.claude/settings.json
 
             # Verify placeholders were replaced
@@ -1045,17 +1044,17 @@ fi
 if [ -f "$OTEL_BINARY" ]; then
     echo
     echo "Installing OTEL helper..."
-    cp "$OTEL_BINARY" ~/claude-code-with-bedrock/otel-helper
-    chmod +x ~/claude-code-with-bedrock/otel-helper
-    xattr -d com.apple.quarantine ~/claude-code-with-bedrock/otel-helper 2>/dev/null || true
+    cp "$OTEL_BINARY" "$INSTALL_DIR/otel-helper"
+    chmod +x "$INSTALL_DIR/otel-helper"
+    xattr -d com.apple.quarantine "$INSTALL_DIR/otel-helper" 2>/dev/null || true
     echo "✓ OTEL helper installed"
 fi
 
 # Add debug info if OTEL helper was installed
-if [ -f ~/claude-code-with-bedrock/otel-helper ]; then
+if [ -f "$INSTALL_DIR/otel-helper" ]; then
     echo "The OTEL helper will extract user attributes from authentication tokens"
     echo "and include them in metrics. To test the helper, run:"
-    echo "  ~/claude-code-with-bedrock/otel-helper --test"
+    echo "  $INSTALL_DIR/otel-helper --test"
 fi
 
 # Update AWS config
@@ -1155,10 +1154,10 @@ done
 # Post-install validation
 echo
 echo "Validating installation..."
-if [ -f ~/claude-code-with-bedrock/credential-process ]; then
-    echo "  OK credential-process: ~/claude-code-with-bedrock/credential-process"
+if [ -f "$INSTALL_DIR/credential-process" ]; then
+    echo "  OK credential-process: $INSTALL_DIR/credential-process"
 else
-    echo "  FAIL credential-process not found at: ~/claude-code-with-bedrock/credential-process"
+    echo "  FAIL credential-process not found at: $INSTALL_DIR/credential-process"
 fi
 if [ -f ~/.claude/settings.json ]; then
     echo "  OK settings.json: ~/.claude/settings.json"

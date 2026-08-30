@@ -924,23 +924,65 @@ fi
 """
 
         installer_content += f"""
+# -----------------------------------------------------------------------
+# Environment-aware install target.
+# A normal install is "prod" and lives in ~/claude-code-with-bedrock.
+# A dev build (NEXUS_ENV=dev in the environment) installs into the
+# parallel ~/claude-code-with-bedrock-dev directory so prod and dev can
+# coexist. IS_DEV/UNINSTALL_SCOPE drive the idempotency logic below.
+# -----------------------------------------------------------------------
+if [ "${{NEXUS_ENV:-}}" = "dev" ]; then
+    IS_DEV=true
+    INSTALL_DIR="$HOME/claude-code-with-bedrock-dev"
+    UNINSTALL_SCOPE="--dev"
+    CRED_PROCESS_LINE="credential_process = env NEXUS_ENV=dev $INSTALL_DIR/credential-process --profile"
+else
+    IS_DEV=false
+    INSTALL_DIR="$HOME/claude-code-with-bedrock"
+    UNINSTALL_SCOPE="--prod"
+    CRED_PROCESS_LINE="credential_process = $INSTALL_DIR/credential-process --profile"
+fi
+
+# -----------------------------------------------------------------------
+# Pre-install cleanup (idempotency): if a previous Nexus install exists for
+# the SAME environment we are about to (re)install, run the bundled
+# uninstaller first so this install cleanly supersedes the old one. We pass
+# --keep-tokens so server-side Nexus tokens are NEVER removed. This is best
+# effort and must never abort the install (the script runs under 'set -e').
+# -----------------------------------------------------------------------
+NEXUS_CONFIG_HAS_PROFILE=false
+if [ -f ~/.aws/config ] && grep -q 'credential-process' ~/.aws/config 2>/dev/null; then
+    NEXUS_CONFIG_HAS_PROFILE=true
+fi
+if {{ [ -d "$INSTALL_DIR" ] || [ "$NEXUS_CONFIG_HAS_PROFILE" = "true" ]; }} && [ -f "$SCRIPT_DIR/uninstall.sh" ]; then
+    echo
+    echo "Detected a previous installation — cleaning up before reinstall..."
+    bash "$SCRIPT_DIR/uninstall.sh" --yes --keep-tokens "$UNINSTALL_SCOPE" 2>/dev/null || true
+fi
+
 # Create directory
 echo
 echo "Installing authentication tools..."
-mkdir -p ~/claude-code-with-bedrock
+mkdir -p "$INSTALL_DIR"
 
 # Copy appropriate binary
-cp "$CREDENTIAL_BINARY" ~/claude-code-with-bedrock/credential-process
+cp "$CREDENTIAL_BINARY" "$INSTALL_DIR/credential-process"
 
 # Copy config
-cp config.json ~/claude-code-with-bedrock/
-chmod +x ~/claude-code-with-bedrock/credential-process
+cp config.json "$INSTALL_DIR/"
+chmod +x "$INSTALL_DIR/credential-process"
+
+# Copy the bundled uninstaller into the install dir so users can always
+# find it later (idempotency / distribution requirement).
+if [ -f "$SCRIPT_DIR/uninstall.sh" ]; then
+    cp "$SCRIPT_DIR/uninstall.sh" "$INSTALL_DIR/uninstall.sh" && chmod +x "$INSTALL_DIR/uninstall.sh"
+fi
 
 # macOS Gatekeeper + Keychain notices
 if [[ "$OSTYPE" == "darwin"* ]]; then
     # Remove quarantine flag added by macOS when downloading unsigned binaries.
     # Without this, Gatekeeper blocks execution with "Apple could not verify..." dialog.
-    xattr -d com.apple.quarantine ~/claude-code-with-bedrock/credential-process 2>/dev/null || true
+    xattr -d com.apple.quarantine "$INSTALL_DIR/credential-process" 2>/dev/null || true
     echo
     echo "⚠️  macOS Keychain Access:"
     echo "   On first use, macOS will ask for permission to access the keychain."
@@ -977,8 +1019,8 @@ if [ -d "claude-settings" ]; then
 
         if [ "$SKIP_SETTINGS" != "true" ]; then
             # Replace placeholders and write settings
-            sed -e "s|__OTEL_HELPER_PATH__|$HOME/claude-code-with-bedrock/otel-helper|g" \
-                -e "s|__CREDENTIAL_PROCESS_PATH__|$HOME/claude-code-with-bedrock/credential-process|g" \
+            sed -e "s|__OTEL_HELPER_PATH__|$INSTALL_DIR/otel-helper|g" \
+                -e "s|__CREDENTIAL_PROCESS_PATH__|$INSTALL_DIR/credential-process|g" \
                 "claude-settings/settings.json" > ~/.claude/settings.json
 
             # Verify placeholders were replaced
@@ -996,17 +1038,17 @@ fi
 if [ -f "$OTEL_BINARY" ]; then
     echo
     echo "Installing OTEL helper..."
-    cp "$OTEL_BINARY" ~/claude-code-with-bedrock/otel-helper
-    chmod +x ~/claude-code-with-bedrock/otel-helper
-    xattr -d com.apple.quarantine ~/claude-code-with-bedrock/otel-helper 2>/dev/null || true
+    cp "$OTEL_BINARY" "$INSTALL_DIR/otel-helper"
+    chmod +x "$INSTALL_DIR/otel-helper"
+    xattr -d com.apple.quarantine "$INSTALL_DIR/otel-helper" 2>/dev/null || true
     echo "✓ OTEL helper installed"
 fi
 
 # Add debug info if OTEL helper was installed
-if [ -f ~/claude-code-with-bedrock/otel-helper ]; then
+if [ -f "$INSTALL_DIR/otel-helper" ]; then
     echo "The OTEL helper will extract user attributes from authentication tokens"
     echo "and include them in metrics. To test the helper, run:"
-    echo "  ~/claude-code-with-bedrock/otel-helper --test"
+    echo "  $INSTALL_DIR/otel-helper --test"
 fi
 
 # Update AWS config
@@ -1039,8 +1081,46 @@ fi
 for PROFILE_NAME in $PROFILES; do
     echo "Configuring AWS profile: $PROFILE_NAME"
 
-    # Remove old profile if exists
-    sed -i.bak "/\\[profile $PROFILE_NAME\\]/,/^$/d" ~/.aws/config 2>/dev/null || true
+    # Remove ONLY the [profile <name>] block being (re)configured, preserving
+    # all other profiles and comments. This robust block-parser mirrors the
+    # uninstaller's STEP 3 and guarantees we never end up with two blocks that
+    # share the same profile name after a reinstall.
+    if [ -f ~/.aws/config ]; then
+        "$PYTHON" - ~/.aws/config "$PROFILE_NAME" <<'PYPROF'
+import re, sys
+path = sys.argv[1]
+target = sys.argv[2]
+with open(path, "r", encoding="utf-8") as f:
+    lines = f.readlines()
+
+# Split into blocks headed by a [section] line, keeping any preamble.
+sections = []
+current = {{"header": None, "lines": []}}
+header_re = re.compile(r"^\\s*\\[")
+for line in lines:
+    if header_re.match(line):
+        sections.append(current)
+        current = {{"header": line, "lines": [line]}}
+    else:
+        current["lines"].append(line)
+sections.append(current)
+
+def is_target(sec):
+    if not sec["header"]:
+        return False
+    m = re.match(r"^\\s*\\[profile\\s+(.+?)\\s*\\]\\s*$", sec["header"])
+    return bool(m) and m.group(1) == target
+
+out = []
+for sec in sections:
+    if is_target(sec):
+        continue
+    out.append("".join(sec["lines"]))
+
+with open(path, "w", encoding="utf-8") as f:
+    f.write("".join(out))
+PYPROF
+    fi
 
     # Get profile-specific region from config.json
     PROFILE_REGION=$($PYTHON -c "
@@ -1048,22 +1128,35 @@ import json
 print(json.load(open('config.json')).get('$PROFILE_NAME', {{}}).get('aws_region', '$DEFAULT_REGION'))
 ")
 
-    # Add new profile with --profile flag (cross-platform, no shell required)
+    # Add exactly one fresh profile block. The credential_process line is
+    # environment-aware ($CRED_PROCESS_LINE points at the prod or -dev binary,
+    # prefixing 'env NEXUS_ENV=dev' for dev builds).
     cat >> ~/.aws/config << EOF
 [profile $PROFILE_NAME]
-credential_process = $HOME/claude-code-with-bedrock/credential-process --profile $PROFILE_NAME
+$CRED_PROCESS_LINE $PROFILE_NAME
 region = $PROFILE_REGION
 EOF
     echo "  ✓ Created AWS profile '$PROFILE_NAME'"
 done
 
+# Ownership safety net (idempotency): if any step above ran under sudo/root,
+# make sure no root-owned files are left behind in the user's home. Derive the
+# invoking user safely (never hardcode) and re-own the install dir and Claude
+# state files when they exist. Best effort — never fatal.
+OWNER_USER="${{SUDO_USER:-${{USER:-$(id -un)}}}}"
+if [ -n "$OWNER_USER" ]; then
+    [ -d "$INSTALL_DIR" ] && chown -R "$OWNER_USER" "$INSTALL_DIR" 2>/dev/null || true
+    [ -d ~/.claude ] && chown -R "$OWNER_USER" ~/.claude 2>/dev/null || true
+    [ -f ~/.claude.json ] && chown "$OWNER_USER" ~/.claude.json 2>/dev/null || true
+fi
+
 # Post-install validation
 echo
 echo "Validating installation..."
-if [ -f ~/claude-code-with-bedrock/credential-process ]; then
-    echo "  OK credential-process: ~/claude-code-with-bedrock/credential-process"
+if [ -f "$INSTALL_DIR/credential-process" ]; then
+    echo "  OK credential-process: $INSTALL_DIR/credential-process"
 else
-    echo "  FAIL credential-process not found at: ~/claude-code-with-bedrock/credential-process"
+    echo "  FAIL credential-process not found at: $INSTALL_DIR/credential-process"
 fi
 if [ -f ~/.claude/settings.json ]; then
     echo "  OK settings.json: ~/.claude/settings.json"
@@ -1138,6 +1231,9 @@ echo "  aws sts get-caller-identity"
 echo
 echo "Note: Authentication will automatically open your browser when needed."
 echo
+echo "To remove this installation later, run:"
+echo "  $INSTALL_DIR/uninstall.sh"
+echo
 
 # Create a launcher script on PATH
 echo "Creating Claude launcher..."
@@ -1185,6 +1281,9 @@ echo
 echo "Or use the standard command with the profile:"
 echo "  export AWS_PROFILE=$FIRST_PROFILE"
 echo "  claude"
+echo
+echo "To remove this installation later, run:"
+echo "  $INSTALL_DIR/uninstall.sh"
 echo
 
 # Ask if they want to launch now

@@ -924,9 +924,78 @@ fi
 """
 
         installer_content += f"""
+# -----------------------------------------------------------------------
+# Resolve environment (prod by default; dev when NEXUS_ENV=dev) and the
+# invoking user. INSTALL_DIR is derived from NEXUS_ENV so that a dev build
+# installs alongside prod without clobbering it. Prod behaviour is unchanged
+# when NEXUS_ENV is unset.
+# -----------------------------------------------------------------------
+NEXUS_ENV="${{NEXUS_ENV:-prod}}"
+if [ "$NEXUS_ENV" = "dev" ]; then
+    INSTALL_DIR="$HOME/claude-code-with-bedrock-dev"
+    UNINSTALL_SCOPE="--dev"
+else
+    NEXUS_ENV="prod"
+    INSTALL_DIR="$HOME/claude-code-with-bedrock"
+    UNINSTALL_SCOPE="--prod"
+fi
+
+# Resolve the invoking (non-root) user and their home for the ownership
+# safety net. When run via sudo, SUDO_USER is the real user; on macOS fall
+# back to the console user. Never hardcode a username.
+INVOKING_USER="${{SUDO_USER:-${{USER:-$(id -un)}}}}"
+if [ "$(uname)" = "Darwin" ]; then
+    CONSOLE_USER="$(stat -f%Su /dev/console 2>/dev/null || true)"
+    if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ]; then
+        INVOKING_USER="$CONSOLE_USER"
+    fi
+fi
+
+# -----------------------------------------------------------------------
+# PRE-INSTALL CLEANUP: if a previous Nexus install for this environment is
+# detected and the bundle ships uninstall.sh, run it scoped to the SAME
+# environment with --keep-tokens so server-side tokens are preserved. This
+# clears stale install dirs, the old AWS profile block, and stale MCP /
+# session state BEFORE we write new state. Gracefully do nothing if
+# uninstall.sh is not bundled — never fail the install.
+# -----------------------------------------------------------------------
+PREV_INSTALL_DETECTED=false
+if [ -d "$INSTALL_DIR" ]; then
+    PREV_INSTALL_DETECTED=true
+fi
+# Also detect a matching AWS profile block for any profile in config.json.
+if [ -f ~/.aws/config ] && [ -f "config.json" ] && [ -n "$PYTHON" ]; then
+    if $PYTHON -c "
+import json, sys
+try:
+    names = list(json.load(open('config.json')).keys())
+except Exception:
+    sys.exit(1)
+try:
+    cfg = open('$HOME/.aws/config', encoding='utf-8').read()
+except Exception:
+    sys.exit(1)
+import re
+for n in names:
+    if re.search(r'^\\s*\\[profile\\s+' + re.escape(n) + r'\\]', cfg, re.M):
+        sys.exit(0)
+sys.exit(1)
+" 2>/dev/null; then
+        PREV_INSTALL_DETECTED=true
+    fi
+fi
+
+if [ "$PREV_INSTALL_DETECTED" = "true" ] && [ -f "$SCRIPT_DIR/uninstall.sh" ]; then
+    echo
+    echo "Detected a previous Nexus install ($NEXUS_ENV) — cleaning up stale state..."
+    # --keep-tokens ensures server-side tokens are NEVER removed.
+    bash "$SCRIPT_DIR/uninstall.sh" --yes --keep-tokens "$UNINSTALL_SCOPE" >/dev/null 2>&1 || true
+fi
+
 # Create directory
 echo
 echo "Installing authentication tools..."
+mkdir -p "$INSTALL_DIR"
 mkdir -p ~/claude-code-with-bedrock
 
 # Copy appropriate binary
@@ -935,6 +1004,13 @@ cp "$CREDENTIAL_BINARY" ~/claude-code-with-bedrock/credential-process
 # Copy config
 cp config.json ~/claude-code-with-bedrock/
 chmod +x ~/claude-code-with-bedrock/credential-process
+
+# Copy the bundled uninstaller into the install dir so users can always
+# find it later. Guarded so a bundle without uninstall.sh still installs.
+if [ -f "$SCRIPT_DIR/uninstall.sh" ]; then
+    cp "$SCRIPT_DIR/uninstall.sh" "$INSTALL_DIR/uninstall.sh"
+    chmod +x "$INSTALL_DIR/uninstall.sh"
+fi
 
 # macOS Gatekeeper + Keychain notices
 if [[ "$OSTYPE" == "darwin"* ]]; then
@@ -1039,8 +1115,41 @@ fi
 for PROFILE_NAME in $PROFILES; do
     echo "Configuring AWS profile: $PROFILE_NAME"
 
-    # Remove old profile if exists
-    sed -i.bak "/\\[profile $PROFILE_NAME\\]/,/^$/d" ~/.aws/config 2>/dev/null || true
+    # Remove any pre-existing [profile <name>] block for this exact profile
+    # name. Section-aware: a block runs from its [profile name] header to the
+    # next [section] header (or EOF), so comments and unrelated profiles are
+    # preserved and we don't stop early at the first blank line. This ensures
+    # installing prod over dev (or vice versa) REPLACES the same-named block
+    # rather than stacking two.
+    if [ -f ~/.aws/config ]; then
+        $PYTHON - "$HOME/.aws/config" "$PROFILE_NAME" <<'PYDEDUPE' || true
+import re, sys
+path, name = sys.argv[1], sys.argv[2]
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+except Exception:
+    sys.exit(0)
+
+header_re = re.compile(r"^\\s*\\[")
+target_re = re.compile(r"^\\s*\\[profile\\s+" + re.escape(name) + r"\\]\\s*$")
+
+out = []
+skip = False
+for line in lines:
+    if header_re.match(line):
+        # A new section header decides whether we start/stop skipping.
+        skip = bool(target_re.match(line))
+        if skip:
+            continue
+    if skip:
+        continue
+    out.append(line)
+
+with open(path, "w", encoding="utf-8") as f:
+    f.write("".join(out))
+PYDEDUPE
+    fi
 
     # Get profile-specific region from config.json
     PROFILE_REGION=$($PYTHON -c "
@@ -1234,6 +1343,44 @@ CODEX_TOML
 
         echo "✓ Codex configuration installed"
     fi
+fi
+
+# -----------------------------------------------------------------------
+# SHELL PROFILE GUARDS: for a dev install, persist NEXUS_ENV=dev to the
+# user's shell profiles so subsequent shells target the dev environment.
+# Each appended line is grep-guarded so re-runs never duplicate it, and it
+# carries the '# AllCode Nexus DEV install' marker the uninstaller matches.
+# Prod installs append nothing (no marker line needed).
+# -----------------------------------------------------------------------
+if [ "$NEXUS_ENV" = "dev" ]; then
+    NEXUS_ENV_LINE='export NEXUS_ENV=dev # AllCode Nexus DEV install'
+    for RC_FILE in ~/.zshrc ~/.bashrc; do
+        if [ -f "$RC_FILE" ] || [[ "$RC_FILE" == ~/.zshrc && "$OSTYPE" == "darwin"* ]]; then
+            if ! grep -qF '# AllCode Nexus DEV install' "$RC_FILE" 2>/dev/null; then
+                echo "$NEXUS_ENV_LINE" >> "$RC_FILE"
+            fi
+        fi
+    done
+fi
+
+# -----------------------------------------------------------------------
+# OWNERSHIP SAFETY NET: several steps above may run under sudo (AWS CLI /
+# Node / Claude CLI installs, launcher copy), which can leave root-owned
+# files in the user's home. Chown the install dir and Claude state back to
+# the invoking user. Only touch paths that exist; never fatal.
+# -----------------------------------------------------------------------
+if [ -n "$INVOKING_USER" ] && command -v chown >/dev/null 2>&1; then
+    for OWNED_PATH in \\
+        "$INSTALL_DIR" \\
+        "$HOME/claude-code-with-bedrock" \\
+        "$HOME/.npm" \\
+        "$HOME/.claude" \\
+        "$HOME/.claude.json" \\
+        "$HOME/.claude-code-session"; do
+        if [ -e "$OWNED_PATH" ]; then
+            chown -R "$INVOKING_USER" "$OWNED_PATH" 2>/dev/null || true
+        fi
+    done
 fi
 """
 

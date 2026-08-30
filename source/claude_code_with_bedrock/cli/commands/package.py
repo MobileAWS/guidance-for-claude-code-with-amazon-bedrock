@@ -276,6 +276,10 @@ class PackageCommand(Command):
         console.print("[cyan]Creating installer script...[/cyan]")
         self._create_installer(output_dir, profile, built_executables, built_otel_helpers)
 
+        # Create standalone uninstaller script (bundled automatically by distribute.py)
+        console.print("[cyan]Creating uninstaller script...[/cyan]")
+        self._create_uninstaller(output_dir, profile)
+
         # Copy shell wrapper for OTEL helper (Layer 2 caching - the shell wrapper
         # warms the per-profile cache before the Go otel-helper binary runs)
         if built_otel_helpers:
@@ -557,6 +561,9 @@ class PackageCommand(Command):
         # Regenerate installer scripts
         console.print("[cyan]Generating installer scripts...[/cyan]")
         self._create_installer(output_dir, profile, built_executables, built_otel_helpers)
+
+        # Regenerate standalone uninstaller script
+        self._create_uninstaller(output_dir, profile)
 
         # Regenerate documentation
         console.print("[cyan]Generating documentation...[/cyan]")
@@ -1248,6 +1255,538 @@ fi
             self._create_windows_installer(output_dir, profile)
 
         return installer_path
+
+    def _create_uninstaller(self, output_dir: Path, profile) -> Path:
+        """Create standalone macOS-first uninstaller script (uninstall.sh).
+
+        The uninstaller is a self-contained bash script (deps: bash + python3)
+        that removes the AllCode Nexus / Claude Code with Bedrock install. It is
+        written to ``output_dir / 'uninstall.sh'`` so distribute.py bundles it
+        automatically. See the docstring flags for supported options.
+        """
+        uninstaller_content = r"""#!/bin/bash
+# Claude Code with Amazon Bedrock (AllCode Nexus) Uninstaller
+# Standalone, macOS-first. Dependencies: bash + python3 only.
+#
+# Usage:
+#   ./uninstall.sh [--yes|-y] [--purge] [--keep-tokens] [--dev] [--prod]
+#
+#   --yes, -y      No prompts; assume "yes" to confirmation.
+#   --purge        Also remove Claude Code CLI global npm package
+#                  (@anthropic-ai/claude-code) AND Google credential files.
+#   --keep-tokens  Do NOT touch integration credential files (skip local
+#                  Google file-bridge removal). Never touches server-side
+#                  Nexus tokens regardless.
+#   --dev          Target only the dev install.
+#   --prod         Target only the prod install.
+#   (default: remove BOTH dev and prod)
+
+set -u
+
+# ---------------------------------------------------------------------------
+# Flag parsing
+# ---------------------------------------------------------------------------
+ASSUME_YES=0
+PURGE=0
+KEEP_TOKENS=0
+SCOPE_DEV=0
+SCOPE_PROD=0
+
+for arg in "$@"; do
+  case "$arg" in
+    --yes|-y) ASSUME_YES=1 ;;
+    --purge) PURGE=1 ;;
+    --keep-tokens) KEEP_TOKENS=1 ;;
+    --dev) SCOPE_DEV=1 ;;
+    --prod) SCOPE_PROD=1 ;;
+    -h|--help)
+      grep '^#' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $arg" >&2
+      echo "Use --help for usage." >&2
+      exit 2
+      ;;
+  esac
+done
+
+# Default: neither --dev nor --prod means BOTH.
+if [ "$SCOPE_DEV" -eq 0 ] && [ "$SCOPE_PROD" -eq 0 ]; then
+  DO_DEV=1
+  DO_PROD=1
+else
+  DO_DEV="$SCOPE_DEV"
+  DO_PROD="$SCOPE_PROD"
+fi
+
+# ---------------------------------------------------------------------------
+# Derive the target user's home (match the postinstall convention).
+# Prefer the console user; fall back to $HOME when run directly as the user.
+# ---------------------------------------------------------------------------
+CONSOLE_USER="$(stat -f%Su /dev/console 2>/dev/null || true)"
+if [ -n "${CONSOLE_USER:-}" ] && [ "$CONSOLE_USER" != "root" ]; then
+  USER_HOME="$(eval echo "~${CONSOLE_USER}" 2>/dev/null || true)"
+fi
+if [ -z "${USER_HOME:-}" ] || [ ! -d "${USER_HOME:-/nonexistent}" ]; then
+  USER_HOME="$HOME"
+fi
+
+echo "======================================"
+echo "AllCode Nexus / Claude Code Uninstaller"
+echo "======================================"
+echo "Target home: $USER_HOME"
+echo
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+PROD_INSTALL_DIR="$USER_HOME/claude-code-with-bedrock"
+DEV_INSTALL_DIR="$USER_HOME/claude-code-with-bedrock-dev"
+PROD_PAYLOAD_DIR="/usr/local/share/allcode-nexus"
+DEV_PAYLOAD_DIR="/usr/local/share/allcode-nexus-dev"
+
+# ---------------------------------------------------------------------------
+# Detect installs
+# ---------------------------------------------------------------------------
+FOUND=0
+declare -a SUMMARY
+
+detect() {
+  local label="$1" path="$2"
+  if [ -e "$path" ]; then
+    FOUND=1
+    SUMMARY+=("  $label: $path")
+  fi
+}
+
+if [ "$DO_PROD" -eq 1 ]; then
+  detect "prod install dir" "$PROD_INSTALL_DIR"
+  detect "prod payload dir" "$PROD_PAYLOAD_DIR"
+fi
+if [ "$DO_DEV" -eq 1 ]; then
+  detect "dev install dir" "$DEV_INSTALL_DIR"
+  detect "dev payload dir" "$DEV_PAYLOAD_DIR"
+fi
+
+# Also count some shared state as "installed" so we still clean up after a
+# partial install.
+for p in \
+  "$USER_HOME/.claude-code-session" \
+  "$USER_HOME/.claude.json" \
+  "$USER_HOME/.claude/settings.json"; do
+  if [ -e "$p" ]; then FOUND=1; fi
+done
+
+if [ "$FOUND" -eq 0 ]; then
+  echo "Nothing to remove. AllCode Nexus / Claude Code does not appear to be installed."
+  echo "nothing to remove"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Summary + confirmation
+# ---------------------------------------------------------------------------
+echo "The following will be removed:"
+if [ "${#SUMMARY[@]}" -gt 0 ]; then
+  for line in "${SUMMARY[@]}"; do echo "$line"; done
+fi
+echo "  Nexus-owned AWS profiles, shell env lines, MCP keys and runtime state"
+if [ "$PURGE" -eq 1 ]; then
+  echo "  (--purge) Claude Code CLI global npm package + Google credential files"
+fi
+echo
+
+if [ "$ASSUME_YES" -ne 1 ]; then
+  printf "Proceed? [y/N] "
+  read -r reply
+  case "$reply" in
+    y|Y|yes|YES) ;;
+    *) echo "Aborted."; exit 0 ;;
+  esac
+fi
+echo
+
+mark_removed() { echo "  ✓ removed: $1"; }
+mark_absent()  { echo "  – not present: $1"; }
+
+# ---------------------------------------------------------------------------
+# 1. Remove install dirs and payload dirs
+# ---------------------------------------------------------------------------
+echo "[1/13] Removing install directories..."
+remove_dir() {
+  local path="$1"
+  if [ -e "$path" ]; then
+    rm -rf "$path" && mark_removed "$path" || echo "  ! failed: $path"
+  else
+    mark_absent "$path"
+  fi
+}
+
+remove_payload_dir() {
+  local path="$1"
+  if [ ! -e "$path" ]; then
+    mark_absent "$path"
+    return
+  fi
+  # Only escalate with sudo when the dir exists and is root-owned.
+  local owner
+  owner="$(stat -f%Su "$path" 2>/dev/null || echo "")"
+  if [ "$owner" = "root" ]; then
+    echo "  (sudo) removing root-owned $path"
+    sudo rm -rf "$path" && mark_removed "$path" || echo "  ! failed: $path"
+  else
+    rm -rf "$path" && mark_removed "$path" || echo "  ! failed: $path"
+  fi
+}
+
+if [ "$DO_PROD" -eq 1 ]; then
+  remove_dir "$PROD_INSTALL_DIR"
+  remove_payload_dir "$PROD_PAYLOAD_DIR"
+fi
+if [ "$DO_DEV" -eq 1 ]; then
+  remove_dir "$DEV_INSTALL_DIR"
+  remove_payload_dir "$DEV_PAYLOAD_DIR"
+fi
+
+# ---------------------------------------------------------------------------
+# 2. Clean ~/.aws/config (remove Nexus-owned profile blocks)
+# ---------------------------------------------------------------------------
+echo "[2/13] Cleaning ~/.aws/config..."
+AWS_CONFIG="$USER_HOME/.aws/config"
+if [ -f "$AWS_CONFIG" ]; then
+  AWS_CONFIG="$AWS_CONFIG" DO_DEV="$DO_DEV" DO_PROD="$DO_PROD" python3 - <<'PY'
+import os, re
+
+path = os.environ["AWS_CONFIG"]
+do_dev = os.environ.get("DO_DEV") == "1"
+do_prod = os.environ.get("DO_PROD") == "1"
+
+with open(path, "r", encoding="utf-8") as f:
+    text = f.read()
+
+lines = text.splitlines(keepends=True)
+
+# Split into (header, body_lines) blocks; preamble kept as-is.
+blocks = []
+preamble = []
+cur_header = None
+cur_body = []
+header_re = re.compile(r'^\s*\[')
+
+def flush():
+    if cur_header is not None:
+        blocks.append((cur_header, cur_body))
+
+for ln in lines:
+    if header_re.match(ln):
+        flush()
+        cur_header = ln
+        cur_body = []
+    else:
+        if cur_header is None:
+            preamble.append(ln)
+        else:
+            cur_body.append(ln)
+flush()
+
+def is_nexus_block(header, body):
+    joined = "".join(body)
+    m = re.search(r'^\s*credential_process\s*=\s*(.+)$', joined, re.MULTILINE)
+    if not m:
+        return False
+    cp = m.group(1)
+    if "claude-code-with-bedrock" not in cp:
+        return False
+    is_dev = "NEXUS_ENV=dev" in cp
+    if is_dev:
+        return do_dev
+    return do_prod
+
+kept = []
+removed = 0
+for header, body in blocks:
+    if is_nexus_block(header, body):
+        removed += 1
+        continue
+    kept.append((header, body))
+
+out = "".join(preamble)
+for header, body in kept:
+    out += header + "".join(body)
+
+with open(path, "w", encoding="utf-8") as f:
+    f.write(out)
+
+if removed:
+    print(f"  \u2713 removed {removed} Nexus AWS profile block(s)")
+else:
+    print("  \u2013 no Nexus AWS profile blocks found")
+PY
+else
+  mark_absent "$AWS_CONFIG"
+fi
+
+# ---------------------------------------------------------------------------
+# 3. Clean shell profiles (~/.zshrc, ~/.bashrc): remove the DEV env line only
+# ---------------------------------------------------------------------------
+echo "[3/13] Cleaning shell profiles..."
+DEV_MARKER='# AllCode Nexus DEV install'
+for rc in "$USER_HOME/.zshrc" "$USER_HOME/.bashrc"; do
+  if [ -f "$rc" ]; then
+    RC_FILE="$rc" python3 - <<'PY'
+import os
+path = os.environ["RC_FILE"]
+marker = "# AllCode Nexus DEV install"
+with open(path, "r", encoding="utf-8") as f:
+    lines = f.readlines()
+kept = [ln for ln in lines if marker not in ln]
+if len(kept) != len(lines):
+    with open(path, "w", encoding="utf-8") as f:
+        f.writelines(kept)
+    print(f"  \u2713 removed DEV env line from {path}")
+else:
+    print(f"  \u2013 no Nexus DEV env line in {path}")
+PY
+  else
+    mark_absent "$rc"
+  fi
+done
+
+# ---------------------------------------------------------------------------
+# 4. Remove Nexus-managed MCP keys from ~/.claude.json and ~/.claude/settings.json
+# ---------------------------------------------------------------------------
+echo "[4/13] Removing Nexus-managed MCP servers..."
+STATE_FILE="$USER_HOME/.claude-code-session/nexus-managed-mcps.json"
+for target in "$USER_HOME/.claude.json" "$USER_HOME/.claude/settings.json"; do
+  if [ -f "$target" ]; then
+    TARGET="$target" STATE_FILE="$STATE_FILE" python3 - <<'PY'
+import os, json
+target = os.environ["TARGET"]
+state_file = os.environ["STATE_FILE"]
+
+FALLBACK = [
+    "github", "slack", "hubspot", "activecampaign", "zapier",
+    "nexus-factory", "web-search", "partner-central", "atlassian",
+    "jira", "google-drive", "google-docs", "google-slides",
+    "google-workspace", "google-docs-&-slides",
+]
+
+managed = None
+if os.path.isfile(state_file):
+    try:
+        with open(state_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            managed = data
+        elif isinstance(data, dict):
+            managed = data.get("managed") or data.get("keys") or list(data.keys())
+    except Exception:
+        managed = None
+if not managed:
+    managed = FALLBACK
+
+try:
+    with open(target, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+except Exception:
+    print(f"  \u2013 could not parse {target}")
+    raise SystemExit(0)
+
+servers = cfg.get("mcpServers")
+removed = []
+if isinstance(servers, dict):
+    for key in list(servers.keys()):
+        if key in managed:
+            del servers[key]
+            removed.append(key)
+    if not servers:
+        # keep an empty object rather than removing the field
+        cfg["mcpServers"] = {}
+
+with open(target, "w", encoding="utf-8") as f:
+    json.dump(cfg, f, indent=2)
+    f.write("\n")
+
+if removed:
+    print(f"  \u2713 removed {len(removed)} MCP key(s) from {target}: {', '.join(removed)}")
+else:
+    print(f"  \u2013 no Nexus MCP keys in {target}")
+PY
+  else
+    mark_absent "$target"
+  fi
+done
+
+# ---------------------------------------------------------------------------
+# 5. Clean Nexus env block from ~/.claude/settings.json
+# ---------------------------------------------------------------------------
+echo "[5/13] Cleaning Nexus env from ~/.claude/settings.json..."
+SETTINGS="$USER_HOME/.claude/settings.json"
+if [ -f "$SETTINGS" ]; then
+  SETTINGS="$SETTINGS" python3 - <<'PY'
+import os, json
+path = os.environ["SETTINGS"]
+
+ENV_KEYS = {
+    "AWS_PROFILE", "AWS_REGION", "CLAUDE_CODE_USE_BEDROCK", "ANTHROPIC_MODEL",
+    "ANTHROPIC_CUSTOM_HEADERS", "CLAUDE_CODE_ENABLE_TELEMETRY", "NEXUS_ENV",
+    "AWS_CREDENTIAL_PROCESS", "ANTHROPIC_SMALL_FAST_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+}
+TOP_KEYS = {"otelHeadersHelper", "awsAuthRefresh"}
+
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+except Exception:
+    print(f"  \u2013 could not parse {path}")
+    raise SystemExit(0)
+
+removed = []
+env = cfg.get("env")
+if isinstance(env, dict):
+    for key in list(env.keys()):
+        if key in ENV_KEYS or key.startswith("OTEL_"):
+            del env[key]
+            removed.append("env." + key)
+    if not env:
+        del cfg["env"]
+
+for key in list(TOP_KEYS):
+    if key in cfg:
+        del cfg[key]
+        removed.append(key)
+
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(cfg, f, indent=2)
+    f.write("\n")
+
+if removed:
+    print(f"  \u2713 removed {len(removed)} Nexus setting(s)")
+else:
+    print("  \u2013 no Nexus settings found")
+PY
+else
+  mark_absent "$SETTINGS"
+fi
+
+# ---------------------------------------------------------------------------
+# 6. Remove Cowork config files (files only, not the whole dir)
+# ---------------------------------------------------------------------------
+echo "[6/13] Removing Cowork config files..."
+remove_file() {
+  local path="$1"
+  if [ -f "$path" ]; then
+    rm -f "$path" && mark_removed "$path" || echo "  ! failed: $path"
+  else
+    mark_absent "$path"
+  fi
+}
+remove_file "$USER_HOME/Library/Application Support/Claude-3p/managed_config.json"
+remove_file "$USER_HOME/Library/Application Support/Claude-3p/claude_desktop_config.json"
+remove_file "$USER_HOME/Library/Application Support/Claude/managed_config.json"
+
+# ---------------------------------------------------------------------------
+# 7. Remove runtime state
+# ---------------------------------------------------------------------------
+echo "[7/13] Removing runtime state..."
+remove_dir "$USER_HOME/.claude-code-session"
+
+# ---------------------------------------------------------------------------
+# 8. Google file-bridge (only with --purge and NOT --keep-tokens)
+# ---------------------------------------------------------------------------
+echo "[8/13] Google file-bridge credentials..."
+if [ "$PURGE" -eq 1 ] && [ "$KEEP_TOKENS" -ne 1 ]; then
+  remove_dir "$USER_HOME/.config/google-drive-mcp"
+  remove_file "$USER_HOME/.gdrive-server-credentials.json"
+else
+  echo "  – skipped (requires --purge and not --keep-tokens)"
+fi
+
+# ---------------------------------------------------------------------------
+# 9. Codex: remove ~/.codex only if it carries a Nexus/bedrock marker
+# ---------------------------------------------------------------------------
+echo "[9/13] Codex config..."
+CODEX_DIR="$USER_HOME/.codex"
+if [ -d "$CODEX_DIR" ]; then
+  if grep -rqiE 'nexus|claude-code-with-bedrock|bedrock' "$CODEX_DIR" 2>/dev/null; then
+    remove_dir "$CODEX_DIR"
+  else
+    echo "  – ~/.codex present but no Nexus marker; leaving intact"
+  fi
+else
+  mark_absent "$CODEX_DIR"
+fi
+
+# ---------------------------------------------------------------------------
+# 10. Managed Preferences plist (best-effort, non-fatal, needs sudo)
+# ---------------------------------------------------------------------------
+echo "[10/13] Managed Preferences plist..."
+PLIST="/Library/Managed Preferences/${CONSOLE_USER:-}/com.anthropic.claudefordesktop.plist"
+if [ -n "${CONSOLE_USER:-}" ] && [ -f "$PLIST" ]; then
+  if grep -qiE 'nexus|bedrock' "$PLIST" 2>/dev/null; then
+    echo "  (sudo) removing Nexus-managed keys from $PLIST"
+    sudo /usr/libexec/PlistBuddy -c "Delete :AWS_PROFILE" "$PLIST" 2>/dev/null || true
+    sudo /usr/libexec/PlistBuddy -c "Delete :CLAUDE_CODE_USE_BEDROCK" "$PLIST" 2>/dev/null || true
+    sudo /usr/libexec/PlistBuddy -c "Delete :NEXUS_ENV" "$PLIST" 2>/dev/null || true
+    echo "  ✓ processed $PLIST (best-effort)"
+  else
+    echo "  – plist present but no Nexus marker; leaving intact"
+  fi
+else
+  echo "  – no managed preferences plist"
+fi
+
+# ---------------------------------------------------------------------------
+# 11. --purge: remove Claude Code CLI global npm package (best-effort)
+# ---------------------------------------------------------------------------
+echo "[11/13] Claude Code CLI (npm global)..."
+if [ "$PURGE" -eq 1 ]; then
+  if command -v npm >/dev/null 2>&1; then
+    if npm uninstall -g @anthropic-ai/claude-code >/dev/null 2>&1; then
+      mark_removed "@anthropic-ai/claude-code (npm global)"
+    else
+      echo "  – @anthropic-ai/claude-code not installed or removal skipped"
+    fi
+  else
+    echo "  – npm not found; skipping CLI removal"
+  fi
+else
+  echo "  – skipped (requires --purge)"
+fi
+
+# ---------------------------------------------------------------------------
+# 12. Temp files
+# ---------------------------------------------------------------------------
+echo "[12/13] Removing temp files..."
+if ls /tmp/nexus-* >/dev/null 2>&1; then
+  rm -f /tmp/nexus-* && mark_removed "/tmp/nexus-*"
+else
+  mark_absent "/tmp/nexus-*"
+fi
+
+# ---------------------------------------------------------------------------
+# 13. Done
+# ---------------------------------------------------------------------------
+echo "[13/13] Done."
+echo
+echo "======================================"
+echo "Uninstall complete."
+echo "  ✓ = removed   – = not present"
+echo
+echo "Please restart Claude Code / Claude Cowork (Desktop) for changes to take effect."
+echo "======================================"
+exit 0
+"""
+
+        uninstaller_path = output_dir / "uninstall.sh"
+        with open(uninstaller_path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(uninstaller_content)
+        uninstaller_path.chmod(0o755)
+
+        return uninstaller_path
 
     def _create_windows_installer(self, output_dir: Path, profile) -> Path:
         """Create Windows batch installer script."""

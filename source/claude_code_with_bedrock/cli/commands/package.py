@@ -920,9 +920,62 @@ fi
 """
 
         installer_content += f"""
+# ---------------------------------------------------------------------------
+# Determine install scope (dev vs prod) and target install directory.
+# Prod installs use ~/claude-code-with-bedrock (no NEXUS_ENV in credential_process).
+# Dev installs use ~/claude-code-with-bedrock-dev and set NEXUS_ENV=dev so the two
+# can coexist without clobbering each other. Scope is taken from NEXUS_ENV in the
+# environment (default: prod).
+# ---------------------------------------------------------------------------
+if [ "${{NEXUS_ENV:-}}" = "dev" ]; then
+    NEXUS_SCOPE="dev"
+    INSTALL_DIR="$HOME/claude-code-with-bedrock-dev"
+    UNINSTALL_SCOPE_FLAG="--dev"
+else
+    NEXUS_SCOPE="prod"
+    INSTALL_DIR="$HOME/claude-code-with-bedrock"
+    UNINSTALL_SCOPE_FLAG="--prod"
+fi
+
+# ---------------------------------------------------------------------------
+# Idempotent pre-install cleanup.
+# If a previous Nexus install is detected (either scoped install dir exists, OR a
+# matching [profile] block already lives in ~/.aws/config), supersede it cleanly
+# by running the bundled uninstall.sh for the SAME scope being installed. We pass
+# --keep-tokens so server-side tokens are preserved. This removes stale dirs, the
+# old aws profile block and stale MCP/session state BEFORE writing new state.
+# Guarded so it is silent and non-fatal when uninstall.sh is not bundled.
+# ---------------------------------------------------------------------------
+PRIOR_INSTALL_DETECTED=false
+if [ -d "$HOME/claude-code-with-bedrock" ] || [ -d "$HOME/claude-code-with-bedrock-dev" ]; then
+    PRIOR_INSTALL_DETECTED=true
+fi
+if [ "$PRIOR_INSTALL_DETECTED" != "true" ] && [ -f ~/.aws/config ]; then
+    # Any profile from config.json already present?
+    for _PN in $($PYTHON -c "import json; print(' '.join(json.load(open('config.json')).keys()))" 2>/dev/null); do
+        if grep -q "^\\[profile $_PN\\]" ~/.aws/config 2>/dev/null; then
+            PRIOR_INSTALL_DETECTED=true
+            break
+        fi
+    done
+fi
+
+if [ "$PRIOR_INSTALL_DETECTED" = "true" ]; then
+    echo
+    echo "Detected a previous installation — cleaning up before reinstalling..."
+    if [ -x "$SCRIPT_DIR/uninstall.sh" ]; then
+        "$SCRIPT_DIR/uninstall.sh" --yes --keep-tokens "$UNINSTALL_SCOPE_FLAG" || true
+    elif [ -f "$SCRIPT_DIR/uninstall.sh" ]; then
+        bash "$SCRIPT_DIR/uninstall.sh" --yes --keep-tokens "$UNINSTALL_SCOPE_FLAG" || true
+    else
+        echo "  (bundled uninstall.sh not found — skipping cleanup, continuing)"
+    fi
+fi
+
 # Create directory
 echo
 echo "Installing authentication tools..."
+mkdir -p "$INSTALL_DIR"
 mkdir -p ~/claude-code-with-bedrock
 
 # Copy appropriate binary
@@ -1035,8 +1088,46 @@ fi
 for PROFILE_NAME in $PROFILES; do
     echo "Configuring AWS profile: $PROFILE_NAME"
 
-    # Remove old profile if exists
-    sed -i.bak "/\\[profile $PROFILE_NAME\\]/,/^$/d" ~/.aws/config 2>/dev/null || true
+    # Robustly remove ONLY the exact [profile <name>] INI block (if present) so we
+    # never end up with two blocks sharing the same profile name. This replaces the
+    # old naive `sed` range-delete which could clobber adjacent blocks or leave dupes.
+    # It parses ~/.aws/config as INI sections and drops just the matching section,
+    # regardless of whether the previous block was a dev or prod variant.
+    if [ -f ~/.aws/config ]; then
+        NEXUS_PROFILE_NAME="$PROFILE_NAME" $PYTHON - "$HOME/.aws/config" << 'PYEOF' || true
+import os, sys, re
+
+path = sys.argv[1]
+target = os.environ.get("NEXUS_PROFILE_NAME", "")
+header = "[profile %s]" % target
+
+with open(path, "r", encoding="utf-8") as fh:
+    lines = fh.readlines()
+
+out = []
+skip = False
+section_re = re.compile(r"^\\s*\\[")
+for line in lines:
+    stripped = line.strip()
+    if section_re.match(line):
+        # Starting a new section: skip only if it's the exact matching profile block.
+        skip = (stripped == header)
+        if skip:
+            continue
+    if skip:
+        continue
+    out.append(line)
+
+# Trim trailing blank lines so appended block stays tidy.
+while out and out[-1].strip() == "":
+    out.pop()
+
+with open(path, "w", encoding="utf-8") as fh:
+    fh.write("".join(out))
+    if out:
+        fh.write("\\n")
+PYEOF
+    fi
 
     # Get profile-specific region from config.json
     PROFILE_REGION=$($PYTHON -c "
@@ -1044,10 +1135,18 @@ import json
 print(json.load(open('config.json')).get('$PROFILE_NAME', {{}}).get('aws_region', '$DEFAULT_REGION'))
 ")
 
-    # Add new profile with --profile flag (cross-platform, no shell required)
+    # Build the credential_process line. Dev installs prefix `env NEXUS_ENV=dev` and
+    # use the -dev install dir so dev and prod never clobber each other's profile.
+    if [ "$NEXUS_SCOPE" = "dev" ]; then
+        CRED_PROCESS="env NEXUS_ENV=dev $INSTALL_DIR/credential-process --profile $PROFILE_NAME"
+    else
+        CRED_PROCESS="$INSTALL_DIR/credential-process --profile $PROFILE_NAME"
+    fi
+
+    # Add fresh profile block (guaranteed single block per name after dedupe above).
     cat >> ~/.aws/config << EOF
 [profile $PROFILE_NAME]
-credential_process = $HOME/claude-code-with-bedrock/credential-process --profile $PROFILE_NAME
+credential_process = $CRED_PROCESS
 region = $PROFILE_REGION
 EOF
     echo "  ✓ Created AWS profile '$PROFILE_NAME'"
@@ -1112,6 +1211,26 @@ if ! command -v claude &> /dev/null; then
 else
     echo "✓ Claude Code CLI already installed"
 fi
+
+# ---------------------------------------------------------------------------
+# Ownership safety net.
+# Some of the steps above (AWS CLI pkg install, npm -g install, etc.) may run under
+# sudo and can leave root-owned files inside $HOME. Reclaim ownership for the current
+# user so subsequent (non-sudo) runs and normal use are not blocked. Each chown is
+# guarded so it only runs when the path exists, and is non-fatal.
+_NEXUS_OWNER="$(id -un)"
+_NEXUS_GROUP="$(id -gn)"
+for _p in \
+    "$HOME/.npm" \
+    "$HOME/claude-code-with-bedrock" \
+    "$HOME/claude-code-with-bedrock-dev" \
+    "$HOME/.claude" \
+    "$HOME/.claude.json" \
+    "$HOME/.claude-code-session"; do
+    if [ -e "$_p" ]; then
+        chown -R "$_NEXUS_OWNER":"$_NEXUS_GROUP" "$_p" 2>/dev/null || true
+    fi
+done
 
 echo
 echo "======================================"

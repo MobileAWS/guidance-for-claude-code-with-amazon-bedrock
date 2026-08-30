@@ -924,6 +924,35 @@ fi
 """
 
         installer_content += f"""
+# -----------------------------------------------------------------------
+# Determine install scope for idempotency. This ZIP installer path targets
+# the prod install dir (~/claude-code-with-bedrock). A dev install is only
+# signalled by the NEXUS_ENV=dev marker used elsewhere in the toolchain; when
+# present the credential_process line is prefixed so dev and prod profiles do
+# not clobber each other.
+# -----------------------------------------------------------------------
+if [ "${{NEXUS_ENV:-}}" = "dev" ]; then
+    NEXUS_INSTALL_SCOPE="dev"
+else
+    NEXUS_INSTALL_SCOPE="prod"
+fi
+
+# -----------------------------------------------------------------------
+# Pre-install cleanup for idempotency. If a prior Nexus install shipped an
+# uninstall.sh, silently supersede the stale install for the SAME scope being
+# installed BEFORE we write any new state (this ZIP path is prod scope, so we
+# pass --prod). --keep-tokens guarantees server-side Nexus tokens are NEVER
+# removed. This removes stale install dir contents, the old AWS profile block,
+# and stale MCP/session state so re-running the installer is clean. Skipped
+# silently when no executable uninstall.sh is present — never fails install.
+# -----------------------------------------------------------------------
+PRIOR_UNINSTALL="$HOME/claude-code-with-bedrock/uninstall.sh"
+if [ -f "$PRIOR_UNINSTALL" ] && [ -x "$PRIOR_UNINSTALL" ]; then
+    echo
+    echo "Detected a prior install — superseding it (keeping server-side tokens)..."
+    "$PRIOR_UNINSTALL" --yes --keep-tokens --$NEXUS_INSTALL_SCOPE >/dev/null 2>&1 || true
+fi
+
 # Create directory
 echo
 echo "Installing authentication tools..."
@@ -935,6 +964,12 @@ cp "$CREDENTIAL_BINARY" ~/claude-code-with-bedrock/credential-process
 # Copy config
 cp config.json ~/claude-code-with-bedrock/
 chmod +x ~/claude-code-with-bedrock/credential-process
+
+# Copy the bundled uninstaller into the install dir so users can always find
+# it at ~/claude-code-with-bedrock/uninstall.sh. Best-effort: never fail the
+# install if the bundle did not ship an uninstall.sh.
+cp "$SCRIPT_DIR/uninstall.sh" ~/claude-code-with-bedrock/uninstall.sh 2>/dev/null || true
+chmod +x ~/claude-code-with-bedrock/uninstall.sh 2>/dev/null || true
 
 # macOS Gatekeeper + Keychain notices
 if [[ "$OSTYPE" == "darwin"* ]]; then
@@ -1039,21 +1074,71 @@ fi
 for PROFILE_NAME in $PROFILES; do
     echo "Configuring AWS profile: $PROFILE_NAME"
 
-    # Remove old profile if exists
-    sed -i.bak "/\\[profile $PROFILE_NAME\\]/,/^$/d" ~/.aws/config 2>/dev/null || true
-
     # Get profile-specific region from config.json
     PROFILE_REGION=$($PYTHON -c "
 import json
 print(json.load(open('config.json')).get('$PROFILE_NAME', {{}}).get('aws_region', '$DEFAULT_REGION'))
 ")
 
-    # Add new profile with --profile flag (cross-platform, no shell required)
-    cat >> ~/.aws/config << EOF
-[profile $PROFILE_NAME]
-credential_process = $HOME/claude-code-with-bedrock/credential-process --profile $PROFILE_NAME
-region = $PROFILE_REGION
-EOF
+    # Dev/prod coexistence: a dev install prefixes the credential_process
+    # command with 'env NEXUS_ENV=dev' so its profile does not clobber a prod
+    # profile of the same name; prod uses no prefix. The dedupe below replaces
+    # any existing block with the SAME profile name.
+    if [ "$NEXUS_INSTALL_SCOPE" = "dev" ]; then
+        CREDENTIAL_PROCESS_CMD="env NEXUS_ENV=dev $HOME/claude-code-with-bedrock/credential-process --profile $PROFILE_NAME"
+    else
+        CREDENTIAL_PROCESS_CMD="$HOME/claude-code-with-bedrock/credential-process --profile $PROFILE_NAME"
+    fi
+
+    # Robust dedupe: remove ONLY the existing [profile <name>] block matching
+    # this profile name (preserving all other profiles and comments), then
+    # append a single fresh block. Uses the same section-splitting approach as
+    # the uninstaller's PYAWS block so exactly ONE block per profile results.
+    AWS_CONFIG_FILE="$HOME/.aws/config"
+    touch "$AWS_CONFIG_FILE"
+    "$PYTHON" - "$AWS_CONFIG_FILE" "$PROFILE_NAME" "$CREDENTIAL_PROCESS_CMD" "$PROFILE_REGION" <<'PYPROFILE'
+import re, sys
+path, profile_name, cred_cmd, region = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+except FileNotFoundError:
+    lines = []
+
+# Split into blocks headed by a [section] line, keeping any preamble.
+sections = []
+current = {{"header": None, "lines": []}}
+header_re = re.compile(r"^\\s*\\[")
+for line in lines:
+    if header_re.match(line):
+        sections.append(current)
+        current = {{"header": line, "lines": [line]}}
+    else:
+        current["lines"].append(line)
+sections.append(current)
+
+# Match the [profile <name>] section for exactly this profile name (dedupe).
+target_re = re.compile(r"^\\s*\\[profile\\s+" + re.escape(profile_name) + r"\\s*\\]\\s*$")
+
+out = []
+for sec in sections:
+    if sec["header"] and target_re.match(sec["header"]):
+        continue  # drop the existing block for this profile name
+    out.append("".join(sec["lines"]))
+
+body = "".join(out)
+# Normalise trailing whitespace so we append cleanly with one blank separator.
+body = body.rstrip("\\n")
+block = "[profile %s]\\ncredential_process = %s\\nregion = %s\\n" % (profile_name, cred_cmd, region)
+if body:
+    new_content = body + "\\n\\n" + block
+else:
+    new_content = block
+
+with open(path, "w", encoding="utf-8") as f:
+    f.write(new_content)
+PYPROFILE
     echo "  ✓ Created AWS profile '$PROFILE_NAME'"
 done
 
@@ -1173,6 +1258,38 @@ else
     fi
 fi
 rm -f /tmp/claude-code-launcher
+
+# -----------------------------------------------------------------------
+# Ownership safety net. Some steps above may run under elevated privileges
+# (e.g. sudo for the launcher or package managers), which can leave freshly
+# created files root-owned. When running elevated, restore ownership of the
+# install dir and the user's Claude state to the invoking (non-root) user so
+# subsequent, non-elevated runs of Claude Code can read/write them. We only
+# touch the install dir, ~/.claude and ~/.claude.json — never Node.js or the
+# user's global npm packages beyond ownership.
+# -----------------------------------------------------------------------
+if [ "$(id -u)" = "0" ]; then
+    # Resolve the invoking (non-root) user and their HOME.
+    OWNER_USER=""
+    OWNER_HOME=""
+    if [ "$(uname)" = "Darwin" ]; then
+        CONSOLE_USER="$(stat -f%Su /dev/console 2>/dev/null || true)"
+        if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ]; then
+            OWNER_USER="$CONSOLE_USER"
+            OWNER_HOME="$(dscl . -read /Users/"$OWNER_USER" NFSHomeDirectory 2>/dev/null | awk '{{print $2}}')"
+            [ -z "$OWNER_HOME" ] && OWNER_HOME="/Users/$OWNER_USER"
+        fi
+    elif [ -n "${{SUDO_USER:-}}" ] && [ "$SUDO_USER" != "root" ]; then
+        OWNER_USER="$SUDO_USER"
+        OWNER_HOME="$(eval echo ~"$SUDO_USER")"
+    fi
+
+    if [ -n "$OWNER_USER" ] && [ -n "$OWNER_HOME" ]; then
+        chown -R "$OWNER_USER" "$OWNER_HOME/claude-code-with-bedrock" 2>/dev/null || true
+        [ -d "$OWNER_HOME/.claude" ] && chown -R "$OWNER_USER" "$OWNER_HOME/.claude" 2>/dev/null || true
+        [ -f "$OWNER_HOME/.claude.json" ] && chown "$OWNER_USER" "$OWNER_HOME/.claude.json" 2>/dev/null || true
+    fi
+fi
 
 echo
 echo "======================================"
@@ -1859,6 +1976,10 @@ REM older ccwb auth logout) would shadow credential_process and break Cowork
 REM Desktop with a 403 InvalidClientTokenId.
 powershell -NoProfile -Command "$ErrorActionPreference = 'Stop'; $awsCreds = Join-Path $env:USERPROFILE '.aws\\credentials'; if (Test-Path $awsCreds) {{ $cfg = Get-Content config.json | ConvertFrom-Json; $existing = Get-Content $awsCreds -Raw; foreach ($p in $cfg.PSObject.Properties.Name) {{ $pattern = '(?ms)^\\[' + [regex]::Escape($p) + '\\].*?(?=^\\[|\\Z)'; $existing = [regex]::Replace($existing, $pattern, '') }}; Set-Content -Path $awsCreds -Value $existing.TrimStart() -NoNewline -Encoding ASCII }}"
 
+REM Idempotency: before appending each profile stanza we first strip any
+REM existing [profile <name>] block for the same name from %USERPROFILE%\\.aws\\config
+REM via [regex]::Replace, so re-running this installer always yields exactly ONE
+REM block per profile (no duplicates on repeat installs).
 powershell -NoProfile -Command "$ErrorActionPreference = 'Stop'; $nl = [char]13 + [char]10; $cfg = Get-Content config.json | ConvertFrom-Json; $awsConfig = Join-Path $env:USERPROFILE '.aws\\config'; $credProcess = Join-Path $env:USERPROFILE 'claude-code-with-bedrock\\credential-process.exe'; $existing = if (Test-Path $awsConfig) {{ Get-Content $awsConfig -Raw }} else {{ '' }}; foreach ($p in $cfg.PSObject.Properties.Name) {{ $region = $cfg.$p.aws_region; if (-not $region) {{ $region = '{profile.aws_region}' }}; $pattern = '(?ms)^\\[profile ' + [regex]::Escape($p) + '\\].*?(?=^\\[|\\Z)'; $existing = [regex]::Replace($existing, $pattern, ''); $stanza = '[profile ' + $p + ']' + $nl + 'credential_process = ' + $credProcess + ' --profile ' + $p + $nl + 'region = ' + $region + $nl; $existing = $existing.TrimEnd() + $nl + $nl + $stanza; Write-Host ('  OK Configured AWS profile ' + $p) }}; Set-Content -Path $awsConfig -Value $existing.TrimStart() -NoNewline -Encoding ASCII"
 if %errorlevel% neq 0 (
     echo ERROR: Failed to configure AWS profiles
@@ -1921,7 +2042,7 @@ REM as a permanent user environment variable.  When the file is absent the
 REM block is silently skipped.
 REM -----------------------------------------------------------------------
 if exist "codex-config.json" (
-    powershell -NoProfile -Command "$ErrorActionPreference = 'Stop'; $cfg = Get-Content 'codex-config.json' | ConvertFrom-Json; $apiKey = $cfg.codex_api_key; $provider = if ($cfg.model_provider) {{ $cfg.model_provider }} else {{ 'amazon-bedrock' }}; if ($apiKey) {{ $codexDir = Join-Path $env:USERPROFILE '.codex'; if (-not (Test-Path $codexDir)) {{ New-Item -ItemType Directory -Path $codexDir | Out-Null }}; $toml = \"model_provider = `\"amazon-bedrock`\"`r`nbedrock_api_key = `\"$apiKey`\"\"; Set-Content -Path (Join-Path $codexDir 'config.toml') -Value $toml -Encoding UTF8; [System.Environment]::SetEnvironmentVariable('AWS_BEARER_TOKEN_BEDROCK', $apiKey, 'User'); Write-Host '✓ Codex configuration installed' }}"
+    powershell -NoProfile -Command "$ErrorActionPreference = 'Stop'; $cfg = Get-Content 'codex-config.json' | ConvertFrom-Json; $apiKey = $cfg.codex_api_key; $provider = if ($cfg.model_provider) {{ $cfg.model_provider }} else {{ 'amazon-bedrock' }}; if ($apiKey) {{ $codexDir = Join-Path $env:USERPROFILE '.codex'; if (-not (Test-Path $codexDir)) {{ New-Item -ItemType Directory -Path $codexDir | Out-Null }}; $toml = \"model_provider = `\"amazon-bedrock`\"`r`nbedrock_api_key = `\"$apiKey`\"\"; Set-Content -Path (Join-Path $codexDir 'config.toml') -Value $toml -Encoding UTF8; if ([System.Environment]::GetEnvironmentVariable('AWS_BEARER_TOKEN_BEDROCK', 'User') -ne $apiKey) {{ [System.Environment]::SetEnvironmentVariable('AWS_BEARER_TOKEN_BEDROCK', $apiKey, 'User') }}; Write-Host '✓ Codex configuration installed' }}"
 )
 
 pause

@@ -439,6 +439,14 @@ Resources:
                     metric_name_selectors: ["claude_code.cost.usage", "claude_code.token.usage"]
                   - dimensions: [[type, OTelLib]]
                     metric_name_selectors: ["claude_code.token.usage", "claude_code.lines_of_code.count"]
+                  # Cowork (Claude Desktop 3P) accuracy: emit token usage broken down by BOTH
+                  # token type AND deployment mode, so Cowork (claude.deployment_mode=3p) input+
+                  # output tokens can be queried in isolation and match Cowork's own UI. Without
+                  # this combined dimension, CloudWatch flattens type and deployment_mode into
+                  # separate streams that cannot be cross-filtered, making Cowork's billable
+                  # (input+output, cache-excluded) token count unrecoverable from the dashboard.
+                  - dimensions: [[type, claude.deployment_mode, OTelLib], [claude.deployment_mode, OTelLib]]
+                    metric_name_selectors: ["claude_code.token.usage", "claude_code.cost.usage"]
                   - dimensions: [[tool_name, OTelLib]]
                     metric_name_selectors: ["claude_code.code_edit_tool.*"]
                   - dimensions: [[language, OTelLib]]

@@ -1001,6 +1001,34 @@ func nexusDistBase() string {
 // minimal PATH that lacks Homebrew, so bare "npx" in an MCP config fails to launch and
 // the server shows as disconnected. Writing the absolute path makes MCPs PATH-independent.
 // Returns "npx" as a last resort so behavior is never worse than before.
+// dirExists reports whether path exists and is a directory.
+func dirExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
+}
+
+// resolveUvxPath returns an absolute path to `uvx`, searching common install
+// locations, so uvx-based MCPs (workspace-mcp for gmail/google) launch even when
+// the host app spawns them with a minimal PATH. Falls back to "uvx" if not found.
+func resolveUvxPath() string {
+	if p, err := exec.LookPath("uvx"); err == nil && p != "" {
+		return p
+	}
+	home, _ := os.UserHomeDir()
+	candidates := []string{
+		filepath.Join(home, ".local", "bin", "uvx"),
+		"/opt/homebrew/bin/uvx",
+		"/usr/local/bin/uvx",
+		filepath.Join(home, ".cargo", "bin", "uvx"),
+	}
+	for _, c := range candidates {
+		if info, err := os.Stat(c); err == nil && !info.IsDir() {
+			return c
+		}
+	}
+	return "uvx"
+}
+
 func resolveNpxPath() string {
 	// 1. Already on PATH?
 	if p, err := exec.LookPath("npx"); err == nil && p != "" {
@@ -1258,7 +1286,8 @@ func syncMcpServers(profile string) {
 		knownNexusManaged := []string{
 			"github", "slack", "hubspot", "activecampaign", "zapier", "nexus-factory",
 			"web-search", "partner-central", "atlassian", "jira",
-			"google-drive", "google-docs", "google-slides", "google-workspace", "google-docs-&-slides",
+			"google-drive", "google-docs", "google-slides", "google-workspace",
+			"google-docs-&-slides", "google-docs-and-slides", "google_calendar", "gmail",
 		}
 		for _, n := range knownNexusManaged {
 			prevManaged[n] = true
@@ -1310,6 +1339,7 @@ func syncMcpServers(profile string) {
 	// Resolve npx to an absolute path so MCP servers launch even when Claude Code has a
 	// minimal PATH (a common cause of "all MCPs disconnected").
 	npxPath := resolveNpxPath()
+	uvxPath := resolveUvxPath()
 	launchPath := mcpLaunchPath()
 	claudeMcps := make(map[string]interface{})
 	for name, config := range mcps {
@@ -1320,6 +1350,9 @@ func syncMcpServers(profile string) {
 		cmd, _ := cfgMap["command"].(string)
 		if cmd == "npx" {
 			cmd = npxPath
+		}
+		if cmd == "uvx" {
+			cmd = uvxPath
 		}
 
 		// HTTP-type MCPs (e.g., Partner Central) — use native HTTP transport
@@ -1399,6 +1432,87 @@ func syncMcpServers(profile string) {
 	claudeJson["mcpServers"] = existingMcps
 	if claudeData, err := json.MarshalIndent(claudeJson, "", "  "); err == nil {
 		os.WriteFile(claudeJsonPath, claudeData, 0600)
+	}
+
+	// Cowork parity: Claude Desktop 3P (Bedrock) reads MCPs from
+	// ~/Library/Application Support/Claude-3p/claude_desktop_config.json. Historically the
+	// token sync only injected tokens into whatever MCPs were already there at install time,
+	// so Cowork was stuck with a stale list (missing jira/gmail, bare "npx" that fails to
+	// launch under Cowork's minimal PATH). Write the SAME reconciled, absolute-path MCP list
+	// (claudeMcps) here so Cowork gets the full managed set, launchable, with reconciliation.
+	if coworkDir := filepath.Join(home, "Library", "Application Support", "Claude-3p"); dirExists(coworkDir) {
+		coworkCfgPath := filepath.Join(coworkDir, "claude_desktop_config.json")
+		var coworkCfg map[string]interface{}
+		if data, err := os.ReadFile(coworkCfgPath); err == nil {
+			json.Unmarshal(data, &coworkCfg)
+		}
+		if coworkCfg == nil {
+			coworkCfg = make(map[string]interface{})
+		}
+		coworkMcps, _ := coworkCfg["mcpServers"].(map[string]interface{})
+		if coworkMcps == nil {
+			coworkMcps = make(map[string]interface{})
+		}
+		for name, config := range claudeMcps {
+			newConfig, _ := config.(map[string]interface{})
+			if newConfig == nil {
+				continue
+			}
+			// Claude Desktop (Cowork) does NOT support native `type: http` remote MCPs the
+			// way Claude Code does — it only launches stdio servers. Convert HTTP MCPs to the
+			// universally-supported `npx mcp-remote <url>` stdio proxy form (same pattern the
+			// web-search MCP already uses). Without this, Cowork rejects them as "not valid
+			// MCP server configurations".
+			if t, _ := newConfig["type"].(string); t == "http" {
+				url, _ := newConfig["url"].(string)
+				if url == "" {
+					continue
+				}
+				// Pin mcp-remote to a fixed version so its OAuth token cache (~/.mcp-auth,
+				// which is version-keyed) stays stable across launches. Without pinning, npx
+				// could resolve a newer mcp-remote, land in a fresh empty cache dir, and force
+				// a re-auth (browser popup) on every launch. Pinning = "auth once, reuse".
+				remoteArgs := []interface{}{"-y", "mcp-remote@0.8.3", url}
+				// Carry through an auth header as an mcp-remote --header arg, if present.
+				if hdrs, ok := newConfig["headers"].(map[string]interface{}); ok {
+					for hk, hv := range hdrs {
+						if hvs, ok := hv.(string); ok {
+							remoteArgs = append(remoteArgs, "--header", fmt.Sprintf("%s:%s", hk, hvs))
+						}
+					}
+				}
+				newConfig = map[string]interface{}{
+					"type":    "stdio",
+					"command": npxPath,
+					"args":    remoteArgs,
+					"env":     map[string]interface{}{"PATH": launchPath},
+				}
+			}
+			// Preserve any existing tokens already injected into Cowork's copy.
+			if existingConfig, ok := coworkMcps[name].(map[string]interface{}); ok {
+				if existingEnv, ok := existingConfig["env"].(map[string]interface{}); ok && len(existingEnv) > 0 {
+					newEnv, _ := newConfig["env"].(map[string]interface{})
+					if newEnv == nil {
+						newEnv = make(map[string]interface{})
+					}
+					for k, v := range existingEnv {
+						if _, exists := newEnv[k]; !exists {
+							newEnv[k] = v
+						}
+					}
+					newConfig["env"] = newEnv
+				}
+			}
+			coworkMcps[name] = newConfig
+		}
+		// Reconcile: drop MCPs the admin disabled/deleted, same as Claude Code.
+		for name := range toRemove {
+			delete(coworkMcps, name)
+		}
+		coworkCfg["mcpServers"] = coworkMcps
+		if coworkData, err := json.MarshalIndent(coworkCfg, "", "  "); err == nil {
+			os.WriteFile(coworkCfgPath, coworkData, 0600)
+		}
 	}
 
 	// Persist the current managed set so the next sync can compute removals.
@@ -2286,14 +2400,25 @@ func syncManagedConfig(profile string) {
 	}
 
 	// Write updated managed_config.json
-	// Inject per-user otlpHeaders for Cowork telemetry attribution
+	// Inject per-user otlpHeaders for Cowork telemetry attribution.
+	// Cowork expects otlpHeaders as a JSON-encoded object string (same format upstream uses
+	// for X-Cowork-Token), NOT a "key=value" string. The collector reads the x-user-email
+	// header via metadata.x-user-email and upserts it as the user.email attribute, enabling
+	// per-user Cowork attribution in the dashboard/user views.
 	otelFiles, _ := filepath.Glob(filepath.Join(home, ".claude-code-session", "*-otel-headers.raw"))
 	for _, of := range otelFiles {
 		if data, err := os.ReadFile(of); err == nil {
 			var otelHeaders map[string]interface{}
 			if json.Unmarshal(data, &otelHeaders) == nil {
 				if email, ok := otelHeaders["x-user-email"].(string); ok && email != "" {
-					localConfig["otlpHeaders"] = fmt.Sprintf("x-user-email=%s", email)
+					if hj, err := json.Marshal(map[string]string{"x-user-email": email}); err == nil {
+						localConfig["otlpHeaders"] = string(hj)
+					}
+					// Record the OS-user -> email mapping so Cowork telemetry (which emits
+					// enduser.id = OS username, not email) can be attributed per-user. Runs on
+					// the cached sync path too (not just full auth), so any Cowork user gets
+					// mapped without needing a fresh browser login. Throttled to once/day.
+					go reportOsUserMapping(email)
 					break
 				}
 			}
@@ -2385,8 +2510,8 @@ func syncManagedConfig(profile string) {
 				}
 			}
 			if userEmail != "" {
-				headers := fmt.Sprintf("x-user-email=%s", userEmail)
-				exec.Command("plutil", "-replace", "otlpHeaders", "-string", headers, plistPath).Run()
+				hj, _ := json.Marshal(map[string]string{"x-user-email": userEmail})
+				exec.Command("plutil", "-replace", "otlpHeaders", "-string", string(hj), plistPath).Run()
 			}
 		}
 	}
@@ -2421,8 +2546,8 @@ func syncManagedConfig(profile string) {
 			}
 		}
 		if userEmail != "" {
-			hdrs := fmt.Sprintf("x-user-email=%s", userEmail)
-			exec.Command("reg", "add", regPath, "/v", "otlpHeaders", "/t", "REG_SZ", "/d", hdrs, "/f").Run()
+			hj, _ := json.Marshal(map[string]string{"x-user-email": userEmail})
+			exec.Command("reg", "add", regPath, "/v", "otlpHeaders", "/t", "REG_SZ", "/d", string(hj), "/f").Run()
 		}
 	}
 
@@ -2431,6 +2556,49 @@ func syncManagedConfig(profile string) {
 	os.WriteFile(cachePath, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0600)
 }
 
+
+// reportOsUserMapping records the OS-username -> authenticated-email mapping on the backend so
+// Cowork telemetry (which emits enduser.id = OS username, not email) can be attributed per-user.
+// Best-effort, throttled to once per day. No browser auth needed — runs on the cached sync path.
+func reportOsUserMapping(email string) {
+	if email == "" {
+		return
+	}
+	u, err := user.Current()
+	if err != nil || u == nil || u.Username == "" {
+		return
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	// Throttle: once per day.
+	cachePath := filepath.Join(home, ".claude-code-session", "osuser-map-ts")
+	if data, err := os.ReadFile(cachePath); err == nil {
+		if ts, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64); err == nil {
+			if time.Now().Unix()-ts < 86400 {
+				return
+			}
+		}
+	}
+	body, _ := json.Marshal(map[string]string{
+		"email":    email,
+		"platform": runtime.GOOS,
+		"arch":     runtime.GOARCH,
+		"tool":     "cowork",
+		"os_user":  u.Username,
+	})
+	client := &http.Client{Timeout: 3 * time.Second}
+	req, _ := http.NewRequest("POST", nexusAPIBase()+"/api/users/platform", bytes.NewReader(body))
+	if req != nil {
+		req.Header.Set("Content-Type", "application/json")
+		if resp, err := client.Do(req); err == nil && resp != nil {
+			resp.Body.Close()
+			os.MkdirAll(filepath.Dir(cachePath), 0700)
+			os.WriteFile(cachePath, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0600)
+		}
+	}
+}
 
 // reportPlatform sends the user's OS/arch/tool info to the Nexus API for the Users page Platform column.
 func reportPlatform(idToken string) {
@@ -2452,15 +2620,24 @@ func reportPlatform(idToken string) {
 		return
 	}
 
+	// Include the OS username so the backend can map Cowork telemetry (which emits
+	// enduser.id = OS username, NOT email) back to this authenticated email. This is a
+	// ground-truth mapping recorded on the machine where both values are known — no guessing.
+	osUser := ""
+	if u, err := user.Current(); err == nil && u != nil {
+		osUser = u.Username
+	}
+
 	body, _ := json.Marshal(map[string]string{
 		"email":    email,
 		"platform": runtime.GOOS,
 		"arch":     runtime.GOARCH,
 		"tool":     "claude-code",
+		"os_user":  osUser,
 	})
 
 	client := &http.Client{Timeout: 3 * time.Second}
-	req, _ := http.NewRequest("POST", "https://dtxfifv2cj.execute-api.us-east-1.amazonaws.com/api/users/platform", bytes.NewReader(body))
+	req, _ := http.NewRequest("POST", nexusAPIBase()+"/api/users/platform", bytes.NewReader(body))
 	if req != nil {
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+idToken)

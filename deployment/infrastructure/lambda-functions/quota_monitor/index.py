@@ -65,7 +65,7 @@ def _promql_query(query, time_param=None):
     return result["data"].get("result", [])
 
 
-AGGREGATION_WINDOW = 900  # 15 minutes in seconds (matches EventBridge schedule)
+AGGREGATION_WINDOW = 120  # 2 minutes in seconds (matches EventBridge schedule)
 
 
 def fetch_usage_from_promql():
@@ -80,6 +80,11 @@ def fetch_usage_from_promql():
     # Delta token type breakdown per user
     type_results = _promql_query(
         f'sum by ("user.email", type)(increase({{"claude_code.token.usage"}}[{window}s]))'
+    )
+
+    # Delta token breakdown per user per model (input/output only, matches billable definition)
+    model_results = _promql_query(
+        f'sum by ("user.email", "model", type)(increase({{"claude_code.token.usage"}}[{window}s]))'
     )
 
     users = {}
@@ -102,6 +107,16 @@ def fetch_usage_from_promql():
             elif token_type in ("cache_read", "cacheRead"):
                 u["cache_tokens"] = val
 
+    for r in model_results:
+        email = r["metric"].get("user.email", "")
+        model = r["metric"].get("model", "")
+        token_type = r["metric"].get("type", "")
+        val = float(r["value"][1])
+        if email and model and val > 0 and token_type in ("input", "output"):
+            u = users.setdefault(email, {})
+            by_model = u.setdefault("by_model", {})
+            by_model[model] = by_model.get(model, 0) + val
+
     print(f"Fetched delta usage for {len(users)} users from PromQL ({window}s window)")
     return users
 
@@ -117,6 +132,8 @@ def update_quota_metrics(usage_data):
         delta = usage.get("total_tokens", 0)
         if delta <= 0:
             continue
+        # Daily tokens = input + output only (exclude cache for consistent display)
+        daily_delta = int(usage.get("input_tokens", 0)) + int(usage.get("output_tokens", 0))
         try:
             # Check if daily_date changed (new day = reset daily counter)
             response = quota_table.get_item(Key={"pk": f"USER#{email}", "sk": f"MONTH#{current_month}"})
@@ -125,9 +142,9 @@ def update_quota_metrics(usage_data):
 
             update_expr = "ADD total_tokens :delta, input_tokens :inp, output_tokens :out, cache_tokens :cache"
             if daily_reset:
-                update_expr += " SET daily_tokens = :delta, daily_date = :date, last_updated = :ts, #ttl = :ttl, email = :email"
+                update_expr += " SET daily_tokens = :daily, daily_date = :date, last_updated = :ts, #ttl = :ttl, email = :email"
             else:
-                update_expr += ", daily_tokens :delta SET last_updated = :ts, #ttl = :ttl, email = :email"
+                update_expr += ", daily_tokens :daily SET last_updated = :ts, #ttl = :ttl, email = :email"
 
             quota_table.update_item(
                 Key={"pk": f"USER#{email}", "sk": f"MONTH#{current_month}"},
@@ -135,6 +152,7 @@ def update_quota_metrics(usage_data):
                 ExpressionAttributeNames={"#ttl": "ttl"},
                 ExpressionAttributeValues={
                     ":delta": Decimal(str(int(delta))),
+                    ":daily": Decimal(str(int(daily_delta))),
                     ":inp": Decimal(str(int(usage.get("input_tokens", 0)))),
                     ":out": Decimal(str(int(usage.get("output_tokens", 0)))),
                     ":cache": Decimal(str(int(usage.get("cache_tokens", 0)))),
@@ -146,6 +164,25 @@ def update_quota_metrics(usage_data):
             )
         except Exception as e:
             print(f"Error updating quota for {email}: {e}")
+
+        for model, model_delta in usage.get("by_model", {}).items():
+            if model_delta <= 0:
+                continue
+            try:
+                quota_table.update_item(
+                    Key={"pk": f"USER#{email}", "sk": f"MONTH#{current_month}#MODEL#{model}"},
+                    UpdateExpression="ADD tokens :delta SET last_updated = :ts, #ttl = :ttl, email = :email, model = :model",
+                    ExpressionAttributeNames={"#ttl": "ttl"},
+                    ExpressionAttributeValues={
+                        ":delta": Decimal(str(int(model_delta))),
+                        ":ts": now.isoformat().replace("+00:00", "Z"),
+                        ":ttl": ttl,
+                        ":email": email,
+                        ":model": model,
+                    },
+                )
+            except Exception as e:
+                print(f"Error updating per-model quota for {email}/{model}: {e}")
 
     print(f"Updated UserQuotaMetrics for {len(usage_data)} users")
 

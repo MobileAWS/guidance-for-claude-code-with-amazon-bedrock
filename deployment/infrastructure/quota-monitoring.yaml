@@ -229,13 +229,13 @@ Resources:
           METRICS_REGION: !Ref 'AWS::Region'
       Code: ./lambda-functions/quota_monitor/
 
-  # EventBridge Rule to run quota monitor every 15 minutes
+  # EventBridge Rule to run quota monitor every 2 minutes
   QuotaMonitorScheduleRule:
     Type: AWS::Events::Rule
     Properties:
       Name: claude-code-quota-monitor-schedule
-      Description: Trigger quota monitoring every 15 minutes
-      ScheduleExpression: rate(15 minutes)
+      Description: Trigger quota monitoring every 2 minutes
+      ScheduleExpression: rate(2 minutes)
       State: ENABLED
       Targets:
         - Arn: !GetAtt QuotaMonitorFunction.Arn

@@ -972,8 +972,92 @@ func nexusAPIBase() string {
 	if override := strings.TrimRight(strings.TrimSpace(os.Getenv("CCWB_NEXUS_API_BASE")), "/"); override != "" {
 		return override
 	}
+	// Dev installs hit the dev API Gateway; prod hits the prod one.
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("NEXUS_ENV")), "dev") {
+		return "https://5ws93rfch3.execute-api.us-east-1.amazonaws.com"
+	}
 	// Inline the default so this file has no import cycle with internal/nexus.
 	return "https://dtxfifv2cj.execute-api.us-east-1.amazonaws.com"
+}
+
+// nexusCoworkPrefix returns the S3 key prefix for config artifacts (MCP lists, cowork
+// configs, skills, version file, binaries). When NEXUS_ENV=dev, dev artifacts live under
+// "cowork/dev/" so a dev install never reads or overwrites the prod files that real users
+// download. Defaults to prod ("cowork/").
+func nexusCoworkPrefix() string {
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("NEXUS_ENV")), "dev") {
+		return "cowork/dev/"
+	}
+	return "cowork/"
+}
+
+// nexusDistBase returns the base URL of the S3 distribution bucket (without trailing slash).
+func nexusDistBase() string {
+	return "https://claude-code-auth-distribution-916587687563.s3.amazonaws.com"
+}
+
+// resolveNpxPath returns an absolute path to `npx`, searching the common install
+// locations (Homebrew, Volta, nvm, system). Claude Code may spawn MCP servers with a
+// minimal PATH that lacks Homebrew, so bare "npx" in an MCP config fails to launch and
+// the server shows as disconnected. Writing the absolute path makes MCPs PATH-independent.
+// Returns "npx" as a last resort so behavior is never worse than before.
+func resolveNpxPath() string {
+	// 1. Already on PATH?
+	if p, err := exec.LookPath("npx"); err == nil && p != "" {
+		return p
+	}
+	// 2. Common absolute locations.
+	home, _ := os.UserHomeDir()
+	candidates := []string{
+		"/opt/homebrew/bin/npx",             // Apple Silicon Homebrew
+		"/usr/local/bin/npx",                // Intel Homebrew / system
+		filepath.Join(home, ".volta/bin/npx"),
+		filepath.Join(home, ".local/bin/npx"),
+		"/usr/bin/npx",
+	}
+	// nvm: newest version dir under ~/.nvm/versions/node/*/bin/npx
+	if matches, _ := filepath.Glob(filepath.Join(home, ".nvm/versions/node/*/bin/npx")); len(matches) > 0 {
+		candidates = append(candidates, matches[len(matches)-1])
+	}
+	for _, c := range candidates {
+		if fi, err := os.Stat(c); err == nil && !fi.IsDir() {
+			return c
+		}
+	}
+	return "npx"
+}
+
+// mcpLaunchPath returns a PATH value that includes the directory containing node/npx plus
+// the common bin dirs. Claude Code may spawn MCP servers with a minimal PATH (e.g. just
+// /usr/bin:/bin), and npx is a node script — so without node's dir on PATH the server
+// fails with "env: node: No such file or directory". Injecting this PATH into each MCP's
+// env makes stdio MCP servers launch reliably regardless of how Claude Code was started.
+func mcpLaunchPath() string {
+	dirs := []string{}
+	seen := map[string]bool{}
+	add := func(d string) {
+		if d != "" && !seen[d] {
+			if fi, err := os.Stat(d); err == nil && fi.IsDir() {
+				dirs = append(dirs, d)
+				seen[d] = true
+			}
+		}
+	}
+	// Directory of the resolved npx (where node usually lives too).
+	if p := resolveNpxPath(); p != "npx" {
+		add(filepath.Dir(p))
+	}
+	home, _ := os.UserHomeDir()
+	add("/opt/homebrew/bin")
+	add("/usr/local/bin")
+	add(filepath.Join(home, ".volta/bin"))
+	add(filepath.Join(home, ".local/bin"))
+	if matches, _ := filepath.Glob(filepath.Join(home, ".nvm/versions/node/*/bin")); len(matches) > 0 {
+		add(matches[len(matches)-1])
+	}
+	// Always keep the base system dirs.
+	dirs = append(dirs, "/usr/bin", "/bin", "/usr/sbin", "/sbin")
+	return strings.Join(dirs, ":")
 }
 
 // resolveShellProfile returns the path of the shell profile file to update.
@@ -1039,6 +1123,62 @@ func updateShellProfileEnv(profilePath, key, value string) {
 	os.WriteFile(profilePath, []byte(newContent), 0644)
 }
 
+// computeMcpRemovals returns the set of MCP keys to remove from a user's config:
+// those that Nexus previously managed but that are no longer in the current managed set
+// (i.e. the admin disabled or deleted them). User-added MCPs are never in prevManaged,
+// so they are never returned here.
+func computeMcpRemovals(prevManaged, newManaged map[string]bool) map[string]bool {
+	toRemove := map[string]bool{}
+	for name := range prevManaged {
+		if !newManaged[name] {
+			toRemove[name] = true
+		}
+	}
+	return toRemove
+}
+
+// reconcileMcpServers applies the managed set to an existing mcpServers map:
+//   - adds/updates every MCP in `managed` (preserving existing env vars, e.g. injected tokens)
+//   - removes every key in `toRemove` (admin-disabled managed MCPs)
+//   - leaves any other key untouched (user-added MCPs)
+//
+// skipHTTP=true drops __http__ MCPs (used for settings.json, which can't host HTTP MCPs).
+// It returns the updated map. This is pure (no I/O) so it can be unit-tested.
+func reconcileMcpServers(existing, managed map[string]interface{}, toRemove map[string]bool, skipHTTP bool) map[string]interface{} {
+	if existing == nil {
+		existing = make(map[string]interface{})
+	}
+	for name, config := range managed {
+		newConfig, _ := config.(map[string]interface{})
+		if newConfig != nil && skipHTTP {
+			if cmd, _ := newConfig["command"].(string); cmd == "__http__" {
+				continue
+			}
+		}
+		// Preserve env vars from the existing config that aren't in the new config
+		// (integration tokens get injected into env between syncs).
+		if existingConfig, ok := existing[name].(map[string]interface{}); ok && newConfig != nil {
+			if existingEnv, ok := existingConfig["env"].(map[string]interface{}); ok && len(existingEnv) > 0 {
+				newEnv, _ := newConfig["env"].(map[string]interface{})
+				if newEnv == nil {
+					newEnv = make(map[string]interface{})
+				}
+				for k, v := range existingEnv {
+					if _, exists := newEnv[k]; !exists {
+						newEnv[k] = v
+					}
+				}
+				newConfig["env"] = newEnv
+			}
+		}
+		existing[name] = config
+	}
+	for name := range toRemove {
+		delete(existing, name)
+	}
+	return existing
+}
+
 func syncMcpServers(profile string) {
 	// Fetch MCP config from S3 and merge into ~/.claude/settings.json AND ~/.claude.json
 	// Non-blocking, best effort — failures are silent
@@ -1070,16 +1210,18 @@ func syncMcpServers(profile string) {
 		}
 	}
 
-	// Fetch MCPs from S3 (org-specific, falls back to allcode)
+	// Fetch MCPs from S3 (org-specific, falls back to allcode). Env-aware prefix so a
+	// dev install reads cowork/dev/... and never the prod files real users download.
 	client := &http.Client{Timeout: 3 * time.Second}
-	mcpURL := fmt.Sprintf("https://claude-code-auth-distribution-916587687563.s3.amazonaws.com/cowork/org-%s-mcps.json", orgID)
+	prefix := nexusCoworkPrefix()
+	mcpURL := fmt.Sprintf("%s/%sorg-%s-mcps.json", nexusDistBase(), prefix, orgID)
 	resp, err := client.Get(mcpURL)
 	if err != nil || resp.StatusCode != 200 {
 		// Fall back to default
 		if resp != nil {
 			resp.Body.Close()
 		}
-		resp, err = client.Get("https://claude-code-auth-distribution-916587687563.s3.amazonaws.com/cowork/claude-code-mcps.json")
+		resp, err = client.Get(fmt.Sprintf("%s/%sclaude-code-mcps.json", nexusDistBase(), prefix))
 		if err != nil || resp.StatusCode != 200 {
 			return
 		}
@@ -1096,48 +1238,59 @@ func syncMcpServers(profile string) {
 		return
 	}
 
+	// Reconciliation: the S3 file is the authoritative list of MANAGED MCPs for this org.
+	// We track which MCP keys Nexus previously managed so we can REMOVE ones the admin has
+	// since disabled/deleted, while never touching MCPs the user added themselves.
+	managedStatePath := filepath.Join(home, ".claude-code-session", "nexus-managed-mcps.json")
+	prevManaged := map[string]bool{}
+	if data, err := os.ReadFile(managedStatePath); err == nil {
+		var names []string
+		if json.Unmarshal(data, &names) == nil {
+			for _, n := range names {
+				prevManaged[n] = true
+			}
+		}
+	} else {
+		// First run after upgrade (no state file yet): seed the managed set with every
+		// MCP key Nexus has ever shipped. This lets reconciliation clean up stale entries
+		// that accumulated before reconciliation existed (e.g. an MCP the admin later
+		// disabled). User-added MCPs are NOT in this list, so they are preserved.
+		knownNexusManaged := []string{
+			"github", "slack", "hubspot", "activecampaign", "zapier", "nexus-factory",
+			"web-search", "partner-central", "atlassian", "jira",
+			"google-drive", "google-docs", "google-slides", "google-workspace", "google-docs-&-slides",
+		}
+		for _, n := range knownNexusManaged {
+			prevManaged[n] = true
+		}
+	}
+	// The new managed set = keys currently in the S3 file.
+	newManaged := map[string]bool{}
+	newManagedList := []string{}
+	for name := range mcps {
+		newManaged[name] = true
+		newManagedList = append(newManagedList, name)
+	}
+	// MCPs to remove = previously managed but no longer in the S3 file (admin disabled/deleted).
+	toRemove := computeMcpRemovals(prevManaged, newManaged)
+
 	// Read current settings
 	settingsData, err := os.ReadFile(settingsPath)
 	if err != nil {
-		return
+		// Fresh install: ~/.claude/settings.json may not exist yet (Claude Code hasn't
+		// created it). Start from an empty object instead of aborting — otherwise the
+		// MCP sync would leave .claude.json empty on first run ("No MCP servers").
+		settingsData = []byte("{}")
 	}
 	var settings map[string]interface{}
 	if err := json.Unmarshal(settingsData, &settings); err != nil {
-		return
+		settings = make(map[string]interface{})
 	}
+	os.MkdirAll(filepath.Dir(settingsPath), 0700)
 
-	// Merge managed MCPs into existing (preserve user-added MCPs)
+	// Reconcile managed MCPs into settings.json (skip __http__ — only .claude.json hosts those).
 	existing, _ := settings["mcpServers"].(map[string]interface{})
-	if existing == nil {
-		existing = make(map[string]interface{})
-	}
-	// Add/update managed MCPs without removing user-added ones
-	// Preserve existing env vars (integration tokens get injected there)
-	// Skip HTTP-type MCPs for settings.json (only .claude.json supports them)
-	for name, config := range mcps {
-		newConfig, _ := config.(map[string]interface{})
-		if newConfig != nil {
-			if cmd, _ := newConfig["command"].(string); cmd == "__http__" {
-				continue // HTTP MCPs only go in .claude.json
-			}
-		}
-		if existingConfig, ok := existing[name].(map[string]interface{}); ok && newConfig != nil {
-			// Preserve env vars from existing config that aren't in the new config
-			if existingEnv, ok := existingConfig["env"].(map[string]interface{}); ok && len(existingEnv) > 0 {
-				newEnv, _ := newConfig["env"].(map[string]interface{})
-				if newEnv == nil {
-					newEnv = make(map[string]interface{})
-				}
-				for k, v := range existingEnv {
-					if _, exists := newEnv[k]; !exists {
-						newEnv[k] = v
-					}
-				}
-				newConfig["env"] = newEnv
-			}
-		}
-		existing[name] = config
-	}
+	existing = reconcileMcpServers(existing, mcps, toRemove, true)
 	settings["mcpServers"] = existing
 	newData, err := json.MarshalIndent(settings, "", "  ")
 	if err != nil {
@@ -1153,7 +1306,11 @@ func syncMcpServers(profile string) {
 	if claudeJson == nil {
 		claudeJson = make(map[string]interface{})
 	}
-	// Convert mcps to the format Claude Code 2.1+ expects
+	// Convert mcps to the format Claude Code 2.1+ expects.
+	// Resolve npx to an absolute path so MCP servers launch even when Claude Code has a
+	// minimal PATH (a common cause of "all MCPs disconnected").
+	npxPath := resolveNpxPath()
+	launchPath := mcpLaunchPath()
 	claudeMcps := make(map[string]interface{})
 	for name, config := range mcps {
 		cfgMap, _ := config.(map[string]interface{})
@@ -1161,6 +1318,9 @@ func syncMcpServers(profile string) {
 			continue
 		}
 		cmd, _ := cfgMap["command"].(string)
+		if cmd == "npx" {
+			cmd = npxPath
+		}
 
 		// HTTP-type MCPs (e.g., Partner Central) — use native HTTP transport
 		if cmd == "__http__" {
@@ -1194,11 +1354,18 @@ func syncMcpServers(profile string) {
 			"command": cmd,
 			"args":    cfgMap["args"],
 		}
-		if env, ok := cfgMap["env"]; ok {
-			entry["env"] = env
+		var envMap map[string]interface{}
+		if env, ok := cfgMap["env"].(map[string]interface{}); ok {
+			envMap = env
 		} else {
-			entry["env"] = map[string]interface{}{}
+			envMap = map[string]interface{}{}
 		}
+		// Inject PATH so node/npx are found even when Claude Code spawns with a minimal PATH
+		// (root cause of stdio MCPs showing "failed"). Only set if not already provided.
+		if _, has := envMap["PATH"]; !has {
+			envMap["PATH"] = launchPath
+		}
+		entry["env"] = envMap
 		claudeMcps[name] = entry
 	}
 	// Merge: preserve existing user-added MCPs
@@ -1225,19 +1392,71 @@ func syncMcpServers(profile string) {
 		}
 		existingMcps[name] = config
 	}
+	// Remove MCPs the admin has disabled/deleted (previously managed, now gone from S3).
+	for name := range toRemove {
+		delete(existingMcps, name)
+	}
 	claudeJson["mcpServers"] = existingMcps
 	if claudeData, err := json.MarshalIndent(claudeJson, "", "  "); err == nil {
 		os.WriteFile(claudeJsonPath, claudeData, 0600)
 	}
 
-	// Update sync timestamp
-	os.MkdirAll(filepath.Dir(cachePath), 0700)
-	os.WriteFile(cachePath, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0600)
+	// Persist the current managed set so the next sync can compute removals.
+	if stateData, err := json.Marshal(newManagedList); err == nil {
+		os.MkdirAll(filepath.Dir(managedStatePath), 0700)
+		os.WriteFile(managedStatePath, stateData, 0600)
+	}
+
+	// Update sync timestamp — but ONLY if we actually populated MCPs. If the config ended
+	// up empty (S3 hiccup, first-run race, or genuinely empty catalog), do NOT cache the
+	// timestamp so the next run retries instead of leaving "No MCP servers" for 5 minutes.
+	if len(existingMcps) > 0 {
+		os.MkdirAll(filepath.Dir(cachePath), 0700)
+		os.WriteFile(cachePath, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0600)
+	}
 }
 
 
 // syncIntegrationTokens fetches per-user OAuth tokens for MCP servers that need them
 // (e.g., HubSpot) and injects them as env vars in settings.json.
+// hasUnconnectedIntegration reports whether any token-based MCP is present in the user's
+// config but still missing its credential env var (i.e. enabled by the admin but not yet
+// connected by the user on /me). When true, syncIntegrationTokens bypasses its 10-min
+// throttle and checks every run, so a token the user just pasted on /me is picked up almost
+// immediately — no commands, no manual restart required.
+func hasUnconnectedIntegration(home string) bool {
+	// (mcpKey, credentialEnvVar) pairs for token-injected integrations.
+	checks := map[string]string{
+		"hubspot":        "PRIVATE_APP_ACCESS_TOKEN",
+		"activecampaign": "ACTIVECAMPAIGN_API_KEY",
+		"zapier":         "ZAPIER_MCP_TOKEN",
+		"nexus-factory":  "NEXUS_FACTORY_API_KEY",
+		"google-drive":   "GOOGLE_OAUTH_ACCESS_TOKEN",
+		"jira":           "JIRA_API_TOKEN",
+	}
+	data, err := os.ReadFile(filepath.Join(home, ".claude.json"))
+	if err != nil {
+		return false
+	}
+	var cfg map[string]interface{}
+	if json.Unmarshal(data, &cfg) != nil {
+		return false
+	}
+	servers, _ := cfg["mcpServers"].(map[string]interface{})
+	for key, envVar := range checks {
+		srv, ok := servers[key].(map[string]interface{})
+		if !ok {
+			continue // MCP not enabled for this user's org
+		}
+		env, _ := srv["env"].(map[string]interface{})
+		val, _ := env[envVar].(string)
+		if val == "" {
+			return true // enabled but no token yet → keep checking
+		}
+	}
+	return false
+}
+
 // If the user hasn't authenticated with a service yet, opens browser for OAuth.
 func syncIntegrationTokens(profile string) {
 	home, err := os.UserHomeDir()
@@ -1247,13 +1466,18 @@ func syncIntegrationTokens(profile string) {
 
 	debugPrint("syncIntegrationTokens: starting for profile %s", profile)
 
-	// Check if we synced recently (skip if < 10 min ago)
+	// Check if we synced recently. We normally throttle to every 10 min, BUT if the user
+	// has an MCP enabled that is not yet connected (no token), we keep checking every run
+	// so a freshly-connected token (pasted on /me) is picked up almost immediately with
+	// zero action from the user — no commands, no forced restart.
 	cachePath := filepath.Join(home, ".claude-code-session", "integration-token-sync-ts")
-	if data, err := os.ReadFile(cachePath); err == nil {
-		if ts, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64); err == nil {
-			if time.Now().Unix()-ts < 600 {
-				debugPrint("syncIntegrationTokens: skipping, synced recently")
-				return
+	if !hasUnconnectedIntegration(home) {
+		if data, err := os.ReadFile(cachePath); err == nil {
+			if ts, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64); err == nil {
+				if time.Now().Unix()-ts < 600 {
+					debugPrint("syncIntegrationTokens: skipping, synced recently")
+					return
+				}
 			}
 		}
 	}
@@ -1268,9 +1492,11 @@ func syncIntegrationTokens(profile string) {
 	debugPrint("syncIntegrationTokens: got monitoring token, checking integrations")
 
 	// integrations that need per-user tokens
+	apiBase := nexusAPIBase()
 	integrations := []struct {
 		name       string
 		mcpKey     string
+		mcpKeys    []string // if set, inject into all these MCP keys (e.g. the 4 Google MCPs); overrides mcpKey for injection
 		envVar     string
 		extraEnvs  map[string]string // additional env vars to inject from token response
 		tokenURL   string
@@ -1305,10 +1531,61 @@ func syncIntegrationTokens(profile string) {
 			tokenURL:   "https://dtxfifv2cj.execute-api.us-east-1.amazonaws.com/api/integrations/nexus-factory/token",
 			connectURL: "https://nexus.allcode.com/me",
 		},
+		{
+			name:       "google",
+			mcpKey:     "google-drive",
+			mcpKeys:    []string{"google-drive"},
+			envVar:     "GOOGLE_OAUTH_ACCESS_TOKEN",
+			// The Workspace MCP needs the user's Google email + OAuth client to load the
+			// credential file our file-bridge writes. Inject them from the token response.
+			extraEnvs: map[string]string{
+				"google_email":  "USER_GOOGLE_EMAIL",
+				"client_id":     "GOOGLE_OAUTH_CLIENT_ID",
+				"client_secret": "GOOGLE_OAUTH_CLIENT_SECRET",
+			},
+			tokenURL:   "https://dtxfifv2cj.execute-api.us-east-1.amazonaws.com/api/integrations/google/token",
+			connectURL: "https://nexus.allcode.com/me",
+		},
+		{
+			name:       "jira",
+			mcpKey:     "jira",
+			envVar:     "JIRA_API_TOKEN",
+			extraEnvs:  map[string]string{"atlassian_url": "JIRA_HOST", "atlassian_email": "JIRA_EMAIL"},
+			tokenURL:   "https://dtxfifv2cj.execute-api.us-east-1.amazonaws.com/api/integrations/jira/token",
+			connectURL: "https://nexus.allcode.com/me",
+		},
+		{
+			// Separate, READ-ONLY Gmail. Its own gmail.readonly-scoped token, written to a
+			// dedicated credential dir so it never mixes with the broad google-drive token.
+			name:       "gmail",
+			mcpKey:     "gmail",
+			envVar:     "GMAIL_OAUTH_ACCESS_TOKEN",
+			extraEnvs: map[string]string{
+				"google_email":  "USER_GOOGLE_EMAIL",
+				"client_id":     "GOOGLE_OAUTH_CLIENT_ID",
+				"client_secret": "GOOGLE_OAUTH_CLIENT_SECRET",
+			},
+			tokenURL:   "https://dtxfifv2cj.execute-api.us-east-1.amazonaws.com/api/integrations/gmail/token",
+			connectURL: "https://nexus.allcode.com/me",
+		},
+	}
+
+	// Rewrite the hardcoded prod API base to the resolved base (dev when NEXUS_ENV=dev).
+	// The literals above use the prod URL as the canonical form; this makes dev installs
+	// hit the dev API without duplicating the slice.
+	const prodBase = "https://dtxfifv2cj.execute-api.us-east-1.amazonaws.com"
+	if apiBase != prodBase {
+		for i := range integrations {
+			integrations[i].tokenURL = strings.Replace(integrations[i].tokenURL, prodBase, apiBase, 1)
+			integrations[i].connectURL = strings.Replace(integrations[i].connectURL, prodBase, apiBase, 1)
+		}
 	}
 
 	settingsPath := filepath.Join(home, ".claude", "settings.json")
 	claudeJsonPath := filepath.Join(home, ".claude.json")
+	// Cowork (Claude Desktop on Bedrock) reads MCPs from this file. Inject the same per-user
+	// tokens here so integrations work in Cowork too, not just Claude Code.
+	coworkDesktopPath := filepath.Join(home, "Library", "Application Support", "Claude-3p", "claude_desktop_config.json")
 
 	for _, integ := range integrations {
 		// Fetch token from Nexus API
@@ -1348,8 +1625,38 @@ func syncIntegrationTokens(profile string) {
 			if mcpServers == nil {
 				continue
 			}
-			if _, exists := mcpServers[integ.mcpKey]; !exists {
+			// Check if any of this integration's MCP keys is configured.
+			checkKeys := integ.mcpKeys
+			if len(checkKeys) == 0 {
+				checkKeys = []string{integ.mcpKey}
+			}
+			anyConfigured := false
+			for _, mk := range checkKeys {
+				if _, exists := mcpServers[mk]; exists {
+					anyConfigured = true
+					break
+				}
+			}
+			if !anyConfigured {
 				continue // MCP not configured, skip
+			}
+			// Not connected in Nexus — clear any STALE token previously injected into the
+			// config so a revoked/removed integration stops working locally (reconciliation).
+			for _, mk := range checkKeys {
+				clearMcpEnvVar(settingsPath, mk, integ.envVar)
+				clearMcpEnvVar(claudeJsonPath, mk, integ.envVar)
+				clearMcpEnvVar(coworkDesktopPath, mk, integ.envVar)
+				if integ.extraEnvs != nil {
+					for _, envVarName := range integ.extraEnvs {
+						clearMcpEnvVar(settingsPath, mk, envVarName)
+						clearMcpEnvVar(claudeJsonPath, mk, envVarName)
+						clearMcpEnvVar(coworkDesktopPath, mk, envVarName)
+					}
+				}
+			}
+			// Jira uses a header, not env — clear the stale Authorization header too.
+			if integ.name == "jira" {
+				clearMcpHeader(claudeJsonPath, "jira", "Authorization")
 			}
 			// MCP is configured but no token — show user how to connect
 			connectCachePath := filepath.Join(home, ".claude-code-session", integ.name+"-connect-prompted")
@@ -1359,21 +1666,58 @@ func syncIntegrationTokens(profile string) {
 				os.MkdirAll(filepath.Dir(connectCachePath), 0700)
 				os.WriteFile(connectCachePath, []byte("1"), 0600)
 			}
-			debugPrint("syncIntegrationTokens: %s not connected, skipping (user will auth on first use)", integ.name)
+			debugPrint("syncIntegrationTokens: %s not connected, cleared stale token", integ.name)
 			continue
 		}
 
-		// Got a token — inject into MCP env vars in settings.json
-		injectMcpEnvVar(settingsPath, integ.mcpKey, integ.envVar, accessToken)
-		injectMcpEnvVar(claudeJsonPath, integ.mcpKey, integ.envVar, accessToken)
+		// Got a token — inject into MCP env vars in settings.json.
+		// If mcpKeys is set (e.g. the 4 Google MCPs share one token), inject into each.
+		targetKeys := integ.mcpKeys
+		if len(targetKeys) == 0 {
+			targetKeys = []string{integ.mcpKey}
+		}
+		for _, mk := range targetKeys {
+			injectMcpEnvVar(settingsPath, mk, integ.envVar, accessToken)
+			injectMcpEnvVar(claudeJsonPath, mk, integ.envVar, accessToken)
+			injectMcpEnvVar(coworkDesktopPath, mk, integ.envVar, accessToken)
 
-		// Inject additional env vars from the token response (e.g., account_url -> ACTIVECAMPAIGN_API_URL)
-		if integ.extraEnvs != nil {
-			for responseKey, envVarName := range integ.extraEnvs {
-				if val, ok := tokenResp[responseKey].(string); ok && val != "" {
-					injectMcpEnvVar(settingsPath, integ.mcpKey, envVarName, val)
-					injectMcpEnvVar(claudeJsonPath, integ.mcpKey, envVarName, val)
+			// Inject additional env vars from the token response
+			// (e.g., account_url -> ACTIVECAMPAIGN_API_URL, atlassian_url -> ATLASSIAN_URL)
+			if integ.extraEnvs != nil {
+				for responseKey, envVarName := range integ.extraEnvs {
+					if val, ok := tokenResp[responseKey].(string); ok && val != "" {
+						injectMcpEnvVar(settingsPath, mk, envVarName, val)
+						injectMcpEnvVar(claudeJsonPath, mk, envVarName, val)
+						injectMcpEnvVar(coworkDesktopPath, mk, envVarName, val)
+					}
 				}
+			}
+		}
+
+		// Google file-bridge: the common Google Drive/Docs MCP packages read OAuth tokens
+		// from an on-disk credentials file, not an env var. Nexus still owns the token
+		// (fetched above, auto-refreshed server-side); we just write it to the file the
+		// package expects so the user never has to run a browser OAuth flow themselves.
+		if integ.name == "google" {
+			writeGoogleCredentialsFile(home, tokenResp)
+		}
+		if integ.name == "gmail" {
+			writeGmailCredentialsFile(home, tokenResp)
+			// Point the gmail MCP at its dedicated (read-only) credential dir.
+			gmailDir := filepath.Join(home, ".google_workspace_mcp_gmail", "credentials")
+			injectMcpEnvVar(settingsPath, "gmail", "GOOGLE_MCP_CREDENTIALS_DIR", gmailDir)
+			injectMcpEnvVar(claudeJsonPath, "gmail", "GOOGLE_MCP_CREDENTIALS_DIR", gmailDir)
+			injectMcpEnvVar(coworkDesktopPath, "gmail", "GOOGLE_MCP_CREDENTIALS_DIR", gmailDir)
+		}
+		// Jira uses Atlassian's official Rovo MCP over HTTP with the authv2 OAuth endpoint
+		// (matching prod — full tool set). Atlassian handles auth via its own OAuth flow;
+		// we do NOT inject an Authorization header (API-token auth limits Atlassian to ~3
+		// tools). Ensure any stale Basic-auth header/env from a prior approach is removed.
+		if integ.name == "jira" {
+			clearMcpHeader(claudeJsonPath, "jira", "Authorization")
+			for _, ev := range []string{"JIRA_API_TOKEN", "JIRA_EMAIL", "JIRA_HOST"} {
+				clearMcpEnvVar(claudeJsonPath, "jira", ev)
+				clearMcpEnvVar(settingsPath, "jira", ev)
 			}
 		}
 	}
@@ -1381,6 +1725,111 @@ func syncIntegrationTokens(profile string) {
 	// Update sync timestamp
 	os.MkdirAll(filepath.Dir(cachePath), 0700)
 	os.WriteFile(cachePath, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0600)
+}
+
+// injectMcpHeader adds/updates a header on a specific HTTP MCP server's config in the given
+// file (.claude.json). Used for the Jira/Atlassian official HTTP MCP (Authorization: Basic ...).
+func injectMcpHeader(claudeJsonPath, mcpKey, headerName, value string) {
+	data, err := os.ReadFile(claudeJsonPath)
+	if err != nil {
+		return
+	}
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return
+	}
+	servers, _ := cfg["mcpServers"].(map[string]interface{})
+	if servers == nil {
+		return
+	}
+	mcp, ok := servers[mcpKey].(map[string]interface{})
+	if !ok {
+		return
+	}
+	headers, _ := mcp["headers"].(map[string]interface{})
+	if headers == nil {
+		headers = map[string]interface{}{}
+	}
+	headers[headerName] = value
+	mcp["headers"] = headers
+	// Ensure it's marked as an http MCP.
+	if _, has := mcp["type"]; !has {
+		mcp["type"] = "http"
+	}
+	servers[mcpKey] = mcp
+	cfg["mcpServers"] = servers
+	if out, err := json.MarshalIndent(cfg, "", "  "); err == nil {
+		os.WriteFile(claudeJsonPath, out, 0600)
+	}
+}
+
+// clearMcpEnvVar removes an env var from an MCP server's config (used to purge a stale token
+// when Nexus no longer has that integration connected — reconciliation).
+func clearMcpEnvVar(cfgPath, mcpKey, envVar string) {
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		return
+	}
+	var cfg map[string]interface{}
+	if json.Unmarshal(data, &cfg) != nil {
+		return
+	}
+	servers, _ := cfg["mcpServers"].(map[string]interface{})
+	if servers == nil {
+		return
+	}
+	mcp, ok := servers[mcpKey].(map[string]interface{})
+	if !ok {
+		return
+	}
+	env, _ := mcp["env"].(map[string]interface{})
+	if env == nil {
+		return
+	}
+	if _, present := env[envVar]; !present {
+		return
+	}
+	delete(env, envVar)
+	mcp["env"] = env
+	servers[mcpKey] = mcp
+	cfg["mcpServers"] = servers
+	if out, err := json.MarshalIndent(cfg, "", "  "); err == nil {
+		os.WriteFile(cfgPath, out, 0600)
+	}
+}
+
+// clearMcpHeader removes a header from an HTTP MCP server's config (stale Jira Authorization).
+func clearMcpHeader(cfgPath, mcpKey, headerName string) {
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		return
+	}
+	var cfg map[string]interface{}
+	if json.Unmarshal(data, &cfg) != nil {
+		return
+	}
+	servers, _ := cfg["mcpServers"].(map[string]interface{})
+	if servers == nil {
+		return
+	}
+	mcp, ok := servers[mcpKey].(map[string]interface{})
+	if !ok {
+		return
+	}
+	headers, _ := mcp["headers"].(map[string]interface{})
+	if headers == nil {
+		return
+	}
+	if _, present := headers[headerName]; !present {
+		return
+	}
+	delete(headers, headerName)
+	mcp["headers"] = headers
+	servers[mcpKey] = mcp
+	cfg["mcpServers"] = servers
+	if out, err := json.MarshalIndent(cfg, "", "  "); err == nil {
+		os.WriteFile(cfgPath, out, 0600)
+	}
 }
 
 // injectMcpEnvVar adds/updates an env var in a specific MCP server's config within settings.json
@@ -1414,6 +1863,160 @@ func injectMcpEnvVar(settingsPath, mcpKey, envVar, value string) {
 		return
 	}
 	os.WriteFile(settingsPath, newData, 0600)
+}
+
+// writeGoogleCredentialsFile bridges Nexus's per-user Google OAuth token to the on-disk
+// credentials file that the Google Drive/Docs/Slides MCP packages expect. Nexus owns and
+// refreshes the token server-side; this just materializes the current token in the format
+// and locations those packages read, so the user never runs a browser OAuth flow locally.
+func writeGoogleCredentialsFile(home string, tokenResp map[string]interface{}) {
+	accessToken, _ := tokenResp["access_token"].(string)
+	if accessToken == "" {
+		return
+	}
+	refreshToken, _ := tokenResp["refresh_token"].(string)
+	clientID, _ := tokenResp["client_id"].(string)
+	clientSecret, _ := tokenResp["client_secret"].(string)
+	googleEmail, _ := tokenResp["google_email"].(string)
+	tokenURI, _ := tokenResp["token_uri"].(string)
+	if tokenURI == "" {
+		tokenURI = "https://oauth2.googleapis.com/token"
+	}
+	scopesStr, _ := tokenResp["scopes"].(string)
+
+	// ISO expiry (workspace MCP) + ms epoch (legacy packages).
+	var expiryUnix int64
+	if ea, ok := tokenResp["expires_at"].(float64); ok && ea > 0 {
+		expiryUnix = int64(ea)
+	} else if ei, ok := tokenResp["expires_in"].(float64); ok && ei > 0 {
+		expiryUnix = time.Now().Unix() + int64(ei)
+	} else {
+		expiryUnix = time.Now().Unix() + 3600
+	}
+	expiryISO := time.Unix(expiryUnix, 0).UTC().Format("2006-01-02T15:04:05")
+
+	// ---- taylorwilsdon/google_workspace_mcp format (Gmail+Calendar+Drive+Docs+Sheets+Slides).
+	// It reads <WORKSPACE_MCP_CREDENTIALS_DIR>/<url-encoded-email>.json indexed by Google email.
+	if googleEmail != "" {
+		scopeList := []string{}
+		for _, s := range strings.Fields(scopesStr) {
+			scopeList = append(scopeList, s)
+		}
+		wsCreds := map[string]interface{}{
+			"token":         accessToken,
+			"refresh_token": refreshToken,
+			"token_uri":     tokenURI,
+			"client_id":     clientID,
+			"client_secret": clientSecret,
+			"scopes":        scopeList,
+			"expiry":        expiryISO,
+		}
+		wsDir := filepath.Join(home, ".google_workspace_mcp", "credentials")
+		os.MkdirAll(wsDir, 0700)
+		if wd, err := json.MarshalIndent(wsCreds, "", "  "); err == nil {
+			// url-encode the email the same way the MCP does (safe chars @._-).
+			safe := urlEncodeEmail(googleEmail)
+			os.WriteFile(filepath.Join(wsDir, safe+".json"), wd, 0600)
+		}
+	}
+
+	// ---- Legacy @piotr-agier / server-gdrive format (kept for backward compat).
+	var expiryMs int64 = expiryUnix * 1000
+	creds := map[string]interface{}{
+		"access_token": accessToken,
+		"token_type":   "Bearer",
+		"expiry_date":  expiryMs,
+	}
+	if refreshToken != "" {
+		creds["refresh_token"] = refreshToken
+	}
+	data, err := json.MarshalIndent(creds, "", "  ")
+	if err != nil {
+		return
+	}
+	gdriveDir := filepath.Join(home, ".config", "google-drive-mcp")
+	os.MkdirAll(gdriveDir, 0700)
+	for _, p := range []string{
+		filepath.Join(gdriveDir, "tokens.json"),
+		filepath.Join(gdriveDir, "credentials.json"),
+		filepath.Join(home, ".gdrive-server-credentials.json"),
+	} {
+		os.MkdirAll(filepath.Dir(p), 0700)
+		os.WriteFile(p, data, 0600)
+	}
+	if clientID != "" {
+		keys := map[string]interface{}{
+			"installed": map[string]interface{}{
+				"client_id":     clientID,
+				"client_secret": clientSecret,
+				"redirect_uris": []string{"http://localhost"},
+				"auth_uri":      "https://accounts.google.com/o/oauth2/auth",
+				"token_uri":     tokenURI,
+			},
+		}
+		if kd, err := json.MarshalIndent(keys, "", "  "); err == nil {
+			os.WriteFile(filepath.Join(gdriveDir, "gcp-oauth.keys.json"), kd, 0600)
+		}
+	}
+	debugPrint("writeGoogleCredentialsFile: wrote Google token for %s (workspace + legacy)", googleEmail)
+}
+
+// writeGmailCredentialsFile writes the READ-ONLY Gmail token to a SEPARATE workspace-mcp
+// credential dir (~/.google_workspace_mcp_gmail/credentials) so it never mixes with the broad
+// google-drive token. The gmail MCP entry points GOOGLE_MCP_CREDENTIALS_DIR here.
+func writeGmailCredentialsFile(home string, tokenResp map[string]interface{}) {
+	accessToken, _ := tokenResp["access_token"].(string)
+	if accessToken == "" {
+		return
+	}
+	googleEmail, _ := tokenResp["google_email"].(string)
+	if googleEmail == "" {
+		return
+	}
+	tokenURI, _ := tokenResp["token_uri"].(string)
+	if tokenURI == "" {
+		tokenURI = "https://oauth2.googleapis.com/token"
+	}
+	scopeList := []string{}
+	if s, _ := tokenResp["scopes"].(string); s != "" {
+		scopeList = strings.Fields(s)
+	}
+	var expiryUnix int64
+	if ea, ok := tokenResp["expires_at"].(float64); ok && ea > 0 {
+		expiryUnix = int64(ea)
+	} else {
+		expiryUnix = time.Now().Unix() + 3600
+	}
+	creds := map[string]interface{}{
+		"token":         accessToken,
+		"refresh_token": tokenResp["refresh_token"],
+		"token_uri":     tokenURI,
+		"client_id":     tokenResp["client_id"],
+		"client_secret": tokenResp["client_secret"],
+		"scopes":        scopeList,
+		"expiry":        time.Unix(expiryUnix, 0).UTC().Format("2006-01-02T15:04:05"),
+	}
+	dir := filepath.Join(home, ".google_workspace_mcp_gmail", "credentials")
+	os.MkdirAll(dir, 0700)
+	if d, err := json.MarshalIndent(creds, "", "  "); err == nil {
+		os.WriteFile(filepath.Join(dir, urlEncodeEmail(googleEmail)+".json"), d, 0600)
+	}
+	debugPrint("writeGmailCredentialsFile: wrote gmail.readonly token for %s", googleEmail)
+}
+
+// urlEncodeEmail mirrors Python's urllib.parse.quote(email, safe="@._-") used by the
+// Workspace MCP to name its per-user credential file.
+func urlEncodeEmail(email string) string {
+	var b strings.Builder
+	for _, r := range email {
+		if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') ||
+			r == '@' || r == '.' || r == '_' || r == '-' {
+			b.WriteRune(r)
+		} else {
+			b.WriteString(fmt.Sprintf("%%%02X", r))
+		}
+	}
+	return b.String()
 }
 
 func syncSkills() {
@@ -1899,9 +2502,9 @@ func checkForUpdate() {
 		return
 	}
 
-	// Fetch version file
+	// Fetch version file (env-aware: dev installs check cowork/dev/, prod checks cowork/)
 	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get("https://claude-code-auth-distribution-916587687563.s3.amazonaws.com/cowork/credential-process-version.json")
+	resp, err := client.Get(fmt.Sprintf("%s/%scredential-process-version.json", nexusDistBase(), nexusCoworkPrefix()))
 	if err != nil || resp.StatusCode != 200 {
 		return
 	}
@@ -1946,8 +2549,8 @@ func checkForUpdate() {
 		return
 	}
 
-	// Download new binary
-	dlResp, err := client.Get("https://claude-code-auth-distribution-916587687563.s3.amazonaws.com/cowork/" + binaryName)
+	// Download new binary (env-aware prefix)
+	dlResp, err := client.Get(nexusDistBase() + "/" + nexusCoworkPrefix() + binaryName)
 	if err != nil || dlResp.StatusCode != 200 {
 		return
 	}

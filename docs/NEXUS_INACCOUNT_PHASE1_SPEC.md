@@ -161,3 +161,24 @@ Remaining before Marketplace GA (later phases):
 - Phone-home usage counters -> AllCode metering (D4).
 - BYO-IdP federation (Okta/Azure) on top of the default Cognito pool.
 - Wire the Marketplace Fulfillment/launch flow to this template.
+
+## CLEAN-ACCOUNT VALIDATION (2026-09-01) — sandbox account 516148679133
+
+Deployed the full bootstrap into a genuinely EMPTY account (nexus-sandbox) and verified
+end-to-end as a real customer would experience it:
+- One-shot create-stack -> full Nexus (9 tables + 6 Lambdas + Cognito + CloudFront + Bedrock).
+- Dashboard loads; /api/* proxied through the same CloudFront domain to the in-account API.
+- Real admin LOGIN works: fresh id_token carries cognito:groups=[claude-code-admins] ->
+  user is recognized as org-admin in the dashboard.
+- Runtime config (nexus-config.js) makes the single prebuilt UI use THIS account's Cognito.
+
+Bugs caught + fixed by the real-account test (that namespaced dev tests missed):
+1. UI had prod Cognito hardcoded -> added runtime config (window.__NEXUS_CONFIG__).
+2. CloudFront cached stale index.html -> deploys must invalidate CloudFront.
+3. Cognito client only allowed localhost callbacks -> must include the CloudFront URL.
+4. First user wasn't admin -> stack now creates claude-code-admins group + adds the admin.
+
+Automations still to wire into the template (done manually in this test):
+- Custom resource to write nexus-config.js + add CloudFront URL to Cognito callbacks + invalidate.
+- Seed base credential-process binaries into the in-account DistributionBucket so package-gen
+  can generate org-specific installers.

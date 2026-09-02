@@ -27,10 +27,17 @@ CHANNEL="${1:-}"
 VERSION="${2:-}"
 FLAG="${3:-}"
 
-ARTIFACT_BUCKET="${ARTIFACT_BUCKET:-nexus-public-artifacts-916587687563}"
+# Primary/publish region + bucket. Multi-region: after publishing to the primary bucket, the
+# artifacts are replicated to every regional bucket (nexus-public-artifacts-<region>) so a
+# customer deploy in any region pulls same-region Lambda code.
+ARTIFACT_BUCKET="${ARTIFACT_BUCKET:-nexus-public-artifacts-us-east-1}"
 AWS_PROFILE="${AWS_PROFILE:-allcode-admin}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 PREFIX="nexus-inaccount"
+# Regions to replicate to when --all-regions is passed (must match setup-nexus-artifact-buckets.sh).
+ALL_REGIONS="${ALL_REGIONS:-us-east-1 us-west-2 eu-west-1 eu-central-1 ap-southeast-1 ap-southeast-2}"
+REPLICATE_ALL=""
+[[ "${*}" == *"--all-regions"* ]] && REPLICATE_ALL="1"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
@@ -151,5 +158,22 @@ fi
 
 echo "==> Published ${VERSION} to '${CHANNEL}'"
 echo "    manifest: s3://${ARTIFACT_BUCKET}/${PREFIX}/channel/${CHANNEL}.json"
+
+# --- Multi-region replication ---
+# Copy the full artifact prefix to every regional bucket so a customer deploy in ANY region
+# pulls same-region Lambda code (required — Lambda Code.S3Bucket must be same-region).
+if [ -n "$REPLICATE_ALL" ]; then
+  echo "==> Replicating artifacts to all regions..."
+  for region in $ALL_REGIONS; do
+    dest="nexus-public-artifacts-${region}"
+    [ "$dest" = "$ARTIFACT_BUCKET" ] && { echo "    ${region}: (primary, skip)"; continue; }
+    aws s3 sync "s3://${ARTIFACT_BUCKET}/${PREFIX}/" "s3://${dest}/${PREFIX}/" \
+      --profile "$AWS_PROFILE" --region "$region" --quiet \
+      && echo "    ${region}: replicated -> ${dest}" \
+      || echo "    ${region}: FAILED (does the bucket exist? run setup-nexus-artifact-buckets.sh)"
+  done
+fi
+
 echo ""
 echo "Promotion path: canary -> early -> stable. Smoke-test canary before promoting."
+[ -z "$REPLICATE_ALL" ] && echo "Tip: pass --all-regions to replicate to every regional bucket."

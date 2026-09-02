@@ -1695,13 +1695,26 @@ func syncIntegrationTokens(profile string) {
 		}
 	}
 
+
 	settingsPath := filepath.Join(home, ".claude", "settings.json")
 	claudeJsonPath := filepath.Join(home, ".claude.json")
 	// Cowork (Claude Desktop on Bedrock) reads MCPs from this file. Inject the same per-user
 	// tokens here so integrations work in Cowork too, not just Claude Code.
 	coworkDesktopPath := filepath.Join(home, "Library", "Application Support", "Claude-3p", "claude_desktop_config.json")
 
+	// ORG GOOGLE SERVICE ACCOUNT (domain-wide delegation): if the admin configured an org SA,
+	// inject it into the google-drive MCP and impersonate THIS employee — so Google Drive is
+	// auto-connected for every employee with zero auth / zero /me. Takes priority over the
+	// per-user Google OAuth path below (which is skipped when the SA is present).
+	orgGoogleSA := injectGoogleServiceAccount(home, monToken, apiBase, settingsPath, claudeJsonPath, coworkDesktopPath)
+
 	for _, integ := range integrations {
+		// If an org Google SA is configured, skip the per-user Google OAuth integration
+		// (the SA already connected google-drive for this employee).
+		if orgGoogleSA && (integ.name == "google") {
+			debugPrint("syncIntegrationTokens: google handled by org service account, skipping per-user OAuth")
+			continue
+		}
 		// Fetch token from Nexus API
 		client := &http.Client{Timeout: 5 * time.Second}
 		req, err := http.NewRequest("GET", integ.tokenURL, nil)
@@ -1772,15 +1785,13 @@ func syncIntegrationTokens(profile string) {
 			if integ.name == "jira" {
 				clearMcpHeader(claudeJsonPath, "jira", "Authorization")
 			}
-			// MCP is configured but no token — show user how to connect
-			connectCachePath := filepath.Join(home, ".claude-code-session", integ.name+"-connect-prompted")
-			if _, err := os.Stat(connectCachePath); err != nil {
-				// First time seeing this - show the message
-				fmt.Fprintf(os.Stderr, "\n⚠ %s MCP needs authentication.\n  Open this URL in your browser to connect:\n  %s\n  Then restart claude.\n\n", integ.name, integ.connectURL)
-				os.MkdirAll(filepath.Dir(connectCachePath), 0700)
-				os.WriteFile(connectCachePath, []byte("1"), 0600)
-			}
-			debugPrint("syncIntegrationTokens: %s not connected, cleared stale token", integ.name)
+			// MCP is configured but no per-user token yet. We do NOT proactively open a browser
+			// or nag on /me. For OAuth MCPs (Google/Gmail via workspace-mcp), the MCP triggers
+			// its OWN auth at point-of-use: when the user asks Claude to use Google, Claude calls
+			// the MCP's start_google_auth tool, which returns an auth link in the conversation.
+			// So we just leave the MCP configured (no token) and let it self-authenticate on demand.
+			// For paste-key integrations (HubSpot/Jira), the admin sets an org-shared key instead.
+			debugPrint("syncIntegrationTokens: %s not connected — leaving for on-demand MCP auth", integ.name)
 			continue
 		}
 
@@ -1977,6 +1988,57 @@ func injectMcpEnvVar(settingsPath, mcpKey, envVar, value string) {
 		return
 	}
 	os.WriteFile(settingsPath, newData, 0600)
+}
+
+// injectGoogleServiceAccount checks Nexus for an org Google service account (domain-wide
+// delegation). If configured, it writes the SA JSON to disk and injects the SA + this
+// employee's email into the google-drive MCP so the MCP impersonates the employee — giving
+// zero-auth, per-user Google Drive access with no /me visit. Returns true if an SA was applied.
+func injectGoogleServiceAccount(home, monToken, apiBase, settingsPath, claudeJsonPath, coworkDesktopPath string) bool {
+	if monToken == "" {
+		return false
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	req, err := http.NewRequest("GET", apiBase+"/api/integrations/google-sa/token", nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("Authorization", "Bearer "+monToken)
+	resp, err := client.Do(req)
+	if err != nil || resp == nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return false // no org SA configured (404) — fall back to per-user OAuth
+	}
+	body, _ := io.ReadAll(resp.Body)
+	var r map[string]interface{}
+	if json.Unmarshal(body, &r) != nil {
+		return false
+	}
+	saJSON, _ := r["service_account_json"].(string)
+	domain, _ := r["domain"].(string)
+	impersonate, _ := r["impersonate_email"].(string)
+	if saJSON == "" || impersonate == "" {
+		return false
+	}
+	// Write the SA key to a private file the MCP reads.
+	saDir := filepath.Join(home, ".google_workspace_mcp")
+	os.MkdirAll(saDir, 0700)
+	saPath := filepath.Join(saDir, "service-account.json")
+	os.WriteFile(saPath, []byte(saJSON), 0600)
+
+	// Inject the SA env into the google-drive MCP (both Claude Code + Cowork configs).
+	for _, cfgPath := range []string{settingsPath, claudeJsonPath, coworkDesktopPath} {
+		injectMcpEnvVar(cfgPath, "google-drive", "GOOGLE_SERVICE_ACCOUNT_KEY_FILE", saPath)
+		injectMcpEnvVar(cfgPath, "google-drive", "USER_GOOGLE_EMAIL", impersonate)
+		if domain != "" {
+			injectMcpEnvVar(cfgPath, "google-drive", "DWD_ALLOWED_DOMAINS", domain)
+		}
+	}
+	debugPrint("injectGoogleServiceAccount: org SA applied, impersonating %s", impersonate)
+	return true
 }
 
 // writeGoogleCredentialsFile bridges Nexus's per-user Google OAuth token to the on-disk

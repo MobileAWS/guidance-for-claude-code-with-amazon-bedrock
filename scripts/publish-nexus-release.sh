@@ -130,6 +130,25 @@ JSON
 aws s3 cp "${WORK}/manifest.json" "s3://${ARTIFACT_BUCKET}/${PREFIX}/channel/${CHANNEL}.json" \
   --profile "$AWS_PROFILE" --region "$AWS_REGION" --content-type application/json --cache-control "no-cache, no-store"
 
+# --- Sign the manifest with KMS (asymmetric) so customers can verify authenticity ---
+# The updater embeds the PUBLIC key and rejects a manifest whose signature doesn't verify —
+# so a compromised artifact bucket cannot serve a malicious manifest.
+SIGNING_KEY="${SIGNING_KEY:-alias/nexus-manifest-signing}"
+MSG_B64=$(base64 < "${WORK}/manifest.json" | tr -d '\n')
+SIG=$(aws kms sign --key-id "$SIGNING_KEY" \
+  --message "fileb://${WORK}/manifest.json" \
+  --message-type RAW --signing-algorithm ECDSA_SHA_256 \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+  --query "Signature" --output text 2>/dev/null)
+if [ -n "$SIG" ]; then
+  echo "$SIG" > "${WORK}/manifest.sig"
+  aws s3 cp "${WORK}/manifest.sig" "s3://${ARTIFACT_BUCKET}/${PREFIX}/channel/${CHANNEL}.json.sig" \
+    --profile "$AWS_PROFILE" --region "$AWS_REGION" --content-type text/plain --cache-control "no-cache, no-store"
+  echo "    signed manifest -> ${CHANNEL}.json.sig"
+else
+  echo "    WARNING: manifest signing failed (SIGNING_KEY=$SIGNING_KEY) — published unsigned"
+fi
+
 echo "==> Published ${VERSION} to '${CHANNEL}'"
 echo "    manifest: s3://${ARTIFACT_BUCKET}/${PREFIX}/channel/${CHANNEL}.json"
 echo ""

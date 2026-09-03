@@ -1761,15 +1761,29 @@ func syncIntegrationTokens(profile string) {
 			// that connects every employee (Slack model). Only clear if there is no such token,
 			// so a genuinely revoked integration stops working (reconciliation).
 			orgSharedPresent := false
+			var orgSharedVal string
 			for _, mk := range checkKeys {
-				if mcpHasEnvVar(settingsPath, mk, integ.envVar) ||
-					mcpHasEnvVar(claudeJsonPath, mk, integ.envVar) {
+				if v := mcpEnvVarValue(settingsPath, mk, integ.envVar); v != "" {
 					orgSharedPresent = true
+					orgSharedVal = v
+					break
+				}
+				if v := mcpEnvVarValue(claudeJsonPath, mk, integ.envVar); v != "" {
+					orgSharedPresent = true
+					orgSharedVal = v
 					break
 				}
 			}
 			if orgSharedPresent {
-				debugPrint("syncIntegrationTokens: %s has org-shared token in config — leaving it", integ.name)
+				// Org-shared token exists (admin set it via the MCP catalog). Make sure the
+				// Cowork (Claude Desktop) config carries it too — the Cowork MCP sync doesn't
+				// always propagate org-shared env — then leave everything in place.
+				for _, mk := range checkKeys {
+					if mcpEnvVarValue(coworkDesktopPath, mk, integ.envVar) == "" {
+						injectMcpEnvVar(coworkDesktopPath, mk, integ.envVar, orgSharedVal)
+					}
+				}
+				debugPrint("syncIntegrationTokens: %s has org-shared token — ensured in Cowork, leaving it", integ.name)
 				continue
 			}
 			// Not connected in Nexus — clear any STALE token previously injected into the
@@ -1890,6 +1904,33 @@ func injectMcpHeader(claudeJsonPath, mcpKey, headerName, value string) {
 }
 
 // clearMcpEnvVar removes an env var from an MCP server's config (used to purge a stale token
+// mcpEnvVarValue returns the value of envVar for the given MCP key in the config at cfgPath,
+// or "" if absent/empty. Used to read an org-shared token so it can be mirrored into Cowork.
+func mcpEnvVarValue(cfgPath, mcpKey, envVar string) string {
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		return ""
+	}
+	var cfg map[string]interface{}
+	if json.Unmarshal(data, &cfg) != nil {
+		return ""
+	}
+	servers, _ := cfg["mcpServers"].(map[string]interface{})
+	if servers == nil {
+		return ""
+	}
+	mcp, ok := servers[mcpKey].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	env, _ := mcp["env"].(map[string]interface{})
+	if env == nil {
+		return ""
+	}
+	v, _ := env[envVar].(string)
+	return v
+}
+
 // mcpHasEnvVar reports whether the MCP config at cfgPath has a NON-EMPTY value for envVar on
 // the given MCP key. Used to detect an org-shared token (set via the catalog/gear) so the
 // per-user token sync doesn't wipe it.

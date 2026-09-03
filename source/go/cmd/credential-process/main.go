@@ -1407,22 +1407,11 @@ func syncMcpServers(profile string) {
 		existingMcps = make(map[string]interface{})
 	}
 	for name, config := range claudeMcps {
-		// Preserve existing env vars (integration tokens)
-		newConfig, _ := config.(map[string]interface{})
-		if existingConfig, ok := existingMcps[name].(map[string]interface{}); ok && newConfig != nil {
-			if existingEnv, ok := existingConfig["env"].(map[string]interface{}); ok && len(existingEnv) > 0 {
-				newEnv, _ := newConfig["env"].(map[string]interface{})
-				if newEnv == nil {
-					newEnv = make(map[string]interface{})
-				}
-				for k, v := range existingEnv {
-					if _, exists := newEnv[k]; !exists {
-						newEnv[k] = v
-					}
-				}
-				newConfig["env"] = newEnv
-			}
-		}
+		// For MANAGED MCPs, the S3 config is the source of truth for env — do NOT merge in
+		// stale local env keys. Previously we preserved existing env keys, which left behind
+		// renamed/removed vars (e.g. old ATLASSIAN_URL alongside new JIRA_URL) and could mask
+		// a corrected credential. Managed env fully replaces local env. Per-user integration
+		// tokens are injected AFTER this by syncIntegrationTokens, which is the intended path.
 		existingMcps[name] = config
 	}
 	// Remove MCPs the admin has disabled/deleted (previously managed, now gone from S3).
@@ -1767,6 +1756,23 @@ func syncIntegrationTokens(profile string) {
 			if !anyConfigured {
 				continue // MCP not configured, skip
 			}
+			// Not connected in Nexus per-user. Before clearing, check whether the MCP config
+			// already carries an org-shared token for this env var (set by the admin via the
+			// MCP catalog/gear). If so, LEAVE IT — the catalog token is the org-shared credential
+			// that connects every employee (Slack model). Only clear if there is no such token,
+			// so a genuinely revoked integration stops working (reconciliation).
+			orgSharedPresent := false
+			for _, mk := range checkKeys {
+				if mcpHasEnvVar(settingsPath, mk, integ.envVar) ||
+					mcpHasEnvVar(claudeJsonPath, mk, integ.envVar) {
+					orgSharedPresent = true
+					break
+				}
+			}
+			if orgSharedPresent {
+				debugPrint("syncIntegrationTokens: %s has org-shared token in config — leaving it", integ.name)
+				continue
+			}
 			// Not connected in Nexus — clear any STALE token previously injected into the
 			// config so a revoked/removed integration stops working locally (reconciliation).
 			for _, mk := range checkKeys {
@@ -1889,6 +1895,34 @@ func injectMcpHeader(claudeJsonPath, mcpKey, headerName, value string) {
 }
 
 // clearMcpEnvVar removes an env var from an MCP server's config (used to purge a stale token
+// mcpHasEnvVar reports whether the MCP config at cfgPath has a NON-EMPTY value for envVar on
+// the given MCP key. Used to detect an org-shared token (set via the catalog/gear) so the
+// per-user token sync doesn't wipe it.
+func mcpHasEnvVar(cfgPath, mcpKey, envVar string) bool {
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		return false
+	}
+	var cfg map[string]interface{}
+	if json.Unmarshal(data, &cfg) != nil {
+		return false
+	}
+	servers, _ := cfg["mcpServers"].(map[string]interface{})
+	if servers == nil {
+		return false
+	}
+	mcp, ok := servers[mcpKey].(map[string]interface{})
+	if !ok {
+		return false
+	}
+	env, _ := mcp["env"].(map[string]interface{})
+	if env == nil {
+		return false
+	}
+	v, _ := env[envVar].(string)
+	return v != ""
+}
+
 // when Nexus no longer has that integration connected — reconciliation).
 func clearMcpEnvVar(cfgPath, mcpKey, envVar string) {
 	data, err := os.ReadFile(cfgPath)

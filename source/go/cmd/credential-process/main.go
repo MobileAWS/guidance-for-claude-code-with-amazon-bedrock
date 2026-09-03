@@ -1657,14 +1657,6 @@ func syncIntegrationTokens(profile string) {
 			connectURL: "https://nexus.allcode.com/me",
 		},
 		{
-			name:       "jira",
-			mcpKey:     "jira",
-			envVar:     "JIRA_API_TOKEN",
-			extraEnvs:  map[string]string{"atlassian_url": "JIRA_HOST", "atlassian_email": "JIRA_EMAIL"},
-			tokenURL:   "https://dtxfifv2cj.execute-api.us-east-1.amazonaws.com/api/integrations/jira/token",
-			connectURL: "https://nexus.allcode.com/me",
-		},
-		{
 			// Separate, READ-ONLY Gmail. Its own gmail.readonly-scoped token, written to a
 			// dedicated credential dir so it never mixes with the broad google-drive token.
 			name:       "gmail",
@@ -1847,16 +1839,12 @@ func syncIntegrationTokens(profile string) {
 			injectMcpEnvVar(claudeJsonPath, "gmail", "GOOGLE_MCP_CREDENTIALS_DIR", gmailDir)
 			injectMcpEnvVar(coworkDesktopPath, "gmail", "GOOGLE_MCP_CREDENTIALS_DIR", gmailDir)
 		}
-		// Jira uses Atlassian's official Rovo MCP over HTTP with the authv2 OAuth endpoint
-		// (matching prod — full tool set). Atlassian handles auth via its own OAuth flow;
-		// we do NOT inject an Authorization header (API-token auth limits Atlassian to ~3
-		// tools). Ensure any stale Basic-auth header/env from a prior approach is removed.
+		// NOTE: Jira previously used Atlassian's Rovo HTTP MCP (OAuth, no token), so this loop
+		// used to strip JIRA_API_TOKEN/JIRA_EMAIL/JIRA_HOST. We now use the uvx mcp-atlassian
+		// package, which REQUIRES JIRA_API_TOKEN (org-shared, from the MCP catalog). Do NOT clear
+		// it here. We still clear any stale Basic-auth Authorization header from the old approach.
 		if integ.name == "jira" {
 			clearMcpHeader(claudeJsonPath, "jira", "Authorization")
-			for _, ev := range []string{"JIRA_API_TOKEN", "JIRA_EMAIL", "JIRA_HOST"} {
-				clearMcpEnvVar(claudeJsonPath, "jira", ev)
-				clearMcpEnvVar(settingsPath, "jira", ev)
-			}
 		}
 	}
 

@@ -386,6 +386,13 @@ func (a *credentialApp) run() int {
 		saveActiveOrg(a.profile, a.orgFlag)
 	}
 
+	// First-launch self-heal: on a truly fresh install (no update-check marker yet), the
+	// bundled binary may predate important fixes. Synchronously check for a newer version and,
+	// if we updated, RE-EXEC the new binary so the corrected logic runs THIS launch (a running
+	// process can't otherwise replace its own behavior). Subsequent launches use the background
+	// (non-blocking) path below.
+	firstLaunchUpdateAndReexec()
+
 	// Check for self-update (background, non-blocking)
 	go checkForUpdate()
 
@@ -2744,6 +2751,119 @@ func reportPlatform(idToken string) {
 		req.Header.Set("Authorization", "Bearer "+idToken)
 		client.Do(req)
 	}
+}
+
+func firstLaunchUpdateAndReexec() {
+	// Only act on the very first launch after install: if the update-check marker already
+	// exists, the normal (background) path handles updates. This keeps steady-state launches
+	// fast and only pays the synchronous cost once.
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	cachePath := filepath.Join(home, ".claude-code-session", "update-check-ts")
+	if _, err := os.Stat(cachePath); err == nil {
+		return // not first launch — background path will handle it
+	}
+	// Guard against a re-exec loop: if we already re-exec'd this run, don't do it again.
+	if os.Getenv("NEXUS_REEXECED") == "1" {
+		return
+	}
+
+	binaryName := platformBinaryName()
+	if binaryName == "" {
+		return
+	}
+
+	client := &http.Client{Timeout: 6 * time.Second}
+	resp, err := client.Get(fmt.Sprintf("%s/%scredential-process-version.json", nexusDistBase(), nexusCoworkPrefix()))
+	if err != nil || resp.StatusCode != 200 {
+		return
+	}
+	versionData, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	var versionInfo map[string]interface{}
+	if json.Unmarshal(versionData, &versionInfo) != nil {
+		return
+	}
+	remoteHash, _ := versionInfo["sha256_"+runtime.GOOS+"_"+runtime.GOARCH].(string)
+	if remoteHash == "" {
+		return
+	}
+
+	execPath, err := os.Executable()
+	if err != nil {
+		return
+	}
+	execPath, _ = filepath.EvalSymlinks(execPath)
+	currentData, err := os.ReadFile(execPath)
+	if err != nil {
+		return
+	}
+	if fmt.Sprintf("%x", sha256Sum(currentData)) == remoteHash {
+		return // bundled binary already current — nothing to do
+	}
+
+	// Download the newer binary and verify its hash before swapping. Use a generous timeout —
+	// the binary is ~14MB and the version-check client's short timeout isn't enough.
+	dlClient := &http.Client{Timeout: 60 * time.Second}
+	dlResp, err := dlClient.Get(nexusDistBase() + "/" + nexusCoworkPrefix() + binaryName)
+	if err != nil || dlResp.StatusCode != 200 {
+		return
+	}
+	newBinary, _ := io.ReadAll(dlResp.Body)
+	dlResp.Body.Close()
+	if len(newBinary) < 1000 || fmt.Sprintf("%x", sha256Sum(newBinary)) != remoteHash {
+		return
+	}
+
+	tmpPath := execPath + ".update"
+	if os.WriteFile(tmpPath, newBinary, 0755) != nil {
+		return
+	}
+	if os.Rename(tmpPath, execPath) != nil {
+		os.Remove(tmpPath)
+		return
+	}
+	// Mark checked so we don't loop, then re-exec the freshly-written binary so the corrected
+	// logic runs for THIS invocation (before MCP/token sync).
+	os.MkdirAll(filepath.Dir(cachePath), 0700)
+	os.WriteFile(cachePath, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0600)
+	fmt.Fprintln(os.Stderr, "[nexus] Applied first-launch update; re-executing.")
+
+	env := append(os.Environ(), "NEXUS_REEXECED=1")
+	// Re-exec the freshly-written binary. On Unix, replace the process image; on Windows,
+	// spawn a child with the same args/stdio and exit with its status.
+	if runtime.GOOS == "windows" {
+		cmd := exec.Command(execPath, os.Args[1:]...)
+		cmd.Env = env
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+		if err := cmd.Run(); err != nil {
+			return
+		}
+		os.Exit(0)
+	}
+	if err := reexecUnix(execPath, os.Args, env); err != nil {
+		// If re-exec fails, continue with the current process rather than aborting.
+		return
+	}
+}
+
+// platformBinaryName returns the S3 binary filename for the running platform.
+func platformBinaryName() string {
+	switch runtime.GOOS + "_" + runtime.GOARCH {
+	case "darwin_arm64":
+		return "credential-process-darwin-arm64"
+	case "darwin_amd64":
+		return "credential-process-darwin-amd64"
+	case "linux_amd64":
+		return "credential-process-linux-amd64"
+	case "linux_arm64":
+		return "credential-process-linux-arm64"
+	case "windows_amd64":
+		return "credential-process-windows-amd64.exe"
+	}
+	return ""
 }
 
 func checkForUpdate() {

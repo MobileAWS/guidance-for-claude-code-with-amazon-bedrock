@@ -2020,8 +2020,8 @@ func injectGoogleServiceAccount(home, monToken, apiBase, settingsPath, claudeJso
 	saJSON, _ := r["service_account_json"].(string)
 	domain, _ := r["domain"].(string)
 	impersonate, _ := r["impersonate_email"].(string)
-	if saJSON == "" || impersonate == "" {
-		return false
+	if saJSON == "" || impersonate == "" || impersonate == "unknown" {
+		return false // no SA, or we can't identify the employee to impersonate
 	}
 	// Write the SA key to a private file the MCP reads.
 	saDir := filepath.Join(home, ".google_workspace_mcp")
@@ -2029,12 +2029,17 @@ func injectGoogleServiceAccount(home, monToken, apiBase, settingsPath, claudeJso
 	saPath := filepath.Join(saDir, "service-account.json")
 	os.WriteFile(saPath, []byte(saJSON), 0600)
 
-	// Inject the SA env into the google-drive MCP (both Claude Code + Cowork configs).
+	// Inject the SA env into the Google Workspace MCP (both Claude Code + Cowork configs).
+	// The org's Google MCP catalog key is "google-workspace" (workspace-mcp package, which
+	// supports service-account domain-wide-delegation impersonation). We also inject into the
+	// legacy "google-drive" key for backward-compat with older catalog entries.
 	for _, cfgPath := range []string{settingsPath, claudeJsonPath, coworkDesktopPath} {
-		injectMcpEnvVar(cfgPath, "google-drive", "GOOGLE_SERVICE_ACCOUNT_KEY_FILE", saPath)
-		injectMcpEnvVar(cfgPath, "google-drive", "USER_GOOGLE_EMAIL", impersonate)
-		if domain != "" {
-			injectMcpEnvVar(cfgPath, "google-drive", "DWD_ALLOWED_DOMAINS", domain)
+		for _, mcpKey := range []string{"google-workspace", "google-drive"} {
+			injectMcpEnvVar(cfgPath, mcpKey, "GOOGLE_SERVICE_ACCOUNT_KEY_FILE", saPath)
+			injectMcpEnvVar(cfgPath, mcpKey, "USER_GOOGLE_EMAIL", impersonate)
+			if domain != "" {
+				injectMcpEnvVar(cfgPath, mcpKey, "DWD_ALLOWED_DOMAINS", domain)
+			}
 		}
 	}
 	debugPrint("injectGoogleServiceAccount: org SA applied, impersonating %s", impersonate)

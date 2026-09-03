@@ -2434,14 +2434,17 @@ func syncManagedConfig(profile string) {
 		orgID = "allcode"
 	}
 
-	// Try org-specific config first, fall back to default
-	coworkURL := fmt.Sprintf("https://claude-code-auth-distribution-916587687563.s3.amazonaws.com/cowork/org-%s-cowork-3p-config.json", orgID)
+	// Try org-specific config first, fall back to default. Env-aware prefix so a dev install
+	// reads cowork/dev/... and never the prod managed config.
+	prefix := nexusCoworkPrefix()
+	base := nexusDistBase()
+	coworkURL := fmt.Sprintf("%s/%sorg-%s-cowork-3p-config.json", base, prefix, orgID)
 	resp, err := client.Get(coworkURL)
 	if err != nil || resp.StatusCode != 200 {
 		if resp != nil {
 			resp.Body.Close()
 		}
-		resp, err = client.Get("https://claude-code-auth-distribution-916587687563.s3.amazonaws.com/cowork/cowork-3p-config.json")
+		resp, err = client.Get(fmt.Sprintf("%s/%scowork-3p-config.json", base, prefix))
 	}
 	if err != nil || resp.StatusCode != 200 {
 		return
@@ -2461,6 +2464,7 @@ func syncManagedConfig(profile string) {
 	// Read current managed_config.json (if exists)
 	managedConfigPath := filepath.Join(home, "Library", "Application Support", "Claude", "managed_config.json")
 	managedConfigPath3P := filepath.Join(home, "Library", "Application Support", "Claude-3p", "managed_config.json")
+	claudeJsonPath := filepath.Join(home, ".claude.json") // for org-shared token fallback
 	var localConfig map[string]interface{}
 	if data, err := os.ReadFile(managedConfigPath); err == nil {
 		json.Unmarshal(data, &localConfig)
@@ -2505,13 +2509,12 @@ func syncManagedConfig(profile string) {
 						}
 						req.Header.Set("Authorization", "Bearer "+monToken)
 						resp, err := client.Do(req)
-						if err != nil || resp == nil {
-							break
-						}
-						body, _ := io.ReadAll(resp.Body)
-						resp.Body.Close()
 						var tokenResp map[string]interface{}
-						json.Unmarshal(body, &tokenResp)
+						if err == nil && resp != nil {
+							body, _ := io.ReadAll(resp.Body)
+							resp.Body.Close()
+							json.Unmarshal(body, &tokenResp)
+						}
 						env, _ := mcpMap["env"].(map[string]interface{})
 						if env == nil {
 							env = make(map[string]interface{})
@@ -2521,6 +2524,19 @@ func syncManagedConfig(profile string) {
 							if val, ok := tokenResp[respField].(string); ok && val != "" {
 								env[envVar] = val
 								injected = true
+							}
+						}
+						// Org-shared fallback: if no per-user token was returned, use the
+						// org-shared token the MCP catalog wrote into the Claude Code config
+						// (~/.claude.json). This is what makes HubSpot (admin-set, Slack-style)
+						// work in Cowork too — the per-user token API is empty for org-shared.
+						if !injected {
+							mcpKeyLower := strings.ToLower(strings.ReplaceAll(name, " ", "-"))
+							for _, envVar := range tc.envMap {
+								if v := mcpEnvVarValue(claudeJsonPath, mcpKeyLower, envVar); v != "" {
+									env[envVar] = v
+									injected = true
+								}
 							}
 						}
 						if injected {

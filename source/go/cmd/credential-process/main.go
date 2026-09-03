@@ -1726,34 +1726,40 @@ func syncIntegrationTokens(profile string) {
 
 		accessToken, _ := tokenResp["access_token"].(string)
 		if accessToken == "" {
-			// User hasn't connected this integration yet
-			// Check if the MCP is even configured before prompting
-			settingsData, err := os.ReadFile(settingsPath)
-			if err != nil {
-				continue
-			}
-			var settings map[string]interface{}
-			if err := json.Unmarshal(settingsData, &settings); err != nil {
-				continue
-			}
-			mcpServers, _ := settings["mcpServers"].(map[string]interface{})
-			if mcpServers == nil {
-				continue
-			}
-			// Check if any of this integration's MCP keys is configured.
+			// User hasn't connected this integration per-user. Check whether the MCP is even
+			// configured — look in BOTH settings.json and .claude.json (managed MCPs live in
+			// .claude.json; settings.json often has no mcpServers block at all). If we only
+			// checked settings.json we'd wrongly skip org-shared handling for every managed MCP.
 			checkKeys := integ.mcpKeys
 			if len(checkKeys) == 0 {
 				checkKeys = []string{integ.mcpKey}
 			}
 			anyConfigured := false
-			for _, mk := range checkKeys {
-				if _, exists := mcpServers[mk]; exists {
-					anyConfigured = true
+			for _, cfgFile := range []string{settingsPath, claudeJsonPath, coworkDesktopPath} {
+				data, err := os.ReadFile(cfgFile)
+				if err != nil {
+					continue
+				}
+				var cfg map[string]interface{}
+				if json.Unmarshal(data, &cfg) != nil {
+					continue
+				}
+				servers, _ := cfg["mcpServers"].(map[string]interface{})
+				if servers == nil {
+					continue
+				}
+				for _, mk := range checkKeys {
+					if _, exists := servers[mk]; exists {
+						anyConfigured = true
+						break
+					}
+				}
+				if anyConfigured {
 					break
 				}
 			}
 			if !anyConfigured {
-				continue // MCP not configured, skip
+				continue // MCP not configured anywhere, skip
 			}
 			// Not connected in Nexus per-user. Before clearing, check whether the MCP config
 			// already carries an org-shared token for this env var (set by the admin via the
